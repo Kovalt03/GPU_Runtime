@@ -1,0 +1,84 @@
+# Formatting rules for GPU Runtime Simulator.
+# Derived from the style already present in the tree, so adopting it is not a
+# rewrite. Run `cmake --build build --target format` (or scripts/format.sh).
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# --- Indentation -----------------------------------------------------------
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+NamespaceIndentation: None
+IndentCaseLabels: false
+
+# Long enough for `case Opcode::V_CROSS_VEC3_F32: return "V_CROSS_VEC3_F32";`
+# to fit on one line; short enough to stay readable in a side-by-side diff.
+ColumnLimit: 90
+
+# --- Braces ----------------------------------------------------------------
+# A function's opening brace goes on its own line; everything else keeps its
+# brace on the same line, including `} else {`. This is what the code already
+# does. (Plain Stroustrup would push `else` onto a new line.)
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterFunction: true
+  AfterClass: false
+  AfterStruct: false
+  AfterUnion: false
+  AfterEnum: false
+  AfterNamespace: false
+  AfterExternBlock: false
+  AfterControlStatement: Never
+  AfterCaseLabel: false
+  BeforeElse: false
+  BeforeCatch: false
+  BeforeWhile: false
+  BeforeLambdaBody: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+
+# --- Pointers and references ------------------------------------------------
+# `int* ptr`, not `int *ptr`.
+PointerAlignment: Left
+ReferenceAlignment: Left
+DerivePointerAlignment: false
+
+# --- One-liners -------------------------------------------------------------
+# Case labels may collapse so that opcode tables stay compact; nothing else may.
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+# --- Includes ---------------------------------------------------------------
+# Order: standard library -> third party -> project headers.
+# IncludeBlocks: Preserve keeps the blank-line grouping already written by hand
+# and sorts only within each group.
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+IncludeCategories:
+  - Regex: '^<gtest/'
+    Priority: 2
+  - Regex: '^<'
+    Priority: 1
+  - Regex: '^"'
+    Priority: 3
+
+# --- Alignment --------------------------------------------------------------
+AlignAfterOpenBracket: Align
+AlignTrailingComments: true
+AlignOperands: Align
+
+# --- Misc -------------------------------------------------------------------
+Cpp11BracedListStyle: true
+FixNamespaceComments: true
+SpaceBeforeParens: ControlStatements
+KeepEmptyLinesAtTheStartOfBlocks: false
+MaxEmptyLinesToKeep: 1
+InsertNewlineAtEOF: true

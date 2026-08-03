@@ -1,0 +1,9 @@
+# Build artifacts (FetchContent unpacks googletest here too)
+build/
+compile_commands.json
+
+# Render output — only .gitkeep is tracked
+output/*
+!output/.gitkeep
+
+.DS_Store
