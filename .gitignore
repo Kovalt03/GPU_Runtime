@@ -2,6 +2,9 @@
 build/
 compile_commands.json
 
+# clangd index
+.cache/
+
 # Render output — only .gitkeep is tracked
 output/*
 !output/.gitkeep
