@@ -23,6 +23,6 @@ function(add_layer_test name)
 endfunction()
 
 add_layer_test(test_isa)
-# add_layer_test(test_memory)
+add_layer_test(test_memory)
 # add_layer_test(test_scheduler)
 # add_layer_test(test_runtime)
