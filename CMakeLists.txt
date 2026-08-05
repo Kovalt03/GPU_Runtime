@@ -28,13 +28,14 @@ target_compile_options(project_warnings INTERFACE
 #   1) ISA        src/isa.cpp        (done)
 #   2) Memory     src/memory.cpp     (done)
 #   3) Thread     src/thread.cpp     (done)
-#   4) Scheduler  src/scheduler.cpp
+#   4) Scheduler  src/scheduler.cpp  (done)
 #   5) Runtime    src/runtime.cpp
 # ---------------------------------------------------------------------------
 add_library(gpurt STATIC
     src/isa.cpp
     src/memory.cpp
     src/thread.cpp
+    src/scheduler.cpp
 )
 target_include_directories(gpurt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gpurt PRIVATE project_warnings)
