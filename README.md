@@ -35,7 +35,7 @@ Ray-Triangle intersection kernel as the validation workload.
   │             include/thread.hpp                   │
   │   Thread[256 regs, pc, active]                   │
   │   Warp[32 threads, activeMask]                   │
-  │   Block[warps, 4096B sharedMem]                  │
+  │   ThreadBlock[warps, 4096B sharedMem]            │
   └──────┬───────────────────────────────────────────┘
          │  instruction fetch & decode
   ┌──────▼───────────────────────────────────────────┐
@@ -85,10 +85,10 @@ opcodes are added.
 
 | # | Layer | Header / Source | Status |
 |---|-------|-----------------|--------|
-| 1 | Virtual ISA | `include/isa.hpp` · `src/isa.cpp` | ✅ 17 tests passing |
-| 2 | Memory Model | `include/memory.hpp` · `src/memory.cpp` | 🔲 |
-| 3 | Thread / Warp | `include/thread.hpp` · `src/thread.cpp` | 🔲 |
-| 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | 🔲 |
+| 1 | Virtual ISA | `include/isa.hpp` · `src/isa.cpp` | ✅ |
+| 2 | Memory Model | `include/memory.hpp` · `src/memory.cpp` | ✅ |
+| 3 | Thread / Warp | `include/thread.hpp` · `src/thread.cpp` | ✅ |
+| 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | ✅ |
 | 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | 🔲 |
 | 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | 🔲 |
 | 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | 🔲 |
@@ -97,38 +97,45 @@ opcodes are added.
 
 ## Build and run
 
+GoogleTest is fetched automatically on the first configure.
+
 ```bash
-# Build (GoogleTest is fetched automatically on first configure)
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build --parallel
+scripts/build.sh             # configure if needed, then build
+scripts/build.sh --clean     # discard build/ and start over
+scripts/build.sh --release   # with optimisations
 
-# Full test suite
-cd build && ctest --output-on-failure
+scripts/test.sh              # build, then run every test
+scripts/test.sh Scheduler    # only tests whose name matches
 
-# A single layer
-./build/tests/test_isa
-./build/tests/test_isa --gtest_filter=Isa.Vcmp*
+scripts/format.sh            # apply .clang-format in place
+scripts/format.sh --check    # list unformatted files, exit 1
 
-# Ray-Triangle rendering (PPM output)
+scripts/check.sh             # all three gates, as CI would run them
+```
+
+`scripts/test.sh` builds before running, because `ctest` on its own executes
+whatever binaries are already in `build/` — after an edit that can report on
+code which was never compiled.
+
+The equivalent CMake invocations still work (`cmake -B build`, `ctest`,
+`--target format`), but the scripts also recover from a `build/` directory left
+behind by a different generator, which otherwise blocks configuring while
+leaving the stale binaries in place.
+
+Later stages add:
+
+```bash
 ./build/kernels/ray_triangle
 convert output/result.ppm output/result.png   # requires ImageMagick
 
-# Warp divergence benchmark
 ./build/benchmarks/divergence_bench
 ```
 
 ### Formatting
 
-Layout is decided by `.clang-format`, never by hand:
-
-```bash
-./scripts/format.sh          # rewrite in place
-./scripts/format.sh --check  # list unformatted files, exit 1 (for CI)
-```
-
-`cmake --build build --target format` / `format-check` do the same. The config
-is derived from the style already in the tree: 4-space indent, 90-column limit,
-function braces on their own line, `int* ptr`.
+Layout is decided by `.clang-format`, never by hand. The config is derived from
+the style already in the tree: 4-space indent, 90-column limit, function braces
+on their own line, `int* ptr`.
 
 ---
 
@@ -159,7 +166,10 @@ gpu-runtime-sim/
 ├── .clang-format
 ├── CMakeLists.txt
 ├── scripts/
-│   └── format.sh
+│   ├── build.sh
+│   ├── check.sh
+│   ├── format.sh
+│   └── test.sh
 ├── include/
 │   ├── isa.hpp
 │   ├── memory.hpp
@@ -178,6 +188,7 @@ gpu-runtime-sim/
 │   ├── CMakeLists.txt
 │   ├── test_isa.cpp
 │   ├── test_memory.cpp
+│   ├── test_thread.cpp
 │   ├── test_scheduler.cpp
 │   └── test_runtime.cpp
 ├── benchmarks/

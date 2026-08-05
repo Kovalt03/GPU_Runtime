@@ -1,5 +1,6 @@
 # Build artifacts (FetchContent unpacks googletest here too)
 build/
+build-check/
 compile_commands.json
 
 # clangd index
