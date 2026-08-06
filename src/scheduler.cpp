@@ -412,8 +412,10 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     // Once per step, outside the lane loop. Counting per lane would make a fully
     // converged step look like 32 separate ones and report zero divergence for
     // every program ever run.
+    const uint64_t lanes = active_lane_count(warp);
     stats_.warp_steps += 1;
-    stats_.active_lane_ops += active_lane_count(warp);
+    stats_.active_lane_ops += lanes;
+    stats_.weighted_lane_ops += lanes * instruction_cost(program[warp.pc].op);
     return true;
 }
 

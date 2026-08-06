@@ -141,3 +141,10 @@ inline int32_t decode_branch_offset(float imm)
 
 // For disassembly/logging purposes only. Not called during the execution path.
 std::string_view opcode_name(Opcode op);
+
+// Relative issue cost, where a plain FP32 add is 1. Real hardware spans roughly
+// two orders of magnitude between an add and a global load, so counting every
+// opcode as one would make a kernel full of square roots look faster than one
+// full of adds. Only throughput readings depend on this; divergence is a ratio
+// of issued capacity to capacity used and is unaffected.
+uint32_t instruction_cost(Opcode op);

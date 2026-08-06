@@ -21,6 +21,10 @@ struct SchedulerStats {
     uint64_t warp_steps = 0;       // instructions issued to a warp
     uint64_t active_lane_ops = 0;  // lane-instructions that actually ran
 
+    // active_lane_ops weighted by instruction_cost, so that throughput readings
+    // distinguish a kernel full of global loads from one full of adds.
+    uint64_t weighted_lane_ops = 0;
+
     uint64_t lane_slots() const
     {
         return warp_steps * WARP_SIZE;
@@ -33,6 +37,16 @@ struct SchedulerStats {
 
     // Wasted fraction of issued capacity, 0.0 to 1.0. Zero when nothing ran.
     double divergence_rate() const;
+
+    // A Scheduler only ever knows about the run it is performing, so totals
+    // spanning several launches are folded together by the caller.
+    SchedulerStats& operator+=(const SchedulerStats& other)
+    {
+        warp_steps += other.warp_steps;
+        active_lane_ops += other.active_lane_ops;
+        weighted_lane_ops += other.weighted_lane_ops;
+        return *this;
+    }
 };
 
 // Executes a Program over the warps of one ThreadBlock.

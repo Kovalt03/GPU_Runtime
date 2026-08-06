@@ -200,3 +200,55 @@ Instruction make_ret()
 {
     return {Opcode::RET, 0, 0, 0, 0.0f};
 }
+
+// Rough relative latencies, normalised so that a plain FP32 add is 1. The
+// spread matters more than the exact figures: the point is that a memory
+// round-trip dwarfs arithmetic, which is what makes coalescing worth measuring
+// once V_LD_GLOBAL_VEC3_F32 exists.
+//
+// No default label, so -Wswitch flags an opcode added without a cost.
+uint32_t instruction_cost(Opcode op)
+{
+    switch (op) {
+    // Plain FP32 ALU: one unit by definition.
+    case Opcode::V_MUL_F32:
+    case Opcode::V_ADD_F32:
+    case Opcode::V_SUB_F32:
+    case Opcode::V_FMA_F32:
+    case Opcode::V_MIN_F32:
+    case Opcode::V_MAX_F32:
+    case Opcode::V_MOV_F32:
+    case Opcode::V_CMP_F32: return 1;
+
+    // Special function unit: fewer of them, and several cycles deeper.
+    case Opcode::V_RCP_F32:
+    case Opcode::V_SQRT_F32: return 4;
+
+    // Three lanes' worth of the scalar operation.
+    case Opcode::V_ADD_VEC3_F32:
+    case Opcode::V_SUB_VEC3_F32:
+    case Opcode::V_SCALE_VEC3_F32:
+    case Opcode::V_DOT_VEC3_F32: return 3;
+
+    // Six products and three subtractions.
+    case Opcode::V_CROSS_VEC3_F32: return 9;
+
+    // A dot product, a square root, and three divides.
+    case Opcode::V_NORM_VEC3_F32: return 12;
+
+    // On-chip, so tens of cycles rather than hundreds.
+    case Opcode::V_LD_SHARED_F32:
+    case Opcode::V_ST_SHARED_F32: return 8;
+
+    // Off-chip. The dominant cost in any real kernel.
+    case Opcode::V_LD_GLOBAL_F32:
+    case Opcode::V_ST_GLOBAL_F32: return 100;
+
+    // Control flow retires in the scheduler rather than an execution unit.
+    case Opcode::BRA:
+    case Opcode::BRA_DIV:
+    case Opcode::RET: return 1;
+    }
+
+    return 1;
+}
