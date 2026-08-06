@@ -80,6 +80,16 @@ size_t MemoryManager::device_free_bytes() const
     return free_bytes(device_);
 }
 
+uint8_t* MemoryManager::device_base()
+{
+    return device_.bytes.data();
+}
+
+size_t MemoryManager::device_size() const
+{
+    return device_.bytes.size();
+}
+
 size_t MemoryManager::device_largest_free_block() const
 {
     size_t largest = 0;

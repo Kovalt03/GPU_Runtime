@@ -67,6 +67,12 @@ public:
     bool is_host_ptr(const void* ptr) const;
     bool is_device_ptr(const void* ptr) const;
 
+    // The device arena as a whole, rather than any one allocation within it.
+    // Kernels address memory by byte offset from this base, so an executor
+    // needs the whole extent — not the pointer some particular malloc returned.
+    uint8_t* device_base();
+    size_t device_size() const;
+
 private:
     // Host and device differ only in which buffer they carve up, so the
     // allocator logic lives here once rather than being duplicated per space.
