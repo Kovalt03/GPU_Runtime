@@ -110,7 +110,7 @@ opcodes are added.
 | 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | ✅ |
 | 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | 🔲 |
 | 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | ✅ |
-| 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | 🔲 |
+| 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | ✅ |
 
 ---
 
@@ -147,8 +147,9 @@ leaving the stale binaries in place.
 sips -s format png output/result.ppm --out result.png   # macOS
 convert output/result.ppm result.png                    # ImageMagick
 
-# Later stages add:
+# Divergence benchmark
 ./build/benchmarks/divergence_bench
+./build/benchmarks/divergence_bench --csv   # output/divergence.csv
 ```
 
 ### Formatting
@@ -174,9 +175,34 @@ on their own line, `int* ptr`.
 |--------|-------|
 | Warp divergence rate (ray kernel, 256x256) | 2.6% |
 | Warp divergence rate (64x64) | 10.1% |
+| Issue overhead once a warp splits | 1.80x |
 | Rendering throughput | 0.20 GIOPS |
 | Tests | 88 |
-| Throughput difference before/after masking | — |
+
+### What divergence costs
+
+`benchmarks/divergence_bench` holds the work constant and varies only how a
+warp splits.
+
+```
+  lanes | divergence | warp steps | issue | useful ops
+  ------|------------|------------|-------|------------
+   0/32 |      0.00% |      25600 | 1.00x |     819200
+   1/32 |     44.51% |      46080 | 1.80x |     818176
+  16/32 |     45.56% |      46080 | 1.80x |     802816
+  31/32 |     46.60% |      46080 | 1.80x |     787456
+  32/32 |      0.00% |      24576 | 0.96x |     786432
+```
+
+One lane taking the branch costs exactly what sixteen do. Both sides get issued
+separately either way, and a warp step buys 32 lane slots whether one lane fills
+them or all of them. Both extremes read 0%: **divergence is not about branching,
+but about disagreeing.**
+
+The issue column counts what the scheduler had to put through, so it is
+identical on any machine. Wall-clock throughput is reported too, but it measures
+this simulator on this host — where a masked lane is skipped outright and so
+genuinely costs less, while hardware would keep its ALU busy regardless.
 
 ---
 
@@ -215,6 +241,7 @@ gpu-runtime-sim/
 │   ├── test_scheduler.cpp
 │   └── test_runtime.cpp
 ├── benchmarks/
+│   ├── CMakeLists.txt
 │   └── divergence_bench.cpp
 └── output/
     └── .gitkeep
