@@ -62,6 +62,5 @@ add_custom_target(format-check
     VERBATIM
 )
 
-# Added in later stages:
 add_subdirectory(kernels)
-# add_subdirectory(benchmarks)
+add_subdirectory(benchmarks)
