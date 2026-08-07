@@ -7,6 +7,25 @@ Ray-Triangle intersection kernel as the validation workload.
 > **Portfolio goal**: to demonstrate a developer who understands the rendering
 > pipeline from top to bottom. Built for system semiconductor SW roles.
 
+<img src="docs/triangle.png" width="256" alt="Ray-traced triangle shaded by barycentric coordinates">
+
+256x256, one thread per pixel, Möller-Trumbore intersection written in the
+project's own instruction set and executed by its own warp scheduler. The
+colours are the barycentric coordinates, so each vertex resolves to a pure
+primary — an intersection error shows up as a wrong gradient rather than
+disappearing into flat shading.
+
+```
+$ ./build/kernels/ray_triangle 256 256
+rendering 256x256 — 65536 pixels, 2048 blocks of 32 threads
+[STATS] divergence: 2.6%, throughput: 0.20 GIOPS
+```
+
+Divergence is concentrated at the triangle's edges, where a warp's 32 lanes
+disagree about whether they hit. It falls as resolution rises — 10.1% at 64x64
+against 2.6% here — because the interior grows with the area while the edge
+grows only with the perimeter.
+
 ---
 
 ## Architecture
@@ -90,7 +109,7 @@ opcodes are added.
 | 3 | Thread / Warp | `include/thread.hpp` · `src/thread.cpp` | ✅ |
 | 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | ✅ |
 | 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | 🔲 |
-| 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | 🔲 |
+| 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | ✅ |
 | 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | 🔲 |
 
 ---
@@ -122,12 +141,13 @@ The equivalent CMake invocations still work (`cmake -B build`, `ctest`,
 behind by a different generator, which otherwise blocks configuring while
 leaving the stale binaries in place.
 
-Later stages add:
-
 ```bash
-./build/kernels/ray_triangle
-convert output/result.ppm output/result.png   # requires ImageMagick
+# Render (PPM, no image library needed)
+./build/kernels/ray_triangle 256 256
+sips -s format png output/result.ppm --out result.png   # macOS
+convert output/result.ppm result.png                    # ImageMagick
 
+# Later stages add:
 ./build/benchmarks/divergence_bench
 ```
 
@@ -148,14 +168,15 @@ on their own line, `int* ptr`.
 
 ---
 
-## Key metrics (to be filled in once implemented)
+## Key metrics
 
 | Metric | Value |
 |--------|-------|
-| Warp divergence rate (ray kernel) | — |
+| Warp divergence rate (ray kernel, 256x256) | 2.6% |
+| Warp divergence rate (64x64) | 10.1% |
+| Rendering throughput | 0.20 GIOPS |
+| Tests | 88 |
 | Throughput difference before/after masking | — |
-| Rendering throughput | — GIOPS |
-| Test coverage | — |
 
 ---
 
@@ -165,6 +186,8 @@ on their own line, `int* ptr`.
 gpu-runtime-sim/
 ├── .clang-format
 ├── CMakeLists.txt
+├── docs/
+│   └── triangle.png
 ├── scripts/
 │   ├── build.sh
 │   ├── check.sh
