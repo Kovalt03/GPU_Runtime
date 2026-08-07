@@ -248,6 +248,116 @@ TEST(Scheduler, Vec3OperandNearEndOfRegisterFileThrows)
 }
 
 // ---------------------------------------------------------------------------
+// MAT4
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Loads a row-major mat4 into 16 consecutive registers of every lane.
+void load_mat4(Warp& warp, uint8_t reg, const float (&m)[16])
+{
+    for (Thread& t : warp.threads) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            t.regs[reg + i] = m[i];
+        }
+    }
+}
+
+void load_vec4(Warp& warp, uint8_t reg, float x, float y, float z, float w)
+{
+    for (Thread& t : warp.threads) {
+        t.regs[reg + 0] = x;
+        t.regs[reg + 1] = y;
+        t.regs[reg + 2] = z;
+        t.regs[reg + 3] = w;
+    }
+}
+
+}  // namespace
+
+TEST(Scheduler, MatvecIdentityLeavesTheVectorAlone)
+{
+    Fixture f;
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    load_mat4(f.warp(), 16, identity);
+    load_vec4(f.warp(), 4, 1.0f, 2.0f, 3.0f, 1.0f);
+
+    f.run(Program{make_v_matvec_mat4_f32(8, 16, 4), make_ret()});
+
+    const Thread& t = f.lane(0);
+    EXPECT_FLOAT_EQ(t.regs[8], 1.0f);
+    EXPECT_FLOAT_EQ(t.regs[9], 2.0f);
+    EXPECT_FLOAT_EQ(t.regs[10], 3.0f);
+    EXPECT_FLOAT_EQ(t.regs[11], 1.0f);
+}
+
+TEST(Scheduler, MatvecTranslatesAPoint)
+{
+    // Row-major translation: the offsets sit in the last column, so they only
+    // take effect when w is 1 — which is what separates a point from a
+    // direction.
+    Fixture f;
+    const float translate[16] = {1, 0, 0, 10, 0, 1, 0, 20, 0, 0, 1, 30, 0, 0, 0, 1};
+    load_mat4(f.warp(), 16, translate);
+
+    load_vec4(f.warp(), 4, 1.0f, 2.0f, 3.0f, 1.0f);  // a point
+    f.run(Program{make_v_matvec_mat4_f32(8, 16, 4), make_ret()});
+    EXPECT_FLOAT_EQ(f.lane(0).regs[8], 11.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[9], 22.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[10], 33.0f);
+
+    Fixture g;
+    load_mat4(g.warp(), 16, translate);
+    load_vec4(g.warp(), 4, 1.0f, 2.0f, 3.0f, 0.0f);  // a direction
+    g.run(Program{make_v_matvec_mat4_f32(8, 16, 4), make_ret()});
+    EXPECT_FLOAT_EQ(g.lane(0).regs[8], 1.0f) << "a direction must not translate";
+    EXPECT_FLOAT_EQ(g.lane(0).regs[9], 2.0f);
+    EXPECT_FLOAT_EQ(g.lane(0).regs[10], 3.0f);
+}
+
+TEST(Scheduler, MatvecSurvivesOverlappingOperands)
+{
+    // Every output component reads every input component, so writing dst[0]
+    // before the rest are read would corrupt them.
+    Fixture f;
+    const float scale2[16] = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1};
+    load_mat4(f.warp(), 16, scale2);
+    load_vec4(f.warp(), 4, 1.0f, 2.0f, 3.0f, 1.0f);
+
+    f.run(Program{make_v_matvec_mat4_f32(4, 16, 4), make_ret()});  // dst == src1
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[4], 2.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[5], 4.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[6], 6.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[7], 1.0f);
+}
+
+TEST(Scheduler, MatvecRejectsUnalignedOperands)
+{
+    // VEC4 and wider start on a multiple of 4, so that a later
+    // V_LD_GLOBAL_MAT4_F32 can map an aligned block onto an aligned address.
+    Fixture f;
+    EXPECT_THROW(f.run(Program{make_v_matvec_mat4_f32(1, 16, 4), make_ret()}),
+                 std::runtime_error);
+    Fixture g;
+    EXPECT_THROW(g.run(Program{make_v_matvec_mat4_f32(8, 17, 4), make_ret()}),
+                 std::runtime_error);
+    Fixture h;
+    EXPECT_THROW(h.run(Program{make_v_matvec_mat4_f32(8, 16, 5), make_ret()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, MatvecRejectsAMatrixPastTheEndOfTheFile)
+{
+    // A mat4 claims 16 registers, so the last place one fits is r240.
+    Fixture f;
+    EXPECT_NO_THROW(f.run(Program{make_v_matvec_mat4_f32(0, 240, 4), make_ret()}));
+    Fixture g;
+    EXPECT_THROW(g.run(Program{make_v_matvec_mat4_f32(0, 244, 4), make_ret()}),
+                 std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
 // Compare
 // ---------------------------------------------------------------------------
 

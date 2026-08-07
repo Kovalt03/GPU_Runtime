@@ -66,18 +66,19 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 23 opcodes, 0-indexed → RET == 22
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 22);
-    EXPECT_EQ(OPCODE_COUNT, 23);
+    // 24 opcodes, 0-indexed → RET == 23
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 23);
+    EXPECT_EQ(OPCODE_COUNT, 24);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
     // opcode is inserted mid-list and shifts everything behind it.
     EXPECT_EQ(static_cast<int>(Opcode::V_MUL_F32), 0);
     EXPECT_EQ(static_cast<int>(Opcode::V_ADD_VEC3_F32), 9);
-    EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 15);
-    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 16);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 20);
+    EXPECT_EQ(static_cast<int>(Opcode::V_MATVEC_MAT4_F32), 15);
+    EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
+    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 21);
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +180,25 @@ TEST(Isa, FactoryFieldsCorrect)
     EXPECT_EQ(inst.src0, 2);
     EXPECT_EQ(inst.src1, 3);
     EXPECT_EQ(inst.imm, 0.0f);
+}
+
+TEST(Isa, MatrixFactoryFields)
+{
+    const Instruction inst = make_v_matvec_mat4_f32(0, 4, 20);
+    EXPECT_EQ(inst.op, Opcode::V_MATVEC_MAT4_F32);
+    EXPECT_EQ(inst.dst, 0);
+    EXPECT_EQ(inst.src0, 4);
+    EXPECT_EQ(inst.src1, 20);
+    EXPECT_EQ(inst.imm, 0.0f);
+}
+
+TEST(Isa, MatrixCostsMoreThanScalarArithmetic)
+{
+    // Sixteen products and twelve sums against a single add.
+    EXPECT_GT(instruction_cost(Opcode::V_MATVEC_MAT4_F32),
+              instruction_cost(Opcode::V_ADD_F32));
+    EXPECT_GT(instruction_cost(Opcode::V_MATVEC_MAT4_F32),
+              instruction_cost(Opcode::V_CROSS_VEC3_F32));
 }
 
 TEST(Isa, UnaryFactoriesLeaveSrc1Unused)
