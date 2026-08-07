@@ -36,6 +36,12 @@ grows only with the perimeter.
   │             kernels/ray_triangle.cpp             │
   │       Möller–Trumbore · 256×256 · PPM output     │
   └────────────────────┬─────────────────────────────┘
+                       │  emits a Program
+  ┌────────────────────▼─────────────────────────────┐
+  │                  IR Builder                      │
+  │              include/ir_builder.hpp              │
+  │   typed registers · allocation · branch patching │
+  └────────────────────┬─────────────────────────────┘
                        │  myrt_launch(kernel, grid, block, args)
   ┌────────────────────▼─────────────────────────────┐
   │                 Runtime API                      │
@@ -108,9 +114,11 @@ opcodes are added.
 | 2 | Memory Model | `include/memory.hpp` · `src/memory.cpp` | ✅ |
 | 3 | Thread / Warp | `include/thread.hpp` · `src/thread.cpp` | ✅ |
 | 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | ✅ |
-| 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | 🔲 |
+| 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | ✅ |
 | 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | ✅ |
 | 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | ✅ |
+| 8 | IR Builder | `include/ir_builder.hpp` · `src/ir_builder.cpp` | 🔲 |
+| 9 | Rasterizer + Ray Tracer | `kernels/` | 🔲 |
 
 ---
 
