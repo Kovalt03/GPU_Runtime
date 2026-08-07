@@ -98,3 +98,9 @@ size_t decode_address(float value, const char* what);
 
 // Checks that reg .. reg + count - 1 all exist: a VEC3 at src0 = 254 does not.
 void require_register_range(uint32_t reg, uint32_t count, const char* what);
+
+// VEC4 and wider start at a register index that is a multiple of 4. The rule
+// exists so that a future V_LD_GLOBAL_MAT4_F32 can map an aligned register
+// block onto an aligned address; enforcing it on the ALU too keeps one
+// convention rather than two.
+void require_register_alignment(uint32_t reg, uint32_t alignment, const char* what);

@@ -43,6 +43,8 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_DOT_VEC3_F32:   return "V_DOT_VEC3_F32";
     case Opcode::V_CROSS_VEC3_F32: return "V_CROSS_VEC3_F32";
     case Opcode::V_NORM_VEC3_F32:  return "V_NORM_VEC3_F32";
+    // MATRIX (MAT4)
+    case Opcode::V_MATVEC_MAT4_F32: return "V_MATVEC_MAT4_F32";
     // CMP
     case Opcode::V_CMP_F32:        return "V_CMP_F32";
     // MEM
@@ -147,6 +149,16 @@ Instruction make_v_norm_vec3_f32(uint8_t dst, uint8_t src0)
 }
 
 // ---------------------------------------------------------------------------
+// MATRIX (MAT4)
+// ---------------------------------------------------------------------------
+
+// src0 names the first of sixteen registers, src1 and dst the first of four.
+Instruction make_v_matvec_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1)
+{
+    return {Opcode::V_MATVEC_MAT4_F32, dst, src0, src1, 0.0f};
+}
+
+// ---------------------------------------------------------------------------
 // CMP
 // ---------------------------------------------------------------------------
 
@@ -235,6 +247,9 @@ uint32_t instruction_cost(Opcode op)
 
     // A dot product, a square root, and three divides.
     case Opcode::V_NORM_VEC3_F32: return 12;
+
+    // Sixteen products and twelve sums.
+    case Opcode::V_MATVEC_MAT4_F32: return 16;
 
     // On-chip, so tens of cycles rather than hundreds.
     case Opcode::V_LD_SHARED_F32:

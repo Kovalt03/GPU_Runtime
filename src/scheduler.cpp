@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -125,6 +126,14 @@ void require_register_range(uint32_t reg, uint32_t count, const char* what)
                                  std::to_string(reg) + ".." +
                                  std::to_string(reg + count - 1) + " leave the " +
                                  std::to_string(REGS_PER_THREAD) + "-register file");
+    }
+}
+
+void require_register_alignment(uint32_t reg, uint32_t alignment, const char* what)
+{
+    if (reg % alignment != 0) {
+        throw std::runtime_error(std::string(what) + ": register " + std::to_string(reg) +
+                                 " is not a multiple of " + std::to_string(alignment));
     }
 }
 
@@ -336,6 +345,41 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
     // 1.0f or 0.0f so that BRA_DIV, which only tests against zero, can consume
     // it. A switch over CmpOp with no default keeps -Wswitch watching this one
     // too.
+    // MAT4 is row-major: reg[src0 + row * 4 + col]. Sixteen registers for the
+    // matrix, four each for the vector and the result, all 4-aligned.
+    //
+    // Every output component reads every input component, so the temporary is
+    // mandatory rather than tidy — writing dst[0] first would destroy a value
+    // the other three still need.
+    case Opcode::V_MATVEC_MAT4_F32: {
+        require_register_range(instr.dst, 4, "V_MATVEC_MAT4_F32 dst");
+        require_register_range(instr.src0, 16, "V_MATVEC_MAT4_F32 src0");
+        require_register_range(instr.src1, 4, "V_MATVEC_MAT4_F32 src1");
+        require_register_alignment(instr.dst, 4, "V_MATVEC_MAT4_F32 dst");
+        require_register_alignment(instr.src0, 4, "V_MATVEC_MAT4_F32 src0");
+        require_register_alignment(instr.src1, 4, "V_MATVEC_MAT4_F32 src1");
+
+        // Row-major, so row r occupies m[r * 4 .. r * 4 + 3].
+        //
+        // The temporary is mandatory rather than tidy: every output component
+        // reads every input one, so writing dst[0] straight away would destroy a
+        // value the other three still need. Möller-Trumbore already relies on
+        // operands overlapping, and a camera transform in place would too.
+        const float* m = &thread.regs[instr.src0];
+        const float* v = &thread.regs[instr.src1];
+        float out[4];
+        for (uint32_t row = 0; row < 4; ++row) {
+            out[row] = 0.0f;
+            for (uint32_t col = 0; col < 4; ++col) {
+                out[row] += m[row * 4 + col] * v[col];
+            }
+        }
+        for (uint32_t i = 0; i < 4; ++i) {
+            thread.regs[instr.dst + i] = out[i];
+        }
+        break;
+    }
+
     case Opcode::V_CMP_F32: {
         thread.regs[instr.dst] =
             compare(decode_cmp_op(instr.imm), thread.regs[instr.src0],

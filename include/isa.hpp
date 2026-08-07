@@ -49,6 +49,11 @@ enum class Opcode : uint8_t {
     V_CROSS_VEC3_F32,  // reg[dst..+2] = cross(reg[src0..+2], reg[src1..+2])
     V_NORM_VEC3_F32,   // reg[dst..+2] = normalize(reg[src0..+2]) (src1 unused)
 
+    // Matrix ALU — MAT4 is row-major across 16 consecutive registers. dst and
+    // src1 are VEC4. All three start at a register index that is a multiple of
+    // 4, the alignment DOC/01 reserves for VEC4 and wider.
+    V_MATVEC_MAT4_F32,  // reg[dst..+3] = mat4(reg[src0..+15]) * vec4(reg[src1..+3])
+
     // Compare
     V_CMP_F32,  // reg[dst] = (reg[src0] OP reg[src1]) ? 1.0f : 0.0f
 
@@ -98,6 +103,9 @@ Instruction make_v_scale_vec3_f32(uint8_t dst, uint8_t src0, uint8_t src1_scalar
 Instruction make_v_dot_vec3_f32(uint8_t dst, uint8_t src0, uint8_t src1);
 Instruction make_v_cross_vec3_f32(uint8_t dst, uint8_t src0, uint8_t src1);
 Instruction make_v_norm_vec3_f32(uint8_t dst, uint8_t src0);
+
+// MATRIX (MAT4)
+Instruction make_v_matvec_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1);
 
 // CMP
 Instruction make_v_cmp_f32(uint8_t dst, uint8_t src0, uint8_t src1, CmpOp op);
