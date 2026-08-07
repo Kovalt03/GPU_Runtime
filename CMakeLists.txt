@@ -63,5 +63,5 @@ add_custom_target(format-check
 )
 
 # Added in later stages:
-# add_subdirectory(kernels)
+add_subdirectory(kernels)
 # add_subdirectory(benchmarks)
