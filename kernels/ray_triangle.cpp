@@ -42,9 +42,9 @@ struct Scene {
 };
 
 // --- register map -----------------------------------------------------------
-// Follows DOC/01_virtual_isa.md, which worked the algorithm out against the ISA
-// before any of it was written. Vectors occupy three consecutive registers, so
-// each name below claims r, r+1, r+2 unless marked scalar.
+// Assigned by hand, ahead of the algorithm below. Vectors occupy three
+// consecutive registers, so each name below claims r, r+1, r+2 unless marked
+// scalar.
 //
 // The launch reserves r253..r255 for thread coordinates, so allocation runs
 // upward from r0 and has plenty of room.
@@ -139,8 +139,7 @@ Program build_ray_triangle_program(void** args)
 
     p.push_back(make_v_norm_vec3_f32(R_DIR, R_DIR));
 
-    // [3] Möller-Trumbore, transcribed from the mapping in DOC/01 that was
-    //     worked out against the ISA before any of this existed.
+    // [3] Möller-Trumbore, one ISA instruction at a time.
     //
     //     A branch target is not known while the tests are being emitted, the
     //     miss path not existing yet. Placeholders are recorded and patched once

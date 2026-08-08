@@ -6,7 +6,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Opcode naming scheme (see DOC/01_virtual_isa.md)
+// Opcode naming scheme
 //
 //   ALU     V_<OP>[_<SHAPE>]_<TYPE>
 //   Memory  V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>
@@ -51,7 +51,7 @@ enum class Opcode : uint8_t {
 
     // Matrix ALU — MAT4 is row-major across 16 consecutive registers. dst and
     // src1 are VEC4. All three start at a register index that is a multiple of
-    // 4, the alignment DOC/01 reserves for VEC4 and wider.
+    // 4, the alignment the scheme above reserves for VEC4 and wider.
     V_MATVEC_MAT4_F32,  // reg[dst..+3] = mat4(reg[src0..+15]) * vec4(reg[src1..+3])
 
     // Compare

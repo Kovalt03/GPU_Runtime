@@ -55,7 +55,10 @@ struct SchedulerStats {
 // among the warp's still-active threads, and lanes sitting elsewhere are masked
 // off for that step. Threads that took different branches therefore cost extra
 // steps, and rejoin on their own once they reach the same instruction again.
-// Rationale and alternatives: DOC/04_warp_scheduler.md.
+//
+// The alternative, an explicit reconvergence stack, needs the compiler to mark
+// where control flow rejoins. Min-PC derives that from the pcs themselves, which
+// keeps the ISA free of a post-dominator annotation it has no way to compute.
 class WarpScheduler {
 public:
     // Runs until every thread has retired. Throws std::runtime_error on a bad

@@ -82,7 +82,7 @@ TEST(Isa, OpcodeCount)
 }
 
 // ---------------------------------------------------------------------------
-// Naming scheme (DOC/01_virtual_isa.md)
+// Naming scheme (isa.hpp)
 //   ALU     V_<OP>[_<SHAPE>]_<TYPE>
 //   Memory  V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>
 //   Control <OP>
