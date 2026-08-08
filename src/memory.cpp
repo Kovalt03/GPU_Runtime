@@ -90,6 +90,14 @@ size_t MemoryManager::device_size() const
     return device_.bytes.size();
 }
 
+size_t MemoryManager::device_offset(const void* ptr) const
+{
+    if (!contains(device_, ptr)) {
+        throw std::runtime_error("device_offset: pointer does not lie in device memory");
+    }
+    return static_cast<size_t>(static_cast<const uint8_t*>(ptr) - device_.bytes.data());
+}
+
 size_t MemoryManager::device_largest_free_block() const
 {
     size_t largest = 0;

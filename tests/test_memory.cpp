@@ -276,3 +276,27 @@ TEST(Memory, MemcpyRejectsOutOfBounds)
     EXPECT_THROW(mm.memcpy(dev, host.data(), DEVICE_SIZE, Direction::HostToDevice),
                  std::runtime_error);
 }
+
+TEST(Memory, DeviceOffsetLocatesAnAllocationInTheArena)
+{
+    // The number a kernel puts in a register is an offset from the arena base,
+    // not the host pointer the allocator returned.
+    MemoryManager mm = make_manager();
+
+    void* first = mm.device_alloc(64);
+    void* second = mm.device_alloc(64);
+
+    EXPECT_EQ(mm.device_offset(first), 0u);
+    EXPECT_GE(mm.device_offset(second), 64u)
+        << "the second buffer cannot alias the first";
+    EXPECT_EQ(mm.device_base() + mm.device_offset(second), static_cast<uint8_t*>(second));
+}
+
+TEST(Memory, DeviceOffsetRejectsAHostPointer)
+{
+    MemoryManager mm = make_manager();
+    std::vector<uint8_t> host(16, 0);
+
+    EXPECT_THROW(mm.device_offset(host.data()), std::runtime_error);
+    EXPECT_THROW(mm.device_offset(mm.host_alloc(16)), std::runtime_error);
+}

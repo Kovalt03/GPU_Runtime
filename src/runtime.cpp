@@ -36,6 +36,11 @@ void MyGPURuntime::myrt_memcpy(void* dst, const void* src, size_t size, Directio
     mem_->memcpy(dst, src, size, dir);
 }
 
+size_t MyGPURuntime::myrt_device_offset(const void* ptr) const
+{
+    return mem_->device_offset(ptr);
+}
+
 void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** args)
 {
     if (grid.volume() == 0 || block.volume() == 0) {

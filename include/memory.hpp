@@ -73,6 +73,12 @@ public:
     uint8_t* device_base();
     size_t device_size() const;
 
+    // Where a device allocation sits relative to that base, which is the number
+    // a kernel actually puts in a register. Throws unless ptr lies in device
+    // memory. A launch with one buffer can assume zero; a launch with two
+    // cannot, and guessing is how the second buffer ends up aliasing the first.
+    size_t device_offset(const void* ptr) const;
+
 private:
     // Host and device differ only in which buffer they carve up, so the
     // allocator logic lives here once rather than being duplicated per space.

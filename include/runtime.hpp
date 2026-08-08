@@ -54,6 +54,11 @@ public:
     void myrt_free(void* ptr);
     void myrt_memcpy(void* dst, const void* src, size_t size, Direction dir);
 
+    // Byte offset of a device allocation from the base of device memory, which
+    // is the form a kernel addresses it in. Nothing in the ISA can dereference
+    // a host pointer, so this is how a buffer's address reaches a register.
+    size_t myrt_device_offset(const void* ptr) const;
+
     // --- execution ----------------------------------------------------------
     // Runs kernel(args) over grid x block threads. Execution is synchronous:
     // the call returns once every thread has retired. Throws
