@@ -211,6 +211,59 @@ TEST(IRBuilder, SetAndLoadIntoWriteWhereTheCallerAsks)
     EXPECT_EQ(after, k.registers_used()) << "neither call allocates";
 }
 
+TEST(IRBuilder, CopyIntoLeavesBothArmsOfABranchInOnePlace)
+{
+    // What an if_else needs: a destination allocated before the branch that
+    // either arm can fill, since every allocating call hands back somewhere new
+    // and the code after the join has to know where to look.
+    IRBuilder k;
+    const Reg<Scalar> flag = k.constant(1.0f);
+    const Reg<Scalar> value = k.constant(7.0f);
+    const Reg<Scalar> result = k.scalar();
+
+    k.if_else(
+        flag, [&] { k.copy_into(result, value); }, [&] { k.set(result, 0.0f); });
+
+    const uint32_t after = k.registers_used();
+    const Program p = k.build();
+    EXPECT_EQ(after, k.registers_used()) << "neither arm allocates a destination";
+
+    uint32_t moves = 0;
+    for (const Instruction& i : p) {
+        if (i.op == Opcode::V_MAX_F32 && i.dst == result.first()) {
+            ++moves;
+            EXPECT_EQ(i.src0, value.first());
+            EXPECT_EQ(i.src1, value.first()) << "max(x, x) is the move idiom";
+        }
+    }
+    EXPECT_EQ(moves, 1u);
+}
+
+TEST(IRBuilder, CopyIntoRunsOnTheScheduler)
+{
+    // The idiom only works if V_MAX_F32 really does return its operand when
+    // both are the same register, which comparing instructions cannot show.
+    KernelFunc kernel = [](void**) -> Program {
+        IRBuilder k;
+        const Reg<Scalar> base = k.constant(0.0f);
+        const Reg<Scalar> source = k.constant(-3.5f);
+        const Reg<Scalar> destination = k.scalar();
+
+        k.set(destination, 99.0f);
+        k.copy_into(destination, source);
+        k.store(base, destination, 0.0f);
+        return k.build();
+    };
+
+    MyGPURuntime rt(1u << 20);
+    void* out = rt.myrt_malloc(sizeof(float));
+    rt.myrt_launch(kernel, dim3{1, 1, 1}, dim3{32, 1, 1}, nullptr);
+
+    float got = 0.0f;
+    rt.myrt_memcpy(&got, out, sizeof(float), Direction::DeviceToHost);
+    EXPECT_FLOAT_EQ(got, -3.5f) << "a negative value survives the max idiom";
+}
+
 TEST(IRBuilder, XyzViewsTheLeadingThreeRegisters)
 {
     // The other half of the perspective divide: clip.xyz scaled by 1/clip.w,

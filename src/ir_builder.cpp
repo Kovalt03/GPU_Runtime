@@ -198,6 +198,14 @@ void IRBuilder::set(Reg<Scalar> dst, float value)
     emit(make_v_mov_f32(dst.first(), value));
 }
 
+void IRBuilder::copy_into(Reg<Scalar> dst, Reg<Scalar> src)
+{
+    // V_MOV_F32 only carries an immediate, so a register-to-register move has
+    // to go through arithmetic. max(x, x) is x for every value it can hold, and
+    // unlike adding a zero it needs no second register to have been set up.
+    emit(make_v_max_f32(dst.first(), src.first(), src.first()));
+}
+
 Reg<Scalar> IRBuilder::copy(Reg<Scalar> a)
 {
     // V_MOV_F32 takes an immediate, so adding a zero register is the idiom.

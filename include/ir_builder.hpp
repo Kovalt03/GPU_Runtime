@@ -164,6 +164,12 @@ public:
     // chosen index.
     void set(Reg<Scalar> dst, float value);
 
+    // Moves one register into another that already exists. The third of the
+    // family, alongside set (an immediate) and load_into (memory), and the one
+    // a branch needs: both arms of an if_else have to leave their result in the
+    // same place, and every allocating call hands back somewhere new.
+    void copy_into(Reg<Scalar> dst, Reg<Scalar> src);
+
     // Copies a register. V_MOV_F32 takes an immediate, so this goes through
     // arithmetic — adding zero is the idiom.
     Reg<Scalar> copy(Reg<Scalar> a);
