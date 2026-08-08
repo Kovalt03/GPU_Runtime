@@ -5,15 +5,13 @@
 // triangle's edges, where some lanes of a warp hit and the rest miss — which is
 // exactly what the benchmark in stage 7 goes on to measure.
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <string>
-#include <sys/types.h>
 #include <vector>
 
 #include "isa.hpp"
+#include "ppm.hpp"
 #include "runtime.hpp"
 
 namespace {
@@ -252,25 +250,6 @@ Program build_ray_triangle_program(void** args)
 
     p.push_back(make_ret());
     return p;
-}
-
-// --- PPM --------------------------------------------------------------------
-
-void write_ppm(const std::string& path, const std::vector<float>& rgb, uint32_t width,
-               uint32_t height)
-{
-    std::ofstream out(path);
-    if (!out) {
-        throw std::runtime_error("cannot open " + path + " for writing");
-    }
-
-    out << "P3\n" << width << " " << height << "\n255\n";
-    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
-        for (int c = 0; c < 3; ++c) {
-            const float v = std::clamp(rgb[i * 3 + c], 0.0f, 1.0f);
-            out << static_cast<int>(v * 255.0f + 0.5f) << (c == 2 ? '\n' : ' ');
-        }
-    }
 }
 
 }  // namespace
