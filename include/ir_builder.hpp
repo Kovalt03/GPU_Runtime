@@ -54,8 +54,20 @@ public:
     }
 
     // Component of a vector, as a scalar. The perspective divide needs clip.w
-    // on its own, and a VEC3 view of the leading three registers of a VEC4.
+    // on its own.
     Reg<Scalar> component(uint32_t index) const;
+
+    // The leading three registers, seen as a VEC3 — the other half of that
+    // divide, which scales clip.xyz by 1/clip.w. Defined here rather than in
+    // the .cpp so that asking a Scalar for one fails at the call site instead
+    // of at link time; a builder whose point is good diagnostics should not
+    // answer misuse with an undefined symbol.
+    Reg<Vec3> xyz() const
+    {
+        static_assert(Shape::REGISTERS >= Vec3::REGISTERS,
+                      "xyz() needs a value at least three registers wide");
+        return Reg<Vec3>(first_);
+    }
 
 private:
     uint8_t first_ = 0;
@@ -145,6 +157,13 @@ public:
     // Accumulates in place, matching V_FMA_F32: acc += a * b.
     void fma(Reg<Scalar> acc, Reg<Scalar> a, Reg<Scalar> b);
 
+    // Writes a value into a register that already exists, rather than
+    // allocating a fresh one. Assembling a VEC4 needs exactly this: the w
+    // component has to land in the fourth register of a range whose first three
+    // came from somewhere else, and no allocating call can put a value at a
+    // chosen index.
+    void set(Reg<Scalar> dst, float value);
+
     // Copies a register. V_MOV_F32 takes an immediate, so this goes through
     // arithmetic — adding zero is the idiom.
     Reg<Scalar> copy(Reg<Scalar> a);
@@ -169,6 +188,10 @@ public:
     // the address being an argument and the value a return.
     Reg<Scalar> load(Reg<Scalar> address, float offset = 0.0f);
     Reg<Vec3> load_vec3(Reg<Scalar> address, float offset = 0.0f);
+
+    // As load, into a register the caller already holds — the counterpart to
+    // set(), and what fills the first three slots of a VEC4 in place.
+    void load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
     void store(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
     void store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset = 0.0f);
 

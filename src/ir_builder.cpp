@@ -193,6 +193,11 @@ void IRBuilder::fma(Reg<Scalar> acc, Reg<Scalar> a, Reg<Scalar> b)
     emit(make_v_fma_f32(acc.first(), a.first(), b.first()));
 }
 
+void IRBuilder::set(Reg<Scalar> dst, float value)
+{
+    emit(make_v_mov_f32(dst.first(), value));
+}
+
 Reg<Scalar> IRBuilder::copy(Reg<Scalar> a)
 {
     // V_MOV_F32 takes an immediate, so adding a zero register is the idiom.
@@ -291,6 +296,11 @@ Reg<Scalar> IRBuilder::load(Reg<Scalar> address, float offset)
     const Reg<Scalar> dst = alloc<Scalar>();
     emit(make_v_ld_global_f32(dst.first(), address.first(), offset));
     return dst;
+}
+
+void IRBuilder::load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset)
+{
+    emit(make_v_ld_global_f32(dst.first(), address.first(), offset));
 }
 
 Reg<Vec3> IRBuilder::load_vec3(Reg<Scalar> address, float offset)

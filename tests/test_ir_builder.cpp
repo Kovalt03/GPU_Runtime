@@ -186,6 +186,51 @@ TEST(IRBuilder, FmaAccumulatesWithoutAllocating)
     EXPECT_TRUE(same(p[0], make_v_fma_f32(acc.first(), a.first(), b.first())));
 }
 
+TEST(IRBuilder, SetAndLoadIntoWriteWhereTheCallerAsks)
+{
+    // Assembling a VEC4 from a position needs a value at a chosen index, which
+    // no allocating call can do: the loads fill xyz and set() puts 1 in w.
+    IRBuilder k;
+    const Reg<Scalar> addr = k.scalar();
+    const Reg<Vec4> position = k.vec4();
+
+    k.load_into(position.component(0), addr, 0.0f);
+    k.load_into(position.component(1), addr, 4.0f);
+    k.load_into(position.component(2), addr, 8.0f);
+    k.set(position.component(3), 1.0f);
+
+    const uint32_t after = k.registers_used();
+    const Program p = k.build();
+
+    ASSERT_GE(p.size(), 4u);
+    EXPECT_TRUE(
+        same(p[0], make_v_ld_global_f32(position.first() + 0, addr.first(), 0.0f)));
+    EXPECT_TRUE(
+        same(p[2], make_v_ld_global_f32(position.first() + 2, addr.first(), 8.0f)));
+    EXPECT_TRUE(same(p[3], make_v_mov_f32(position.first() + 3, 1.0f)));
+    EXPECT_EQ(after, k.registers_used()) << "neither call allocates";
+}
+
+TEST(IRBuilder, XyzViewsTheLeadingThreeRegisters)
+{
+    // The other half of the perspective divide: clip.xyz scaled by 1/clip.w,
+    // both of them views into one range.
+    IRBuilder k;
+    const Reg<Vec4> clip = k.vec4();
+
+    EXPECT_EQ(clip.xyz().first(), clip.first());
+    EXPECT_EQ(k.registers_used(), 4u) << "a view allocates nothing";
+
+    const Reg<Scalar> inv_w = k.rcp(clip.component(3));
+    const Reg<Vec3> ndc = k.scale(clip.xyz(), inv_w);
+
+    const Program p = k.build();
+    ASSERT_GE(p.size(), 2u);
+    EXPECT_EQ(p[1].op, Opcode::V_SCALE_VEC3_F32);
+    EXPECT_TRUE(
+        same(p[1], make_v_scale_vec3_f32(ndc.first(), clip.first(), inv_w.first())));
+}
+
 // ---------------------------------------------------------------------------
 // Memory — argument order cannot be got wrong
 // ---------------------------------------------------------------------------
