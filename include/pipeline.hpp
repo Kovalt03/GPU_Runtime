@@ -80,3 +80,65 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args);
 // downward from the top row.
 Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t width,
                       uint32_t height);
+
+// --- pass 2 -----------------------------------------------------------------
+// Coverage, one thread per pixel. This is the first kernel whose threads
+// disagree about anything that matters: lanes covering a triangle take a
+// different path from lanes outside it, and a warp spanning an edge pays for
+// both. That is the divergence this project exists to measure.
+
+// RGB per pixel, the layout kernels/ray_triangle.cpp already writes, so the two
+// renderers can be compared image against image rather than by description.
+inline constexpr uint32_t PIXEL_FLOATS = 3;
+inline constexpr uint32_t PIXEL_BYTES = PIXEL_FLOATS * sizeof(float);
+
+struct RasterStageArgs {
+    // Byte offsets from the base of device memory. screen_offset is where pass
+    // 1 left its output; nothing is transferred between the two passes.
+    size_t screen_offset = 0;
+    size_t framebuffer_offset = 0;
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    // Which triangle in the screen buffer to draw. One for now — a loop over
+    // several needs a depth comparison to decide which one wins, and that is a
+    // separate change.
+    uint32_t triangle_index = 0;
+};
+
+// Builds pass 2. args[0] must point at a RasterStageArgs that outlives the
+// launch.
+//
+// No matrix here, which is the other half of why the pipeline is split: the
+// transform is per vertex and coverage is per pixel, so this kernel never pays
+// the sixteen registers pass 1 spends on a uniform.
+Program build_raster_program(void** args);
+
+// Runs pass 2 over width x height threads. The launch is 2D, and 32 threads
+// wide along x so that one warp covers 32 horizontally adjacent pixels — which
+// is what makes a triangle edge split a warp rather than fall between them.
+void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);
+
+// Twice the signed area of the triangle (a, b, p): the z component of a 2D
+// cross product. Its sign says which side of the line ab the point falls on,
+// and the three of them together decide coverage.
+float edge_function(Float3 a, Float3 b, float px, float py);
+
+// Barycentric weights of (px, py), in vertex order.
+//
+// Normalised by the signed area, which is what lets coverage be "all three are
+// >= 0" whatever way the triangle winds. That is not a nicety here: the y flip
+// in pass 1 reverses the winding of every triangle, so a test written against
+// one order would draw nothing at all.
+Float3 barycentric(Float3 v0, Float3 v1, Float3 v2, float px, float py);
+
+// The colour pass 2 writes for one pixel, and the reference the kernel is
+// compared against. Samples the pixel centre, matching the ray tracer — an edge
+// landing on a corner otherwise leaves neighbouring pixels disagreeing and
+// frays the edge.
+//
+// Ordered (w1, w2, w0) so each vertex comes out a pure primary in the same
+// arrangement kernels/ray_triangle.cpp produces. Black where the triangle does
+// not cover the pixel.
+Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py);
