@@ -78,6 +78,12 @@ void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** 
                     th.regs[REG_GLOBAL_ID_X] = float(bx * block.x + tx);
                     th.regs[REG_GLOBAL_ID_Y] = float(by * block.y + ty);
                     th.regs[REG_GLOBAL_ID_Z] = float(bz * block.z + tz);
+
+                    // Same for every thread of the block, and not recoverable
+                    // from the coordinates above without an integer divide.
+                    th.regs[REG_BLOCK_ID_X] = float(bx);
+                    th.regs[REG_BLOCK_ID_Y] = float(by);
+                    th.regs[REG_BLOCK_ID_Z] = float(bz);
                 }
                 // The Scheduler accumulates, so clear it between blocks and fold
                 // the totals in here: statistics span every launch since the last

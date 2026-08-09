@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include "ir_builder.hpp"
 #include "runtime.hpp"
 
 namespace {
@@ -251,4 +252,33 @@ TEST(Runtime, SyncResetsStats)
     EXPECT_NE(printed.find("[STATS]"), std::string::npos) << "sync must report";
     EXPECT_EQ(rt.stats().warp_steps, 0u);
     EXPECT_DOUBLE_EQ(rt.divergence_rate(), 0.0);
+}
+
+TEST(Runtime, LaunchSeedsBlockCoordinates)
+{
+    // blockIdx, which no global coordinate can be divided back down to. Every
+    // thread of a block sees the same value.
+    MyGPURuntime rt(1u << 20);
+    void* out = rt.myrt_malloc(4 * sizeof(float));
+
+    KernelFunc kernel = [](void**) -> Program {
+        IRBuilder k;
+        const Reg<Scalar> addr =
+            k.mul(k.block_x(), k.constant(static_cast<float>(sizeof(float))));
+
+        // block_y * 10 + block_x, so one float carries both coordinates and a
+        // mixed-up pair is visible rather than merely wrong.
+        const Reg<Scalar> packed =
+            k.add(k.mul(k.block_y(), k.constant(10.0f)), k.block_x());
+        k.store(addr, packed, 0.0f);
+        return k.build();
+    };
+
+    // One thread per block, two blocks along x and one along y.
+    rt.myrt_launch(kernel, dim3{2, 1, 1}, dim3{1, 1, 1}, nullptr);
+
+    std::vector<float> got(4, -1.0f);
+    rt.myrt_memcpy(got.data(), out, 4 * sizeof(float), Direction::DeviceToHost);
+    EXPECT_FLOAT_EQ(got[0], 0.0f) << "block (0, 0)";
+    EXPECT_FLOAT_EQ(got[1], 1.0f) << "block (1, 0)";
 }

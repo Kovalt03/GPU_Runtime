@@ -109,7 +109,26 @@ TEST(IRBuilder, ThreadCoordinatesAreNotAllocated)
     EXPECT_EQ(k.thread_x().first(), REG_GLOBAL_ID_X);
     EXPECT_EQ(k.thread_y().first(), REG_GLOBAL_ID_Y);
     EXPECT_EQ(k.thread_z().first(), REG_GLOBAL_ID_Z);
+    EXPECT_EQ(k.block_x().first(), REG_BLOCK_ID_X);
+    EXPECT_EQ(k.block_y().first(), REG_BLOCK_ID_Y);
+    EXPECT_EQ(k.block_z().first(), REG_BLOCK_ID_Z);
     EXPECT_EQ(k.registers_used(), 0u) << "reading a coordinate allocates nothing";
+}
+
+TEST(IRBuilder, AllocationStopsBelowTheBlockCoordinates)
+{
+    // The reserved range grew when block ids arrived, and the allocator had to
+    // move with it: wrapping onto blockIdx is as untraceable as wrapping onto
+    // the thread id was.
+    IRBuilder k;
+    EXPECT_THROW(
+        {
+            for (int i = 0; i < 300; ++i) {
+                k.scalar();
+            }
+        },
+        std::runtime_error);
+    EXPECT_LE(k.registers_used(), REG_BLOCK_ID_X);
 }
 
 // ---------------------------------------------------------------------------

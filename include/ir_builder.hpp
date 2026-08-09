@@ -128,11 +128,18 @@ public:
     Reg<Scalar> constant(float value);
     Reg<Vec3> constant(float x, float y, float z);
 
-    // --- thread coordinates -------------------------------------------------
+    // --- thread and block coordinates ---------------------------------------
     // Reserved by the launch, so the allocator never hands them out.
     Reg<Scalar> thread_x() const;
     Reg<Scalar> thread_y() const;
     Reg<Scalar> thread_z() const;
+
+    // Which block this thread runs in. Needed by anything a block owns
+    // collectively, such as the tile of the screen it covers — a global
+    // coordinate cannot be divided back down to it.
+    Reg<Scalar> block_x() const;
+    Reg<Scalar> block_y() const;
+    Reg<Scalar> block_z() const;
 
     // --- arithmetic ---------------------------------------------------------
     // Overloaded on shape, so V_SUB_F32 and V_SUB_VEC3_F32 are never chosen by

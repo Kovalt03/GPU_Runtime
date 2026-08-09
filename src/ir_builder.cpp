@@ -7,10 +7,10 @@
 
 namespace {
 
-// The launch writes the thread's coordinates here, so the allocator stops
-// short of them rather than handing one out and having a kernel quietly
-// overwrite its own identity.
-constexpr uint32_t FIRST_RESERVED_REGISTER = REG_GLOBAL_ID_X;
+// The launch writes the thread's and block's coordinates from here upward, so
+// the allocator stops short rather than handing one out and having a kernel
+// quietly overwrite its own identity.
+constexpr uint32_t FIRST_RESERVED_REGISTER = REG_BLOCK_ID_X;
 
 // A label that has been handed out but not yet placed. Distinct from address 0,
 // which is a perfectly ordinary target for a backward branch.
@@ -259,6 +259,21 @@ Reg<Scalar> IRBuilder::thread_y() const
 Reg<Scalar> IRBuilder::thread_z() const
 {
     return Reg<Scalar>(REG_GLOBAL_ID_Z);
+}
+
+Reg<Scalar> IRBuilder::block_x() const
+{
+    return Reg<Scalar>(REG_BLOCK_ID_X);
+}
+
+Reg<Scalar> IRBuilder::block_y() const
+{
+    return Reg<Scalar>(REG_BLOCK_ID_Y);
+}
+
+Reg<Scalar> IRBuilder::block_z() const
+{
+    return Reg<Scalar>(REG_BLOCK_ID_Z);
 }
 
 // ---------------------------------------------------------------------------

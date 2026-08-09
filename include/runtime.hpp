@@ -42,6 +42,17 @@ inline constexpr uint8_t REG_GLOBAL_ID_X = 253;
 inline constexpr uint8_t REG_GLOBAL_ID_Y = 254;
 inline constexpr uint8_t REG_GLOBAL_ID_Z = 255;
 
+// Which block a thread belongs to — CUDA's blockIdx, and the other half of the
+// indexing model. A global coordinate cannot be turned back into one, the ISA
+// having no integer division, so anything a block owns collectively has to be
+// found through these.
+//
+// Reserved below the global ids, which lowers the allocator's ceiling to 250.
+// Kernels here use around sixty registers, so the room costs nothing.
+inline constexpr uint8_t REG_BLOCK_ID_X = 250;
+inline constexpr uint8_t REG_BLOCK_ID_Y = 251;
+inline constexpr uint8_t REG_BLOCK_ID_Z = 252;
+
 class MyGPURuntime {
 public:
     // 64 MB of device memory by default; host allocations are rarely needed,
