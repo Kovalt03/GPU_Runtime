@@ -142,6 +142,83 @@ std::vector<Float3> render_triangle(const std::vector<Float3>& world,
     return frame;
 }
 
+// The tiled route to the same frame: bin on the host, then one block per tile.
+// Pass 1 is followed by myrt_sync for the same reason as above, so a caller's
+// runtime sees only what the raster pass cost.
+std::vector<Float3> render_triangle_tiled(const std::vector<Float3>& world,
+                                          MyGPURuntime* external = nullptr)
+{
+    MyGPURuntime local(1u << 24);
+    MyGPURuntime& rt = (external != nullptr) ? *external : local;
+
+    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
+    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
+    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
+
+    void* world_dev = rt.myrt_malloc(world_bytes);
+    void* screen_dev = rt.myrt_malloc(screen_bytes);
+    void* frame_dev = rt.myrt_malloc(frame_bytes);
+
+    std::vector<float> flat;
+    for (const Float3& v : world) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
+
+    VertexStageArgs vertex_args;
+    vertex_args.view_projection = default_vp();
+    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
+    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
+    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
+    vertex_args.width = WIDTH;
+    vertex_args.height = HEIGHT;
+    run_vertex_stage(rt, vertex_args);
+    rt.myrt_sync();
+
+    // Binning reads the projected vertices, so it happens after pass 1 — on the
+    // host, which means reading them back first. Real hardware bins in a
+    // geometry stage without the round trip.
+    std::vector<float> screen(world.size() * SCREEN_VERTEX_FLOATS, 0.0f);
+    rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
+
+    std::vector<ScreenTriangle> triangles;
+    for (size_t i = 0; i + 8 < screen.size(); i += 9) {
+        triangles.push_back(
+            ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
+                           Float3{screen[i + 3], screen[i + 4], screen[i + 5]},
+                           Float3{screen[i + 6], screen[i + 7], screen[i + 8]}});
+    }
+
+    const TileBinning binning = bin_triangles(triangles, WIDTH, HEIGHT);
+
+    void* verts_dev = rt.myrt_malloc(binning.vertices.size() * sizeof(float));
+    void* table_dev = rt.myrt_malloc(binning.table.size() * sizeof(float));
+    rt.myrt_memcpy(verts_dev, binning.vertices.data(),
+                   binning.vertices.size() * sizeof(float), Direction::HostToDevice);
+    rt.myrt_memcpy(table_dev, binning.table.data(), binning.table.size() * sizeof(float),
+                   Direction::HostToDevice);
+
+    TiledRasterStageArgs raster_args;
+    raster_args.tile_vertices_offset = rt.myrt_device_offset(verts_dev);
+    raster_args.tile_table_offset = rt.myrt_device_offset(table_dev);
+    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
+    raster_args.width = WIDTH;
+    raster_args.height = HEIGHT;
+    raster_args.tiles_x = binning.tiles_x;
+    run_tiled_raster_stage(rt, raster_args);
+
+    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
+    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
+
+    std::vector<Float3> frame;
+    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
+        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
+    }
+    return frame;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -575,4 +652,134 @@ TEST(Pipeline, RasterStageDrawsTwoTrianglesInDepthOrder)
         }
     }
     EXPECT_GT(covered, 0u) << "a frame of black would satisfy every check above";
+}
+
+// ---------------------------------------------------------------------------
+// Tiling — the same frame from a shorter list
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Two triangles far enough apart that they land in different tiles, which is
+// what makes the binning observable at all.
+std::vector<ScreenTriangle> spread_triangles()
+{
+    return {
+        ScreenTriangle{Float3{2.0f, 2.0f, 0.0f}, Float3{20.0f, 2.0f, 0.0f},
+                       Float3{2.0f, 6.0f, 0.0f}},
+        ScreenTriangle{Float3{40.0f, 20.0f, 0.0f}, Float3{60.0f, 20.0f, 0.0f},
+                       Float3{40.0f, 28.0f, 0.0f}},
+    };
+}
+
+uint32_t tile_triangle_count(const TileBinning& binning, uint32_t tx, uint32_t ty)
+{
+    return static_cast<uint32_t>(binning.table[(ty * binning.tiles_x + tx) * 2 + 1]);
+}
+
+}  // namespace
+
+TEST(Pipeline, BinningCoversTheWholeScreen)
+{
+    const TileBinning binning = bin_triangles(spread_triangles(), WIDTH, HEIGHT);
+
+    // Rounded up, so the last tile hangs off the edge and its threads fall out
+    // on the bounds check the kernel already has.
+    EXPECT_EQ(binning.tiles_x, (WIDTH + TILE_WIDTH - 1) / TILE_WIDTH);
+    EXPECT_EQ(binning.tiles_y, (HEIGHT + TILE_HEIGHT - 1) / TILE_HEIGHT);
+
+    // One (first, count) pair per tile.
+    EXPECT_EQ(binning.table.size(), binning.tile_count() * 2);
+}
+
+TEST(Pipeline, BinningPutsEachTriangleWhereItReaches)
+{
+    const TileBinning binning = bin_triangles(spread_triangles(), WIDTH, HEIGHT);
+
+    // The first triangle spans x 2..20, y 2..6 — tile (0, 0) only.
+    EXPECT_GT(tile_triangle_count(binning, 0, 0), 0u);
+
+    // The second spans x 40..60, y 20..28 — tile (1, 2) and (1, 3).
+    EXPECT_GT(tile_triangle_count(binning, 1, 2), 0u);
+
+    // And nothing reaches the top right.
+    EXPECT_EQ(tile_triangle_count(binning, 1, 0), 0u);
+}
+
+TEST(Pipeline, BinningStoresNineFloatsPerEntry)
+{
+    const TileBinning binning = bin_triangles(spread_triangles(), WIDTH, HEIGHT);
+
+    uint32_t entries = 0;
+    for (uint32_t t = 0; t < binning.tile_count(); ++t) {
+        entries += static_cast<uint32_t>(binning.table[t * 2 + 1]);
+    }
+    EXPECT_EQ(binning.vertices.size(), entries * 9u);
+    EXPECT_GE(entries, 2u) << "each triangle reaches at least one tile";
+}
+
+TEST(Pipeline, BinningDropsATriangleThatIsWhollyOffScreen)
+{
+    const std::vector<ScreenTriangle> away = {
+        ScreenTriangle{Float3{-90.0f, -90.0f, 0.0f}, Float3{-70.0f, -90.0f, 0.0f},
+                       Float3{-90.0f, -70.0f, 0.0f}},
+    };
+    const TileBinning binning = bin_triangles(away, WIDTH, HEIGHT);
+    EXPECT_TRUE(binning.vertices.empty());
+}
+
+TEST(Pipeline, TiledRasterDrawsTheSameFrameAsTheWalk)
+{
+    // The point of the whole change: fewer triangles visited, identical output.
+    const std::vector<Float3> world = {
+        Float3{-0.6f, 0.4f, -1.0f}, Float3{-0.6f, -0.4f, -1.0f},
+        Float3{0.4f, 0.4f, -1.0f},
+
+        Float3{-0.4f, 0.4f, 0.0f},  Float3{-0.4f, -0.4f, 0.0f},
+        Float3{0.6f, 0.4f, 0.0f},
+    };
+
+    const std::vector<Float3> walked = render_triangle(world);
+    const std::vector<Float3> tiled = render_triangle_tiled(world);
+    ASSERT_EQ(tiled.size(), walked.size());
+
+    for (size_t i = 0; i < walked.size(); ++i) {
+        ASSERT_NEAR(tiled[i].x, walked[i].x, PIXEL_EPS) << "pixel " << i << " r";
+        ASSERT_NEAR(tiled[i].y, walked[i].y, PIXEL_EPS) << "pixel " << i << " g";
+        ASSERT_NEAR(tiled[i].z, walked[i].z, PIXEL_EPS) << "pixel " << i << " b";
+    }
+}
+
+TEST(Pipeline, TiledRasterIssuesLessWorkThanTheWalk)
+{
+    // The measurement, asserted so a regression is a failing test rather than a
+    // number nobody re-reads.
+    //
+    // Sixteen small triangles spread over the frame, which is the shape binning
+    // is for: each tile ends up with two of them instead of all sixteen.
+    //
+    // Triangles large enough to cover the whole frame would land in every tile
+    // and leave the binning nothing to remove, at which point it costs 1.4%
+    // rather than saving anything. benchmarks/RESULTS.md records both ends.
+    std::vector<Float3> world;
+    for (uint32_t gy = 0; gy < 4; ++gy) {
+        for (uint32_t gx = 0; gx < 4; ++gx) {
+            const float cx = -2.4f + 1.6f * static_cast<float>(gx);
+            const float cy = -1.2f + 0.8f * static_cast<float>(gy);
+            world.push_back(Float3{cx, cy + 0.25f, 0.0f});
+            world.push_back(Float3{cx - 0.25f, cy - 0.25f, 0.0f});
+            world.push_back(Float3{cx + 0.25f, cy - 0.25f, 0.0f});
+        }
+    }
+
+    MyGPURuntime walked_rt(1u << 24);
+    render_triangle(world, &walked_rt);
+    const uint64_t walked = walked_rt.stats().weighted_lane_ops;
+
+    MyGPURuntime tiled_rt(1u << 24);
+    render_triangle_tiled(world, &tiled_rt);
+    const uint64_t tiled = tiled_rt.stats().weighted_lane_ops;
+
+    EXPECT_LT(tiled, walked) << "binning has to save something";
+    EXPECT_LT(tiled * 2, walked) << "and enough to be worth the change";
 }

@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 
@@ -378,4 +379,207 @@ Float3 shade_pixel_nearest(const std::vector<ScreenTriangle>& triangles, uint32_
         }
     }
     return best;
+}
+
+// ---------------------------------------------------------------------------
+// Tiling
+//
+// The same picture as the walk above, reached by reading a shorter list. What
+// changes is only which triangles a pixel ever sees, so the two are directly
+// comparable — and have to produce identical frames.
+// ---------------------------------------------------------------------------
+
+TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t width,
+                          uint32_t height)
+{
+    (void)triangles;
+    (void)width;
+    (void)height;
+    // tiles_x = ceil(width / TILE_WIDTH), tiles_y likewise. Rounding up, so the
+    // last tile is partly off screen and its threads fall out on the bounds
+    // check the kernel already has.
+    //
+    TileBinning binning;
+    binning.tiles_x = (width + TILE_WIDTH - 1) / TILE_WIDTH;
+    binning.tiles_y = (height + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    // For each tile, walk every triangle and keep the ones whose screen
+    // bounding box overlaps it:
+    //
+    //   min/max of the three x and the three y
+    //   overlap when  min.x < (tx + 1) * TILE_WIDTH  and  max.x >= tx * TILE_WIDTH
+    //   and the same along y
+    //
+    struct Box {
+        float min_x, min_y, max_x, max_y;
+    };
+    std::vector<Box> boxes;
+
+    for (const ScreenTriangle& t : triangles) {
+        boxes.push_back(
+            Box{std::min({t.v0.x, t.v1.x, t.v2.x}), std::min({t.v0.y, t.v1.y, t.v2.y}),
+                std::max({t.v0.x, t.v1.x, t.v2.x}), std::max({t.v0.y, t.v1.y, t.v2.y})});
+    }
+
+    for (uint32_t ty = 0; ty < binning.tiles_y; ++ty) {
+        for (uint32_t tx = 0; tx < binning.tiles_x; ++tx) {
+            const float left = static_cast<float>(tx * TILE_WIDTH);
+            const float top = static_cast<float>(ty * TILE_HEIGHT);
+
+            binning.table.push_back(static_cast<float>(binning.vertices.size() / 9));
+            uint32_t count = 0;
+
+            for (size_t i = 0; i < triangles.size(); ++i) {
+                const Box& b = boxes[i];
+                // Written as "no overlap", which is four independent rejections
+                // rather than four conditions that all have to line up.
+                if (b.max_x < left || b.min_x >= left + TILE_WIDTH) {
+                    continue;
+                }
+                if (b.max_y < top || b.min_y >= top + TILE_HEIGHT) {
+                    continue;
+                }
+
+                const ScreenTriangle& t = triangles[i];
+                for (const Float3& v : {t.v0, t.v1, t.v2}) {
+                    binning.vertices.push_back(v.x);
+                    binning.vertices.push_back(v.y);
+                    binning.vertices.push_back(v.z);
+                }
+                ++count;
+            }
+            binning.table.push_back(static_cast<float>(count));
+        }
+    }
+    return binning;
+}
+
+Program build_tiled_raster_program(void** args)
+{
+    const TiledRasterStageArgs& a = *static_cast<const TiledRasterStageArgs*>(args[0]);
+    IRBuilder k;
+
+    // The last tile in each direction hangs off the screen, so the bounds check
+    // is the same one the untiled kernel needs.
+    const Reg<Scalar> px = k.thread_x();
+    const Reg<Scalar> py = k.thread_y();
+    const Reg<Scalar> in_image =
+        k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+              k.lt(py, k.constant(static_cast<float>(a.height))));
+
+    k.if_(in_image, [&] {
+        const Reg<Scalar> zero = k.constant(0.0f);
+        const Reg<Scalar> one = k.constant(1.0f);
+        const Reg<Scalar> half = k.constant(0.5f);
+
+        const Reg<Scalar> cx = k.add(px, half);
+        const Reg<Scalar> cy = k.add(py, half);
+
+        // Which tile this block covers — the whole reason blockIdx exists. A
+        // global coordinate cannot be divided back down to it.
+        //
+        // Uniform across the block, so all 32 lanes of a warp load the same two
+        // floats. A scalar unit is what real hardware would use for this, and
+        // the S_ prefix the ISA reserves is for exactly that.
+        const Reg<Scalar> tile = k.add(
+            k.mul(k.block_y(), k.constant(static_cast<float>(a.tiles_x))), k.block_x());
+        const Reg<Scalar> table_addr = k.mul(tile, k.constant(2.0f * sizeof(float)));
+
+        const float table_base = static_cast<float>(a.tile_table_offset);
+        const Reg<Scalar> first = k.load(table_addr, table_base + 0.0f);
+        const Reg<Scalar> count = k.load(table_addr, table_base + 4.0f);
+
+        // The running best, as in the untiled kernel: one thread owns one pixel,
+        // so nothing is shared and no atomic is needed. Started beyond the far
+        // plane so the first covering triangle takes it.
+        const Reg<Scalar> best_z = k.constant(2.0f);
+        const Reg<Vec3> best = k.vec3();
+        k.set(best.component(0), 0.0f);
+        k.set(best.component(1), 0.0f);
+        k.set(best.component(2), 0.0f);
+
+        // An empty tile has to skip the walk outright. The loop tests its
+        // counter at the bottom, so without this guard it would read one
+        // triangle's worth of whatever follows the tile's run — and empty tiles
+        // are most of the screen, which is both where the saving comes from and
+        // where the corruption would be worst.
+        k.if_(k.gt(count, zero), [&] {
+            const Reg<Scalar> stride =
+                k.constant(static_cast<float>(3 * SCREEN_VERTEX_BYTES));
+            const Reg<Scalar> tri_addr =
+                k.add(k.mul(first, stride),
+                      k.constant(static_cast<float>(a.tile_vertices_offset)));
+            const Reg<Scalar> i = k.constant(0.0f);
+
+            const Label top = k.label();
+            k.place(top);
+
+            const Reg<Scalar> x0 = k.load(tri_addr, 0.0f);
+            const Reg<Scalar> y0 = k.load(tri_addr, 4.0f);
+            const Reg<Scalar> z0 = k.load(tri_addr, 8.0f);
+            const Reg<Scalar> x1 = k.load(tri_addr, 12.0f);
+            const Reg<Scalar> y1 = k.load(tri_addr, 16.0f);
+            const Reg<Scalar> z1 = k.load(tri_addr, 20.0f);
+            const Reg<Scalar> x2 = k.load(tri_addr, 24.0f);
+            const Reg<Scalar> y2 = k.load(tri_addr, 28.0f);
+            const Reg<Scalar> z2 = k.load(tri_addr, 32.0f);
+
+            const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
+            const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
+            const Reg<Scalar> e2 = emit_edge(k, x0, y0, x1, y1, cx, cy);
+
+            const Reg<Scalar> area = k.add(k.add(e0, e1), e2);
+            const Reg<Scalar> inv_area = k.rcp(area);
+            const Reg<Scalar> w0 = k.mul(e0, inv_area);
+            const Reg<Scalar> w1 = k.mul(e1, inv_area);
+            const Reg<Scalar> w2 = k.mul(e2, inv_area);
+
+            const Reg<Scalar> inside =
+                k.min(k.min(k.ge(w0, zero), k.ge(w1, zero)), k.ge(w2, zero));
+
+            const Reg<Scalar> depth = k.mul(w0, z0);
+            k.fma(depth, w1, z1);
+            k.fma(depth, w2, z2);
+
+            const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+            k.if_(take, [&] {
+                k.copy_into(best_z, depth);
+                k.copy_into(best.component(0), w1);
+                k.copy_into(best.component(1), w2);
+                k.copy_into(best.component(2), w0);
+            });
+
+            k.fma(tri_addr, stride, one);
+            k.fma(i, one, one);
+            k.branch_to(top, k.lt(i, count));
+        });
+
+        const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
+        const Reg<Scalar> index = k.add(row, px);
+        const Reg<Scalar> addr =
+            k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
+
+        const float frame_base = static_cast<float>(a.framebuffer_offset);
+        k.store(addr, best.component(0), frame_base + 0.0f);
+        k.store(addr, best.component(1), frame_base + 4.0f);
+        k.store(addr, best.component(2), frame_base + 8.0f);
+    });
+
+    return k.build();
+}
+
+void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
+{
+    if (args.width == 0 || args.height == 0) {
+        throw std::runtime_error("run_tiled_raster_stage: an image with no pixels");
+    }
+
+    // One block per tile, which is what makes blockIdx the tile index. A block
+    // is 256 threads, so eight warps, each covering one row of the tile.
+    // Nothing is shared between them — the ISA has no barrier — so they are
+    // independent beyond reading the same triangle list.
+    const dim3 block{TILE_WIDTH, TILE_HEIGHT, 1};
+    const dim3 grid{args.tiles_x, (args.height + TILE_HEIGHT - 1) / TILE_HEIGHT, 1};
+
+    void* raw[] = {const_cast<TiledRasterStageArgs*>(&args)};
+    rt.myrt_launch(build_tiled_raster_program, grid, block, raw);
 }

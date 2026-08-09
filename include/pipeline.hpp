@@ -170,3 +170,78 @@ float interpolate_depth(Float3 v0, Float3 v1, Float3 v2, Float3 weights);
 // far one.
 Float3 shade_pixel_nearest(const std::vector<ScreenTriangle>& triangles, uint32_t px,
                            uint32_t py);
+
+// --- tiling -----------------------------------------------------------------
+// The fix for the walk above: sort triangles into screen tiles once, so a pixel
+// only ever visits the few that reach it. O(pixels x triangles) becomes
+// O(pixels x triangles per tile), which is what real hardware buys with a
+// binning stage.
+//
+// One ThreadBlock covers one tile, so blockIdx *is* the tile index and each
+// block can find its own list. That is what block_x/block_y were added for.
+//
+// The binning runs on the host. Real hardware does it in a geometry stage and
+// keeps the lists on chip; doing it here changes where the work happens but not
+// what it saves, and the saving is what is being measured.
+
+// 32 wide so a warp still covers 32 adjacent pixels of one row — the
+// arrangement every divergence figure so far was measured against, so the
+// comparison stays honest.
+//
+// Height is free to be more than one because nothing here uses shared memory:
+// each thread reads its tile's triangles from global on its own, and no two
+// warps have to agree on anything. Hoisting a tile into shared memory would
+// need a barrier, which the ISA does not have, so it is a separate step.
+inline constexpr uint32_t TILE_WIDTH = 32;
+inline constexpr uint32_t TILE_HEIGHT = 8;
+
+// What the host hands the device.
+//
+// Triangles are copied into each tile's run rather than referenced by index. An
+// index would cost a second, dependent global load per triangle — 100 units to
+// save 36 bytes — and the duplication is bounded by how many tiles a triangle
+// spans.
+struct TileBinning {
+    // Nine floats per triangle, tile by tile, in tile order.
+    std::vector<float> vertices;
+
+    // Two floats per tile: where its run starts, counted in triangles, and how
+    // many it holds. Floats because the ISA has no integer registers.
+    std::vector<float> table;
+
+    uint32_t tiles_x = 0;
+    uint32_t tiles_y = 0;
+
+    uint32_t tile_count() const
+    {
+        return tiles_x * tiles_y;
+    }
+};
+
+// Assigns each triangle to every tile its bounding box overlaps.
+//
+// A bounding box over-counts — a thin diagonal claims tiles it only passes
+// near — which costs a few wasted coverage tests and never a missing pixel. An
+// exact test would be a triangle/rectangle intersection per pair, and the tiles
+// it saves are the cheapest ones to have kept.
+TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t width,
+                          uint32_t height);
+
+struct TiledRasterStageArgs {
+    // Byte offsets from the base of device memory.
+    size_t tile_vertices_offset = 0;
+    size_t tile_table_offset = 0;
+    size_t framebuffer_offset = 0;
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t tiles_x = 0;
+};
+
+// Builds the tiled pass 2. Same picture as build_raster_program, reached by
+// reading a shorter list.
+Program build_tiled_raster_program(void** args);
+
+// Runs it, one block per tile. The grid is the tile grid, which is what makes
+// blockIdx the tile index.
+void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);
