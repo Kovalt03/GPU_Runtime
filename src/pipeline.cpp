@@ -27,11 +27,11 @@ Reg<Scalar> emit_edge(IRBuilder& k, Reg<Scalar> ax, Reg<Scalar> ay, Reg<Scalar> 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// [1] Host reference
+// Pass 1 — projection
 //
-// Do this first. It is a dozen lines of arithmetic with no ISA in the way, and
-// once it passes its tests the device version has something to be wrong
-// against — which is the only practical way to debug a kernel here.
+// The host version first. It is arithmetic with no ISA in the way, and once it
+// passes its own tests the kernel has something to be wrong against, which is
+// the only practical way to debug one here.
 // ---------------------------------------------------------------------------
 
 Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t width,
@@ -50,12 +50,8 @@ Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t wi
     return screen;
 }
 
-// ---------------------------------------------------------------------------
-// [2] Pass 1 as a program
-//
-// The first kernel written entirely with IRBuilder, and the first use of
-// V_MATVEC_MAT4_F32 outside its own test.
-// ---------------------------------------------------------------------------
+// The same projection as a program: the first kernel written entirely with
+// IRBuilder, and the first use of V_MATVEC_MAT4_F32 outside its own test.
 
 Program build_vertex_program(void** args)
 {
@@ -147,11 +143,12 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
 }
 
 // ---------------------------------------------------------------------------
-// [3] Pass 2 — host reference
+// Pass 2 — coverage
 //
-// Do this first, as with pass 1. Coverage has three sign conventions stacked on
-// each other (winding, the y flip, pixel centres) and getting one wrong renders
-// a picture that looks deliberate.
+// Three sign conventions stack up here — the triangle's winding, the y flip
+// pass 1 applied, and where inside a pixel the sample sits — and each of them
+// wrong still renders a picture that looks deliberate. Hence a host version
+// again, and tests written as geometric facts rather than as expected numbers.
 // ---------------------------------------------------------------------------
 
 float edge_function(Float3 a, Float3 b, float px, float py)
@@ -189,14 +186,11 @@ Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py)
     return Float3{0.0f, 0.0f, 0.0f};
 }
 
-// ---------------------------------------------------------------------------
-// [4] Pass 2 as a program
-//
-// The first kernel whose lanes take different paths for reasons that are not a
-// bounds check. A warp covers 32 horizontally adjacent pixels, so a triangle
-// edge crossing it splits the warp, and step 7 measured what that costs: one
-// diverged lane is as expensive as sixteen.
-// ---------------------------------------------------------------------------
+// Coverage as a program. The first kernel whose lanes take different paths for
+// a reason that is not a bounds check: a warp covers 32 horizontally adjacent
+// pixels, so a triangle edge crossing it splits the warp. The divergence
+// benchmark already measured what that costs — one diverged lane is as
+// expensive as sixteen.
 
 Program build_raster_program(void** args)
 {
@@ -213,104 +207,110 @@ Program build_raster_program(void** args)
               k.lt(py, k.constant(static_cast<float>(a.height))));
 
     k.if_(in_image, [&] {
-        // The triangle's address is the same for every lane, so it is a host
-        // constant that rides entirely in the loads' immediates — no register
-        // and no arithmetic. Real hardware would broadcast these six values
-        // from a scalar unit; here all 32 lanes issue the same load, the same
-        // redundancy the sixteen matrix moves cost pass 1.
-        //
-        // Only x and y are read. The depth pass 1 wrote is what a second
-        // triangle would be compared on, and there is only one.
-        const float base =
-            static_cast<float>(a.screen_offset + static_cast<size_t>(a.triangle_index) *
-                                                     3 * SCREEN_VERTEX_BYTES);
-
+        // Loop invariants, hoisted: emitting them inside the body would run a
+        // move per triangle for values that never change.
         const Reg<Scalar> zero = k.constant(0.0f);
-        const Reg<Scalar> x0 = k.load(zero, base + 0.0f);
-        const Reg<Scalar> y0 = k.load(zero, base + 4.0f);
-        const Reg<Scalar> x1 = k.load(zero, base + 12.0f);
-        const Reg<Scalar> y1 = k.load(zero, base + 16.0f);
-        const Reg<Scalar> x2 = k.load(zero, base + 24.0f);
-        const Reg<Scalar> y2 = k.load(zero, base + 28.0f);
+        const Reg<Scalar> one = k.constant(1.0f);
+        const Reg<Scalar> half = k.constant(0.5f);
 
         // The pixel centre, matching what the ray tracer samples.
-        const Reg<Scalar> half = k.constant(0.5f);
         const Reg<Scalar> cx = k.add(px, half);
         const Reg<Scalar> cy = k.add(py, half);
 
-        // [d] Three edge functions, using emit_edge above. Each weight is the
-        //     edge opposite its vertex, as in barycentric():
+        // The running best is all a depth buffer would have held: one thread
+        // owns one pixel outright, so nothing is shared and no atomic is needed.
+        // A thread per triangle would have required both.
         //
-        //       e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
-        //       e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
-        //       e2 = emit_edge(k, x0, y0, x1, y1, cx, cy);
+        // Started beyond the far plane so the first covering triangle takes it.
+        const Reg<Scalar> best_z = k.constant(2.0f);
+        const Reg<Vec3> best = k.vec3();
+        k.set(best.component(0), 0.0f);
+        k.set(best.component(1), 0.0f);
+        k.set(best.component(2), 0.0f);
+
+        // The cursor walks the buffer, the counter ends the loop. Both advance
+        // through fma, the only opcode that accumulates in place.
+        const Reg<Scalar> tri_addr = k.constant(static_cast<float>(a.screen_offset));
+        const Reg<Scalar> stride =
+            k.constant(static_cast<float>(3 * SCREEN_VERTEX_BYTES));
+        const Reg<Scalar> i = k.constant(0.0f);
+        const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
+
+        // The loop splits no warp: every lane runs the same number of
+        // iterations and reaches the backward branch together. Only the
+        // coverage test inside it diverges.
         //
+        // Every lane also loads the same nine floats, the triangle not
+        // depending on the pixel. Real hardware broadcasts these from a scalar
+        // unit; here all 32 lanes issue the same load — the redundancy the
+        // sixteen matrix moves already cost pass 1, and the reason the ISA
+        // reserves an S_ prefix.
+        const Label top = k.label();
+        k.place(top);
+
+        const Reg<Scalar> x0 = k.load(tri_addr, 0.0f);
+        const Reg<Scalar> y0 = k.load(tri_addr, 4.0f);
+        const Reg<Scalar> z0 = k.load(tri_addr, 8.0f);
+        const Reg<Scalar> x1 = k.load(tri_addr, 12.0f);
+        const Reg<Scalar> y1 = k.load(tri_addr, 16.0f);
+        const Reg<Scalar> z1 = k.load(tri_addr, 20.0f);
+        const Reg<Scalar> x2 = k.load(tri_addr, 24.0f);
+        const Reg<Scalar> y2 = k.load(tri_addr, 28.0f);
+        const Reg<Scalar> z2 = k.load(tri_addr, 32.0f);
+
+        // Each weight is the edge opposite its vertex, as in barycentric().
         const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
         const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
         const Reg<Scalar> e2 = emit_edge(k, x0, y0, x1, y1, cx, cy);
 
-        // [e] area = e0 + e1 + e2, one k.rcp of it, three k.mul. Normalising
-        //     rather than testing the signs directly is what keeps the winding
-        //     from mattering — pass 1 reverses it on every triangle.
-        //
+        // The sum is twice the signed area and does not vary with the pixel, so
+        // one reciprocal serves all three weights.
         const Reg<Scalar> area = k.add(k.add(e0, e1), e2);
         const Reg<Scalar> inv_area = k.rcp(area);
         const Reg<Scalar> w0 = k.mul(e0, inv_area);
         const Reg<Scalar> w1 = k.mul(e1, inv_area);
         const Reg<Scalar> w2 = k.mul(e2, inv_area);
 
-        // [f] Coverage, and the divergence point:
-        //
-        //       inside = min(min(ge(w0, zero), ge(w1, zero)), ge(w2, zero))
-        //       k.if_else(inside, colour is (w1, w2, w0), colour is black)
-        //
-        //     Tested the positive way round, as shade_pixel is, so a degenerate
-        //     triangle's NaNs fail the comparison and leave the background.
-        //
-        //     A predicated form — selecting with V_MIN/V_MAX instead of
-        //     branching — is the comparison the README promises, and belongs in
-        //     its own change so the two can be measured against each other.
-        //
+        // Positive comparisons, as in shade_pixel: NaN fails them, so a
+        // degenerate triangle leaves the background.
         const Reg<Scalar> inside =
             k.min(k.min(k.ge(w0, zero), k.ge(w1, zero)), k.ge(w2, zero));
 
-        // Allocated before the branch, because both arms have to leave their
-        // answer in the same place for the stores below to find it.
-        const Reg<Vec3> colour = k.vec3();
-        k.if_else(
-            inside,
-            [&] {
-                // (w1, w2, w0) — v0 blue, v1 red, v2 green, as the ray tracer
-                // colours a hit.
-                k.copy_into(colour.component(0), w1);
-                k.copy_into(colour.component(1), w2);
-                k.copy_into(colour.component(2), w0);
-            },
-            [&] {
-                k.set(colour.component(0), 0.0f);
-                k.set(colour.component(1), 0.0f);
-                k.set(colour.component(2), 0.0f);
-            });
+        const Reg<Scalar> depth = k.mul(w0, z0);
+        k.fma(depth, w1, z1);
+        k.fma(depth, w2, z2);
 
-        // The stores sit after the join, so every in-image lane runs them
-        // together: the divergence above is the cost of choosing a colour, not
-        // of writing one. Putting them inside the arms instead would double
-        // what a split warp pays and make the branch look worse than it is when
-        // a predicated version is measured against it.
+        // Both conditions folded into one flag, and so one divergence point:
+        // covered, and nearer than anything kept so far.
+        const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+        k.if_(take, [&] {
+            // (w1, w2, w0), the ordering shade_pixel explains.
+            k.copy_into(best_z, depth);
+            k.copy_into(best.component(0), w1);
+            k.copy_into(best.component(1), w2);
+            k.copy_into(best.component(2), w0);
+        });
+
+        k.fma(tri_addr, stride, one);
+        k.fma(i, one, one);
+        k.branch_to(top, k.lt(i, count));
+
+        // One store after the whole walk, rather than one per triangle. Every
+        // in-image lane runs it together: the divergence above is the cost of
+        // deciding a colour, not of writing one.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
         const Reg<Scalar> addr =
             k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
 
         const float frame_base = static_cast<float>(a.framebuffer_offset);
-        k.store(addr, colour.component(0), frame_base + 0.0f);
-        k.store(addr, colour.component(1), frame_base + 4.0f);
-        k.store(addr, colour.component(2), frame_base + 8.0f);
+        k.store(addr, best.component(0), frame_base + 0.0f);
+        k.store(addr, best.component(1), frame_base + 4.0f);
+        k.store(addr, best.component(2), frame_base + 8.0f);
     });
 
-    // Registers: nine for the triangle, a handful of scalars, and no matrix.
-    // Well under what pass 1 needs, which is the register pressure the two-pass
-    // split was meant to relieve.
+    // No matrix, which is the other half of why the pipeline is split: pass 1
+    // spends sixteen registers on a uniform and this one never does.
     return k.build();
 }
 
@@ -318,6 +318,11 @@ void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
 {
     if (args.width == 0 || args.height == 0) {
         throw std::runtime_error("run_raster_stage: an image with no pixels");
+    }
+    // The kernel's loop tests its counter at the bottom, so a count of zero
+    // would still walk one triangle's worth of whatever the buffer holds.
+    if (args.triangle_count == 0) {
+        throw std::runtime_error("run_raster_stage: nothing to draw");
     }
 
     // 32 along x so that one warp lands on 32 horizontally adjacent pixels of a
@@ -331,4 +336,46 @@ void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
 
     void* raw[] = {const_cast<RasterStageArgs*>(&args)};
     rt.myrt_launch(build_raster_program, grid, block, raw);
+}
+
+float interpolate_depth(Float3 v0, Float3 v1, Float3 v2, Float3 weights)
+{
+    return weights.x * v0.z + weights.y * v1.z + weights.z * v2.z;
+}
+
+Float3 shade_pixel_nearest(const std::vector<ScreenTriangle>& triangles, uint32_t px,
+                           uint32_t py)
+{
+    // No depth buffer and no atomics: one thread owns one pixel outright, so
+    // the running best is two local values. A thread per triangle would have
+    // needed both, and neither exists in this ISA.
+    //
+    // The cost of that choice is this loop. Every pixel visits every triangle,
+    // which is O(pixels x triangles) against the O(fragments) real hardware
+    // pays — it bins triangles into tiles first, so a pixel only ever sees the
+    // few that reach it. Fixing that is a change to how work is assigned, not
+    // to where depth is kept, and it is measured against this version.
+    const float cx = static_cast<float>(px) + 0.5f;
+    const float cy = static_cast<float>(py) + 0.5f;
+
+    // Beyond the far plane, NDC z running -1 near to +1 far, so the first
+    // covering triangle always takes it.
+    float best_z = 2.0f;
+    Float3 best{0.0f, 0.0f, 0.0f};
+
+    for (const ScreenTriangle& t : triangles) {
+        const Float3 w = barycentric(t.v0, t.v1, t.v2, cx, cy);
+        if (!(w.x >= 0.0f && w.y >= 0.0f && w.z >= 0.0f)) {
+            continue;
+        }
+
+        // Strict <, so coplanar triangles resolve to the first in the buffer
+        // rather than flickering on a rounding difference.
+        const float z = interpolate_depth(t.v0, t.v1, t.v2, w);
+        if (z < best_z) {
+            best_z = z;
+            best = Float3{w.y, w.z, w.x};
+        }
+    }
+    return best;
 }

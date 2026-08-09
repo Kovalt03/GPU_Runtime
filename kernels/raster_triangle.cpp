@@ -16,6 +16,7 @@
 #include "pipeline.hpp"
 #include "ppm.hpp"
 #include "runtime.hpp"
+#include "scheduler.hpp"
 
 namespace {
 
@@ -26,6 +27,39 @@ const std::vector<Float3> TRIANGLE = {
     Float3{-0.5f, -0.5f, -2.0f},  // bottom left
     Float3{0.5f, -0.5f, -2.0f},   // bottom right
 };
+
+// The same triangle again, each copy a little further away. Not a scene worth
+// looking at — it exists so the cost of walking N triangles can be measured
+// before there is a mesh loader. One copy reproduces the ray tracer exactly,
+// and the nearest always wins, so the picture never changes however many are
+// added: any growth in the counters is the walk and nothing else.
+std::vector<Float3> scene(uint32_t triangles)
+{
+    std::vector<Float3> world;
+    for (uint32_t t = 0; t < triangles; ++t) {
+        const float back = -0.01f * static_cast<float>(t);
+        for (const Float3& v : TRIANGLE) {
+            world.push_back(Float3{v.x, v.y, v.z + back});
+        }
+    }
+    return world;
+}
+
+// Issued work, which is reproducible; the GIOPS figure alongside it is not,
+// depending as it does on how fast the host happens to be.
+void report(const char* label, const SchedulerStats& before, const SchedulerStats& after)
+{
+    SchedulerStats d;
+    d.warp_steps = after.warp_steps - before.warp_steps;
+    d.active_lane_ops = after.active_lane_ops - before.active_lane_ops;
+    d.weighted_lane_ops = after.weighted_lane_ops - before.weighted_lane_ops;
+
+    std::printf("%-14s %12llu %14llu %14llu %9.1f%%\n", label,
+                static_cast<unsigned long long>(d.warp_steps),
+                static_cast<unsigned long long>(d.active_lane_ops),
+                static_cast<unsigned long long>(d.weighted_lane_ops),
+                100.0 * d.divergence_rate());
+}
 
 Camera scene_camera()
 {
@@ -54,10 +88,13 @@ int main(int argc, char** argv)
     const uint32_t width = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 256;
     const uint32_t height =
         (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : width;
+    const uint32_t triangles = (argc > 3) ? static_cast<uint32_t>(std::atoi(argv[3])) : 1;
+
+    const std::vector<Float3> world = scene(triangles);
 
     const size_t pixels = static_cast<size_t>(width) * height;
-    const size_t world_bytes = TRIANGLE.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = TRIANGLE.size() * SCREEN_VERTEX_BYTES;
+    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
+    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
     const size_t frame_bytes = pixels * PIXEL_BYTES;
 
     MyGPURuntime rt(frame_bytes + screen_bytes + (1u << 20));
@@ -69,7 +106,7 @@ int main(int argc, char** argv)
     void* frame_dev = rt.myrt_malloc(frame_bytes);
 
     std::vector<float> world_flat;
-    for (const Float3& v : TRIANGLE) {
+    for (const Float3& v : world) {
         world_flat.push_back(v.x);
         world_flat.push_back(v.y);
         world_flat.push_back(v.z);
@@ -79,21 +116,24 @@ int main(int argc, char** argv)
     const Camera camera = scene_camera();
     const float aspect = static_cast<float>(width) / static_cast<float>(height);
 
-    std::printf("rasterising %ux%u — %zu pixels, %zu triangles\n", width, height, pixels,
-                TRIANGLE.size() / 3);
+    std::printf("rasterising %ux%u — %zu pixels, %u triangles\n\n", width, height, pixels,
+                triangles);
+    std::printf("%-14s %12s %14s %14s %10s\n", "", "warp steps", "lane ops", "weighted",
+                "divergence");
 
     // Pass 1: one thread per vertex.
     VertexStageArgs vertex_args;
     vertex_args.view_projection = camera.view_projection(aspect);
     vertex_args.world_offset = rt.myrt_device_offset(world_dev);
     vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(TRIANGLE.size());
+    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
     vertex_args.width = width;
     vertex_args.height = height;
 
+    const SchedulerStats at_start = rt.stats();
     run_vertex_stage(rt, vertex_args);
-    std::printf("pass 1 (vertex)  ");
-    rt.myrt_sync();
+    const SchedulerStats after_vertex = rt.stats();
+    report("pass 1 vertex", at_start, after_vertex);
 
     // Pass 2: one thread per pixel. Reported separately, because pass 1 runs a
     // single warp with 29 of its lanes idle and would otherwise drown out the
@@ -103,10 +143,11 @@ int main(int argc, char** argv)
     raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
     raster_args.width = width;
     raster_args.height = height;
-    raster_args.triangle_index = 0;
+    raster_args.triangle_count = triangles;
 
     run_raster_stage(rt, raster_args);
-    std::printf("pass 2 (raster)  ");
+    report("pass 2 raster", after_vertex, rt.stats());
+    std::printf("\n");
     rt.myrt_sync();
 
     std::vector<float> host_frame(pixels * PIXEL_FLOATS, 0.0f);

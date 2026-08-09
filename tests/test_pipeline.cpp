@@ -129,6 +129,7 @@ std::vector<Float3> render_triangle(const std::vector<Float3>& world,
     raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
     raster_args.width = WIDTH;
     raster_args.height = HEIGHT;
+    raster_args.triangle_count = static_cast<uint32_t>(world.size() / 3);
     run_raster_stage(rt, raster_args);
 
     std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
@@ -456,4 +457,122 @@ TEST(Pipeline, RasterStageRejectsAnEmptyImage)
     args.height = HEIGHT;
 
     EXPECT_THROW(run_raster_stage(rt, args), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Several triangles — depth, and which one wins
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Two overlapping triangles at fixed depths, already in screen space. The
+// second is nearer, so wherever they overlap it is the one that shows.
+ScreenTriangle far_triangle()
+{
+    return ScreenTriangle{Float3{5.0f, 5.0f, 0.5f}, Float3{40.0f, 5.0f, 0.5f},
+                          Float3{5.0f, 25.0f, 0.5f}};
+}
+
+ScreenTriangle near_triangle()
+{
+    return ScreenTriangle{Float3{15.0f, 5.0f, -0.5f}, Float3{50.0f, 5.0f, -0.5f},
+                          Float3{15.0f, 25.0f, -0.5f}};
+}
+
+}  // namespace
+
+TEST(Pipeline, DepthInterpolatesLinearlyAcrossTheTriangle)
+{
+    // Exact in screen space because pass 1 already divided z by w. Anything
+    // else carried across a projected triangle would need the divide undone.
+    const Float3 v0{0.0f, 0.0f, -1.0f};
+    const Float3 v1{10.0f, 0.0f, 0.0f};
+    const Float3 v2{0.0f, 10.0f, 1.0f};
+
+    EXPECT_NEAR(interpolate_depth(v0, v1, v2, Float3{1.0f, 0.0f, 0.0f}), -1.0f,
+                PIXEL_EPS);
+    EXPECT_NEAR(interpolate_depth(v0, v1, v2, Float3{0.0f, 0.0f, 1.0f}), 1.0f, PIXEL_EPS);
+    EXPECT_NEAR(interpolate_depth(v0, v1, v2, Float3{0.5f, 0.5f, 0.0f}), -0.5f,
+                PIXEL_EPS);
+}
+
+TEST(Pipeline, NearestTriangleWinsWhereTheyOverlap)
+{
+    const std::vector<ScreenTriangle> both = {far_triangle(), near_triangle()};
+
+    // Inside both: the nearer one is drawn whichever order the buffer holds.
+    const Float3 got = shade_pixel_nearest(both, 20, 10);
+    const Float3 want =
+        shade_pixel(near_triangle().v0, near_triangle().v1, near_triangle().v2, 20, 10);
+    EXPECT_NEAR(got.x, want.x, PIXEL_EPS);
+    EXPECT_NEAR(got.y, want.y, PIXEL_EPS);
+    EXPECT_NEAR(got.z, want.z, PIXEL_EPS);
+
+    const std::vector<ScreenTriangle> reversed = {near_triangle(), far_triangle()};
+    const Float3 other = shade_pixel_nearest(reversed, 20, 10);
+    EXPECT_NEAR(other.x, got.x, PIXEL_EPS) << "buffer order must not decide it";
+}
+
+TEST(Pipeline, EachTriangleShowsWhereOnlyItCovers)
+{
+    const std::vector<ScreenTriangle> both = {far_triangle(), near_triangle()};
+
+    // Left of the near triangle, inside the far one only.
+    const Float3 only_far = shade_pixel_nearest(both, 7, 10);
+    EXPECT_GT(only_far.x + only_far.y + only_far.z, 0.0f);
+
+    // Right of the far one, inside the near only.
+    const Float3 only_near = shade_pixel_nearest(both, 45, 7);
+    EXPECT_GT(only_near.x + only_near.y + only_near.z, 0.0f);
+}
+
+TEST(Pipeline, NoTriangleLeavesTheBackground)
+{
+    const std::vector<ScreenTriangle> both = {far_triangle(), near_triangle()};
+    const Float3 outside = shade_pixel_nearest(both, 60, 30);
+    EXPECT_FLOAT_EQ(outside.x, 0.0f);
+    EXPECT_FLOAT_EQ(outside.y, 0.0f);
+    EXPECT_FLOAT_EQ(outside.z, 0.0f);
+
+    EXPECT_FLOAT_EQ(shade_pixel_nearest({}, 20, 10).x, 0.0f) << "an empty buffer too";
+}
+
+TEST(Pipeline, RasterStageDrawsTwoTrianglesInDepthOrder)
+{
+    // End to end, and the check DOC/09 asks for: two triangles that occlude
+    // each other have to come out in the right order.
+    //
+    // The nearer one is at z = 0, the farther at z = -1 in world space, with
+    // the camera down +z looking at the origin.
+    const std::vector<Float3> world = {
+        Float3{-0.6f, 0.4f, -1.0f}, Float3{-0.6f, -0.4f, -1.0f},
+        Float3{0.4f, 0.4f, -1.0f},
+
+        Float3{-0.4f, 0.4f, 0.0f},  Float3{-0.4f, -0.4f, 0.0f},
+        Float3{0.6f, 0.4f, 0.0f},
+    };
+
+    const std::vector<Float3> frame = render_triangle(world);
+    ASSERT_EQ(frame.size(), static_cast<size_t>(WIDTH) * HEIGHT);
+
+    const std::vector<Float3> screen = project_all(world);
+    const std::vector<ScreenTriangle> triangles = {
+        ScreenTriangle{screen[0], screen[1], screen[2]},
+        ScreenTriangle{screen[3], screen[4], screen[5]},
+    };
+
+    uint32_t covered = 0;
+    for (uint32_t y = 0; y < HEIGHT; ++y) {
+        for (uint32_t x = 0; x < WIDTH; ++x) {
+            const Float3 want = shade_pixel_nearest(triangles, x, y);
+            const Float3 got = frame[y * WIDTH + x];
+            ASSERT_NEAR(got.x, want.x, PIXEL_EPS) << "pixel " << x << "," << y << " r";
+            ASSERT_NEAR(got.y, want.y, PIXEL_EPS) << "pixel " << x << "," << y << " g";
+            ASSERT_NEAR(got.z, want.z, PIXEL_EPS) << "pixel " << x << "," << y << " b";
+            if (want.x + want.y + want.z > 0.0f) {
+                ++covered;
+            }
+        }
+    }
+    EXPECT_GT(covered, 0u) << "a frame of black would satisfy every check above";
 }

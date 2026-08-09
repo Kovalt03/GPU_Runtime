@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "isa.hpp"
 #include "math3d.hpp"
@@ -18,8 +19,6 @@
 //
 //   pass 1  vertex_program   1 thread = 1 vertex   world -> screen
 //   pass 2  raster_program   1 thread = 1 pixel    coverage, nearest wins
-//
-// Only pass 1 exists so far.
 
 // --- device buffer layout ---------------------------------------------------
 // Kernels address device memory by byte offset, so the strides are named once
@@ -82,10 +81,15 @@ Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t wi
                       uint32_t height);
 
 // --- pass 2 -----------------------------------------------------------------
-// Coverage, one thread per pixel. This is the first kernel whose threads
-// disagree about anything that matters: lanes covering a triangle take a
-// different path from lanes outside it, and a warp spanning an edge pays for
-// both. That is the divergence this project exists to measure.
+// Coverage, one thread per pixel, and the first kernel whose lanes disagree
+// about anything that matters: a warp spanning a triangle edge pays for both
+// paths. That is the divergence this project exists to measure.
+//
+// Each pixel walks every triangle, which costs O(pixels x triangles) against
+// the O(fragments) real hardware pays — it bins triangles into tiles first, so
+// a pixel only sees the few that reach it. Kept this way on purpose, as the
+// baseline a tiled version is measured against; benchmarks/RESULTS.md has the
+// numbers.
 
 // RGB per pixel, the layout kernels/ray_triangle.cpp already writes, so the two
 // renderers can be compared image against image rather than by description.
@@ -101,10 +105,9 @@ struct RasterStageArgs {
     uint32_t width = 0;
     uint32_t height = 0;
 
-    // Which triangle in the screen buffer to draw. One for now — a loop over
-    // several needs a depth comparison to decide which one wins, and that is a
-    // separate change.
-    uint32_t triangle_index = 0;
+    // How many triangles the screen buffer holds. Each thread walks all of
+    // them and keeps the nearest that covers it.
+    uint32_t triangle_count = 0;
 };
 
 // Builds pass 2. args[0] must point at a RasterStageArgs that outlives the
@@ -133,12 +136,37 @@ float edge_function(Float3 a, Float3 b, float px, float py);
 // one order would draw nothing at all.
 Float3 barycentric(Float3 v0, Float3 v1, Float3 v2, float px, float py);
 
-// The colour pass 2 writes for one pixel, and the reference the kernel is
-// compared against. Samples the pixel centre, matching the ray tracer — an edge
-// landing on a corner otherwise leaves neighbouring pixels disagreeing and
-// frays the edge.
+// The colour one triangle gives a pixel, black where it does not cover it.
 //
-// Ordered (w1, w2, w0) so each vertex comes out a pure primary in the same
-// arrangement kernels/ray_triangle.cpp produces. Black where the triangle does
-// not cover the pixel.
+// Samples the pixel centre, matching the ray tracer: an edge landing on a
+// corner otherwise leaves neighbouring pixels disagreeing and frays it.
+//
+// Ordered (w1, w2, w0), which is what makes each vertex the same primary
+// kernels/ray_triangle.cpp produces from (u, v, 1 - u - v). The two renderers
+// are meant to be compared as images, and a rotation in hue is the kind of
+// wrong that still looks deliberate.
 Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py);
+
+// A triangle as pass 1 leaves it: x and y in pixels, z the NDC depth.
+struct ScreenTriangle {
+    Float3 v0;
+    Float3 v1;
+    Float3 v2;
+};
+
+// Depth of the triangle at a pixel.
+//
+// A plain weighted sum, which would be wrong for anything else carried across a
+// projected triangle: pass 1 already divided z by w, so it varies linearly in
+// screen space. That is why a depth buffer stores NDC z and not distance from
+// the camera.
+float interpolate_depth(Float3 v0, Float3 v1, Float3 v2, Float3 weights);
+
+// The whole of pass 2 for one pixel, and the reference a rendered frame is
+// checked against: the colour of the nearest triangle covering it, black if
+// none does.
+//
+// Nearest means smallest depth, NDC running -1 at the near plane to +1 at the
+// far one.
+Float3 shade_pixel_nearest(const std::vector<ScreenTriangle>& triangles, uint32_t px,
+                           uint32_t py);
