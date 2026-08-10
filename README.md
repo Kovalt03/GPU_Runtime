@@ -32,9 +32,17 @@ grows only with the perimeter.
 
 ```
   ┌──────────────────────────────────────────────────┐
-  │       Ray-Triangle Kernel  (validation load)     │
-  │             kernels/ray_triangle.cpp             │
-  │       Möller–Trumbore · 256×256 · PPM output     │
+  │        Kernels  (validation workloads)           │
+  │   ray_triangle.cpp  ·  raster_triangle.cpp       │
+  │   Möller–Trumbore   ·  edge functions            │
+  │        both render to PPM, and must agree        │
+  └────────────────────┬─────────────────────────────┘
+                       │  Mesh · Camera · two launches
+  ┌────────────────────▼─────────────────────────────┐
+  │              Graphics Pipeline                   │
+  │      include/pipeline.hpp · include/math3d.hpp    │
+  │   vertex stage → tile binning → raster stage     │
+  │   host-side Float3 / Float4x4, staged in shared  │
   └────────────────────┬─────────────────────────────┘
                        │  emits a Program
   ┌────────────────────▼─────────────────────────────┐
@@ -67,8 +75,10 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   V_MUL_F32 / V_DOT_VEC3_F32 / V_LD_GLOBAL_F32   │
-  │   V_CMP_F32 / BRA_DIV / RET                      │
+  │   25 opcodes, 8 bytes each                       │
+  │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
+  │   V_LD_GLOBAL_F32 / V_LD_SHARED_F32              │
+  │   V_CMP_F32 / BRA_DIV / BARRIER / RET            │
   └──────┬───────────────────────────────────────────┘
          │  physical memory access
   ┌──────▼───────────────────────────────────────────┐
@@ -89,14 +99,15 @@ than force a rename:
 ```
 ALU        V_<OP>[_<SHAPE>]_<TYPE>          V_ADD_F32, V_CROSS_VEC3_F32
 Memory     V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>   V_LD_GLOBAL_F32
-Control    <OP>                             BRA, BRA_DIV, RET
+Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
 ```
 
 - **`V_`** marks instructions that write the per-lane register file, following
   the AMD `v_add_f32` convention. Control flow only mutates warp state
   (`pc`, `activeMask`), so it carries no prefix.
-- **`<SHAPE>`** is omitted for scalars; `VEC3` today, with `VEC4`, `MAT3` and
-  `MAT4` reserved for matrix transforms.
+- **`<SHAPE>`** is omitted for scalars. `VEC3` and `MAT4` are built —
+  `V_MATVEC_MAT4_F32` arrived for the vertex stage and filled the slot the
+  scheme had reserved for it, without renaming anything. `MAT3` is still open.
 - **`<TYPE>`** always comes last, leaving room for `F64` / `F16`.
 
 `F32` rather than `FP32` because that is the mnemonic standard — PTX `add.f32`,
@@ -117,8 +128,11 @@ opcodes are added.
 | 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | ✅ |
 | 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | ✅ |
 | 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | ✅ |
-| 8 | IR Builder | `include/ir_builder.hpp` · `src/ir_builder.cpp` | 🔲 |
-| 9 | Rasterizer + Ray Tracer | `kernels/` | 🔲 |
+| 8 | IR Builder | `include/ir_builder.hpp` · `src/ir_builder.cpp` | ✅ |
+| 9 | Host geometry | `include/math3d.hpp` · `src/math3d.cpp` | ✅ |
+| 10 | Rasteriser | `include/pipeline.hpp` · `src/pipeline.cpp` | ✅ |
+| 11 | Tile binning + shared memory | `src/pipeline.cpp` · `BARRIER` | ✅ |
+| 12 | Ray tracer over the same scene | `src/pipeline.cpp` | 🔲 |
 
 ---
 
@@ -184,8 +198,10 @@ on their own line, `int* ptr`.
 | Warp divergence rate (ray kernel, 256x256) | 2.6% |
 | Warp divergence rate (64x64) | 10.1% |
 | Issue overhead once a warp splits | 1.80x |
-| Rendering throughput | 0.20 GIOPS |
-| Tests | 88 |
+| Rasteriser, tile binning | **-84%** issued work |
+| Rasteriser, staged through shared memory | **-95%** against the naive walk |
+| Opcodes | 25 |
+| Tests | 191 |
 
 ### What divergence costs
 
@@ -214,6 +230,37 @@ genuinely costs less, while hardware would keep its ALU busy regardless.
 
 ---
 
+## What the optimisations bought
+
+Two renderers draw the same triangle by different arithmetic —
+Möller-Trumbore against edge functions — and their PPMs are byte-identical.
+That is the check neither can make alone: each kernel is tested against a host
+reference written from the same conventions, so a sign wrong in both would pass.
+
+The rasteriser was then made faster twice, measured in issued work rather than
+wall clock so the figures reproduce. Sixteen small triangles over a 64x32 frame:
+
+| | weighted lane ops | against the previous | against the walk |
+|---|---:|---:|---:|
+| every pixel walks every triangle | 31,701,456 | — | — |
+| triangles binned into 32x8 tiles | 4,979,152 | -84.3% | -84.3% |
+| each tile staged in shared memory | 1,646,944 | -66.9% | **-94.8%** |
+
+The two changes remove different waste, which shows on a scene built to defeat
+the first: when every triangle covers every tile, **binning loses 1.4%** having
+nothing to drop, while staging still wins 84% — 256 threads were issuing the
+same nine global loads either way.
+
+Staging needed `BARRIER`, the project's `__syncthreads()`. The fill and the
+barrier sit outside the kernel's bounds check, because a thread whose pixel is
+off screen still has to arrive; reaching a barrier under divergence is refused
+rather than left to hang.
+
+`benchmarks/RESULTS.md` carries the full tables, the method, and a prediction
+about divergence that the measurements contradicted.
+
+---
+
 ## Layout
 
 ```
@@ -232,24 +279,36 @@ gpu-runtime-sim/
 │   ├── memory.hpp
 │   ├── thread.hpp
 │   ├── scheduler.hpp
-│   └── runtime.hpp
+│   ├── runtime.hpp
+│   ├── ir_builder.hpp
+│   ├── math3d.hpp
+│   └── pipeline.hpp
 ├── src/
 │   ├── isa.cpp
 │   ├── memory.cpp
 │   ├── thread.cpp
 │   ├── scheduler.cpp
-│   └── runtime.cpp
+│   ├── runtime.cpp
+│   ├── ir_builder.cpp
+│   ├── math3d.cpp
+│   └── pipeline.cpp
 ├── kernels/
-│   └── ray_triangle.cpp
+│   ├── ppm.hpp
+│   ├── ray_triangle.cpp
+│   └── raster_triangle.cpp
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── test_isa.cpp
 │   ├── test_memory.cpp
 │   ├── test_thread.cpp
 │   ├── test_scheduler.cpp
-│   └── test_runtime.cpp
+│   ├── test_runtime.cpp
+│   ├── test_ir_builder.cpp
+│   ├── test_math3d.cpp
+│   └── test_pipeline.cpp
 ├── benchmarks/
 │   ├── CMakeLists.txt
+│   ├── RESULTS.md
 │   └── divergence_bench.cpp
 └── output/
     └── .gitkeep
