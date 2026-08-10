@@ -4,6 +4,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include "isa.hpp"
 
 #include "scheduler.hpp"
 
@@ -405,6 +406,11 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
 
     // min-PC skips retired threads, so clearing the flag is all that is needed.
     case Opcode::RET: thread.active = false; break;
+
+    case Opcode::BARRIER:
+        throw std::runtime_error(
+            "BARRIER reached the lane loop; step_warp "
+            "should have intercepted it");
     }
 }
 
@@ -442,6 +448,44 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
                                  std::to_string(program.size()) + "-instruction program");
     }
 
+    if (program[warp.pc].op == Opcode::BARRIER) {
+        // Every live lane has to have arrived. min-PC issue means the warp
+        // reaches a barrier with only the lanes that got there; any that
+        // branched past sit at a higher pc and will never come back, so the
+        // wait would be against threads already gone ahead.
+        //
+        // CUDA requires the condition around a barrier to evaluate identically
+        // across the block and documents that anything else may hang or go
+        // quietly wrong. Both are worse than a message.
+        uint32_t live = 0;
+        for (const Thread& t : warp.threads) {
+            if (t.active) {
+                ++live;
+            }
+        }
+        if (active_lane_count(warp) != live) {
+            throw std::runtime_error(
+                "BARRIER at pc " + std::to_string(warp.pc) + " reached by " +
+                std::to_string(active_lane_count(warp)) + " of " + std::to_string(live) +
+                " live lanes: a barrier inside divergent control flow");
+        }
+
+        // Past the barrier before waiting, or a released warp arrives at the
+        // same instruction again and never gets anywhere.
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (is_active(warp, lane)) {
+                ++warp.threads[lane].pc;
+            }
+        }
+
+        stats_.warp_steps += 1;
+        stats_.active_lane_ops += live;
+        stats_.weighted_lane_ops += live * instruction_cost(Opcode::BARRIER);
+
+        warp.at_barrier = true;
+        return false;
+    }
+
     // Skipping the masked lanes is what divergence costs: they are paid for by
     // the step and produce nothing. Advancing pc before execute() is what lets a
     // branch simply overwrite it.
@@ -463,6 +507,20 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     return true;
 }
 
+void WarpScheduler::release_barrier(ThreadBlock& block)
+{
+    // Called only once the queue has run dry, and that is the whole arrival
+    // test: if nobody can take a turn and somebody is waiting, then every warp
+    // with work left has reached the barrier. No arrival counter to keep in
+    // step with warp retirement — the queue already knows.
+    for (Warp& warp : block.warps) {
+        if (warp.at_barrier) {
+            warp.at_barrier = false;
+            ready_queue_.push(&warp);
+        }
+    }
+}
+
 void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan global)
 {
     // A previous run() may have thrown partway and left pointers here that now
@@ -470,6 +528,7 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
     ready_queue_ = {};
 
     for (Warp& warp : block.warps) {
+        warp.at_barrier = false;
         ready_queue_.push(&warp);
     }
 
@@ -481,6 +540,13 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
         ready_queue_.pop();
         if (step_warp(program, *warp, block, global)) {
             ready_queue_.push(warp);
+        }
+
+        // A warp that retires before reaching the barrier stops being waited
+        // for. Waiting for it instead would hang, and a simulator that hangs is
+        // harder to debug than one that carries on.
+        if (ready_queue_.empty()) {
+            release_barrier(block);
         }
     }
 }

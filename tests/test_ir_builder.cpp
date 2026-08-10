@@ -431,6 +431,17 @@ TEST(IRBuilder, IfRunsItsBodyOnlyWhenTheConditionHolds)
 // Output
 // ---------------------------------------------------------------------------
 
+TEST(IRBuilder, BarrierEmitsTheOpcode)
+{
+    IRBuilder k;
+    k.barrier();
+
+    const Program p = k.build();
+    ASSERT_GE(p.size(), 1u);
+    EXPECT_EQ(p[0].op, Opcode::BARRIER);
+    EXPECT_EQ(k.registers_used(), 0u) << "synchronisation allocates nothing";
+}
+
 TEST(IRBuilder, BuildAppendsRet)
 {
     IRBuilder k;

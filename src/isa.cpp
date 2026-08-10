@@ -55,6 +55,7 @@ std::string_view opcode_name(Opcode op)
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
     case Opcode::BRA_DIV:          return "BRA_DIV";
+    case Opcode::BARRIER:          return "BARRIER";
     case Opcode::RET:              return "RET";
     }
 
@@ -208,6 +209,11 @@ Instruction make_bra_div(uint8_t cond_reg, int32_t offset)
     return {Opcode::BRA_DIV, 0, cond_reg, 0, encode_branch_offset(offset)};
 }
 
+Instruction make_barrier()
+{
+    return {Opcode::BARRIER, 0, 0, 0, 0.0f};
+}
+
 Instruction make_ret()
 {
     return {Opcode::RET, 0, 0, 0, 0.0f};
@@ -263,6 +269,11 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::BRA:
     case Opcode::BRA_DIV:
     case Opcode::RET: return 1;
+
+    // The instruction itself is nothing; the cost of a barrier is the stall
+    // while the slowest warp catches up, and that shows as warps not issuing
+    // rather than as weight on this line.
+    case Opcode::BARRIER: return 1;
     }
 
     return 1;

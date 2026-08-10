@@ -362,6 +362,11 @@ void IRBuilder::store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset)
 // before the branch that reaches it.
 // ---------------------------------------------------------------------------
 
+void IRBuilder::barrier()
+{
+    emit(make_barrier());
+}
+
 Label IRBuilder::label()
 {
     const uint32_t id = static_cast<uint32_t>(label_targets_.size());

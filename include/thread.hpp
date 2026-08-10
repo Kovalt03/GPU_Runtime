@@ -34,6 +34,10 @@ struct Warp {
     std::array<Thread, WARP_SIZE> threads{};
     uint32_t pc = 0;
     uint32_t active_mask = 0;
+
+    // A waiting warp leaves the scheduler's queue entirely, which is what makes
+    // the wait cost nothing but the turns it does not take.
+    bool at_barrier = false;
 };
 
 // Named ThreadBlock rather than Block because memory.hpp already defines a

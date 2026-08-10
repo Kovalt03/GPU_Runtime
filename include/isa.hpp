@@ -67,6 +67,9 @@ enum class Opcode : uint8_t {
     BRA,      // pc += (int32_t)imm                       (unconditional)
     BRA_DIV,  // if (reg[src0] != 0.0f) pc += (int32_t)imm
               //   → splits activeMask (divergence point)
+
+    // CUDA's __syncthreads().
+    BARRIER,  // wait for every live warp of the block    (all operands unused)
     RET,      // end thread                               (all operands unused)
 };
 
@@ -119,6 +122,7 @@ Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0
 // CONTROL FLOW
 Instruction make_bra(int32_t offset);
 Instruction make_bra_div(uint8_t cond_reg, int32_t offset);
+Instruction make_barrier();
 Instruction make_ret();
 
 // Bit reinterpretation between 'imm' and 'CmpOp'. Centralized here so that the

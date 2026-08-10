@@ -82,9 +82,13 @@ private:
     std::queue<Warp*> ready_queue_;  // pointers: a Warp is ~32 KB
     SchedulerStats stats_;
 
-    // False once the warp has no active threads left.
+    // Returns false when the warp will not take another turn — retired, or now
+    // waiting at a barrier. run() tells the two apart by Warp::at_barrier.
     bool step_warp(const Program& program, Warp& warp, ThreadBlock& block,
                    DeviceSpan global);
+
+    // Every warp of the block has arrived, so let them all go.
+    void release_barrier(ThreadBlock& block);
 
     // thread.pc has already been advanced past instr; branches overwrite it,
     // computing their target from instr_pc rather than from the advanced value.

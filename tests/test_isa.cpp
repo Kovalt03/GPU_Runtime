@@ -15,7 +15,8 @@ constexpr int OPCODE_COUNT = static_cast<int>(Opcode::RET) + 1;
 // the opcodes into these two groups.
 bool is_control_flow(Opcode op)
 {
-    return op == Opcode::BRA || op == Opcode::BRA_DIV || op == Opcode::RET;
+    return op == Opcode::BRA || op == Opcode::BRA_DIV || op == Opcode::BARRIER ||
+           op == Opcode::RET;
 }
 
 bool starts_with(std::string_view s, std::string_view prefix)
@@ -66,9 +67,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 24 opcodes, 0-indexed → RET == 23
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 23);
-    EXPECT_EQ(OPCODE_COUNT, 24);
+    // 25 opcodes, 0-indexed → RET == 24
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 24);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 23);
+    EXPECT_EQ(OPCODE_COUNT, 25);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an

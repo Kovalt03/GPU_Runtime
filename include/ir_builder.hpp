@@ -214,6 +214,10 @@ public:
     void branch_to(Label target);                        // unconditional
     void branch_to(Label target, Reg<Scalar> when_set);  // when the flag is not 0
 
+    // Must sit outside any if_: every thread of the block has to reach it, and
+    // the scheduler throws when one does not.
+    void barrier();
+
     // Structured forms, for the cases a label would only clutter. BRA_DIV can
     // only jump when a value is non-zero, so skipping a body costs one extra
     // instruction to invert the condition; that is hidden here.

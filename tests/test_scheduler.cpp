@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include "runtime.hpp"  // REG_GLOBAL_ID_X, seeded by a launch
 #include "scheduler.hpp"
 
 namespace {
@@ -622,4 +623,123 @@ TEST(Scheduler, ProgramCounterLeavingTheProgramThrows)
     Fixture f;
     // Falls off the end: no RET, so pc walks past the last instruction.
     EXPECT_THROW(f.run(Program{make_v_mov_f32(10, 1.0f)}), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// BARRIER — the one opcode the scheduler handles above the lane loop
+// ---------------------------------------------------------------------------
+
+TEST(Scheduler, BarrierMakesOneWarpsWritesVisibleToAnother)
+{
+    // What the whole thing is for. Warp 0 writes shared memory, warp 1 reads
+    // it, and only the barrier between them makes the order hold.
+    //
+    // The writer is padded so that round-robin puts the reader at its load long
+    // before the writer reaches its store. Without that the interleaving
+    // happens to order them correctly on its own and the test proves nothing —
+    // it passed against a barrier that did nothing at all until this was added.
+    ThreadBlock block = make_block(2);
+
+    Program p;
+    p.push_back(make_v_mov_f32(0, 0.0f));                           // 0: address
+    p.push_back(make_v_mov_f32(1, 7.0f));                           // 1: value
+    p.push_back(make_v_mov_f32(2, 32.0f));                          // 2: boundary
+    p.push_back(make_v_cmp_f32(3, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 3
+    p.push_back(make_bra_div(3, 8));                                // 4: readers -> 12
+    for (int i = 0; i < 5; ++i) {                                   // 5..9: padding
+        p.push_back(make_v_mov_f32(5, 0.0f));
+    }
+    p.push_back(make_v_st_shared_f32(0, 1, 0.0f));  // 10: the write
+    p.push_back(make_bra(1));                       // 11: -> 12
+    p.push_back(make_barrier());                    // 12
+    p.push_back(make_v_ld_shared_f32(4, 0, 0.0f));  // 13: the read
+    p.push_back(make_ret());                        // 14
+
+    for (uint32_t w = 0; w < 2; ++w) {
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            block.warps[w].threads[lane].regs[REG_GLOBAL_ID_X] =
+                static_cast<float>(w * WARP_SIZE + lane);
+        }
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(64, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[1].threads[0].regs[4], 7.0f)
+        << "the reader has to see the writer's value";
+}
+
+TEST(Scheduler, BarrierLetsEveryWarpThrough)
+{
+    // Two warps, a barrier, then both keep going. Neither should be left
+    // waiting when run() returns.
+    ThreadBlock block = make_block(2);
+
+    Program p;
+    p.push_back(make_barrier());
+    p.push_back(make_v_mov_f32(0, 5.0f));
+    p.push_back(make_ret());
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    for (const Warp& warp : block.warps) {
+        EXPECT_FALSE(warp.at_barrier) << "nobody is left waiting";
+        EXPECT_FLOAT_EQ(warp.threads[0].regs[0], 5.0f) << "and everyone ran on";
+    }
+}
+
+TEST(Scheduler, BarrierRejectsBeingReachedUnderDivergence)
+{
+    // Half the lanes branch past the barrier, so the warp arrives with only the
+    // other half and those lanes would be synchronised against threads that
+    // never come. CUDA leaves this to hang or go quietly wrong; simulating the
+    // rule is worth nothing unless it is enforced.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(0, 16.0f));
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0, CmpOp::GE));
+    p.push_back(make_bra_div(1, 2));  // lanes 16..31 jump over the barrier
+    p.push_back(make_barrier());
+    p.push_back(make_ret());
+
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, BarrierDoesNotWaitForAWarpThatHasRetired)
+{
+    // Warp 1 leaves before the barrier; warp 0 must not be stranded there.
+    ThreadBlock block = make_block(2);
+
+    Program p;
+    p.push_back(make_v_mov_f32(0, 32.0f));
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0, CmpOp::GE));
+    p.push_back(make_bra_div(1, 3));  // warp 1 leaves at once
+    p.push_back(make_barrier());
+    p.push_back(make_v_mov_f32(2, 9.0f));
+    p.push_back(make_ret());
+
+    for (uint32_t w = 0; w < 2; ++w) {
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            block.warps[w].threads[lane].regs[REG_GLOBAL_ID_X] =
+                static_cast<float>(w * WARP_SIZE + lane);
+        }
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[2], 9.0f)
+        << "warp 0 must not be stranded";
 }
