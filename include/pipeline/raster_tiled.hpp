@@ -101,7 +101,7 @@ void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);
 // not the ones that read each entry, so without a rendezvous between the two a
 // fast warp reads a slot a slow one has not written.
 
-// 4096 floats of shared memory, nine per triangle. A tile holding more than
+// 4096 floats of shared memory, twelve per triangle. A tile holding more than
 // this cannot be staged in one pass, and real hardware has the same problem —
 // it splits the tile across passes. Refused here instead.
 // A binned triangle is laid out exactly as three consecutive screen vertices,

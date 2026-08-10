@@ -24,15 +24,8 @@ target_compile_options(project_warnings INTERFACE
 )
 
 # ---------------------------------------------------------------------------
-# Core library — each implementation stage adds its source here.
-#   1) ISA        src/isa.cpp        (done)
-#   2) Memory     src/memory.cpp     (done)
-#   3) Thread     src/thread.cpp     (done)
-#   4) Scheduler  src/scheduler.cpp  (done)
-#   5) Runtime    src/runtime.cpp    (done)
-#   8) IRBuilder  src/ir_builder.cpp (done)
-#   9) Graphics   src/math3d.cpp     (done)
-#                 src/pipeline/*.cpp (done)
+# Core library. Listed bottom up, each layer using only the ones above it —
+# the kernels and the benchmark link this and add a main().
 # ---------------------------------------------------------------------------
 add_library(gpurt STATIC
     src/isa.cpp

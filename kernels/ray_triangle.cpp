@@ -92,7 +92,7 @@ Program build_ray_triangle_program(void** args)
     const KernelArgs& a = *static_cast<const KernelArgs*>(args[0]);
     Program p;
 
-    // [1] Constants and the triangle, as immediates.
+    // Constants and the triangle, as immediates.
     const auto mov_vec3 = [&p](uint8_t reg, const Vec3& v) {
         p.push_back(make_v_mov_f32(reg + 0, v.x));
         p.push_back(make_v_mov_f32(reg + 1, v.y));
@@ -108,16 +108,17 @@ Program build_ray_triangle_program(void** args)
     mov_vec3(R_V1, a.scene->v1);
     mov_vec3(R_V2, a.scene->v2);
 
-    // [2] Ray direction: normalize(x - 0.5, 0.5 - y, -1), where x and y are the
-    //     pixel *centre* in [0,1). REG_GLOBAL_ID_X/_Y arrive as integer pixel
-    //     coordinates, and the ISA has no divide, so the reciprocal is baked in
-    //     and the kernel multiplies.
+    // Ray direction: normalize(x - 0.5, 0.5 - y, -1), where x and y are the
+    // pixel *centre* in [0,1). REG_GLOBAL_ID_X/_Y arrive as integer pixel
+    // coordinates, and the ISA has no divide, so the reciprocal is baked in and
+    // the kernel multiplies.
     //
-    //     Sampling the centre rather than the corner matters: an edge landing
-    //     exactly on a corner leaves u + v at 1.0 give or take a rounding error,
-    //     and neighbouring pixels along it then disagree, fraying the edge. The
-    //     half-pixel folds into the constant, so it costs nothing:
-    //       (px + 0.5) * inv_w - 0.5  ==  px * inv_w + (0.5 * inv_w - 0.5)
+    // Sampling the centre rather than the corner matters: an edge landing
+    // exactly on a corner leaves u + v at 1.0 give or take a rounding error, and
+    // neighbouring pixels along it then disagree, fraying the edge. The
+    // half-pixel folds into the constant, so it costs nothing:
+    //
+    //   (px + 0.5) * inv_w - 0.5  ==  px * inv_w + (0.5 * inv_w - 0.5)
     const float inv_w = 1.0f / static_cast<float>(a.width);
     const float inv_h = 1.0f / static_cast<float>(a.height);
 
@@ -137,11 +138,11 @@ Program build_ray_triangle_program(void** args)
 
     p.push_back(make_v_norm_vec3_f32(R_DIR, R_DIR));
 
-    // [3] Möller-Trumbore, one ISA instruction at a time.
+    // Möller-Trumbore, one ISA instruction at a time.
     //
-    //     A branch target is not known while the tests are being emitted, the
-    //     miss path not existing yet. Placeholders are recorded and patched once
-    //     the label is placed — a forward reference, as any assembler handles it.
+    // A branch target is not known while the tests are being emitted, the miss
+    // path not existing yet. Placeholders are recorded and patched once
+    // the label is placed — a forward reference, as any assembler handles it.
     std::vector<size_t> miss_branches;
     const auto branch_to_miss = [&p, &miss_branches](uint8_t cond) {
         miss_branches.push_back(p.size());
@@ -192,12 +193,12 @@ Program build_ray_triangle_program(void** args)
     p.push_back(make_v_cmp_f32(R_COND, R_T, R_EPS, CmpOp::LT));
     branch_to_miss(R_COND);
 
-    // [4] Hit: barycentric coordinates as the colour. Each vertex comes out a
-    //     pure primary, so wrong intersection maths shows as a wrong gradient —
-    //     flat white would hide it.
+    // Hit: barycentric coordinates as the colour. Each vertex comes out a pure
+    // primary, so wrong intersection maths shows as a wrong gradient — flat
+    // white would hide it.
     //
-    //     V_MOV_F32 takes an immediate, so a register-to-register copy has to go
-    //     through arithmetic; adding zero is the idiom.
+    // V_MOV_F32 takes an immediate, so a register-to-register copy has to go
+    // through arithmetic; adding zero is the idiom.
     p.push_back(make_v_add_f32(R_COLOR + 0, R_U, R_ZERO));
     p.push_back(make_v_add_f32(R_COLOR + 1, R_V, R_ZERO));
     p.push_back(make_v_sub_f32(R_COLOR + 2, R_ONE, R_U));
@@ -207,7 +208,7 @@ Program build_ray_triangle_program(void** args)
     const size_t skip_miss = p.size();
     p.push_back(make_bra(0));
 
-    // [5] Miss: background.
+    // Miss: background.
     const size_t miss_label = p.size();
     p.push_back(make_v_mov_f32(R_COLOR + 0, 0.0f));
     p.push_back(make_v_mov_f32(R_COLOR + 1, 0.0f));
@@ -220,13 +221,13 @@ Program build_ray_triangle_program(void** args)
     }
     p[skip_miss] = make_bra(static_cast<int32_t>(write_label - skip_miss));
 
-    // [6] addr = framebuffer_offset + (py * width + px) * 3 * sizeof(float)
+    // addr = framebuffer_offset + (py * width + px) * 3 * sizeof(float)
     //
-    //     Rounding the grid up leaves lanes with px >= width whenever the width
-    //     is not a multiple of the warp size. Their address lands on the next
-    //     row, so they are branched over the stores entirely. The current scene
-    //     hides this — those lanes write black onto a black margin — but the
-    //     corruption is real for any triangle reaching the left edge.
+    // Rounding the grid up leaves lanes with px >= width whenever the width is
+    // not a multiple of the warp size. Their address lands on the next
+    // row, so they are branched over the stores entirely. The current scene
+    // hides this — those lanes write black onto a black margin — but the
+    // corruption is real for any triangle reaching the left edge.
     p.push_back(make_v_mov_f32(R_TMP, static_cast<float>(a.width)));
     p.push_back(make_v_cmp_f32(R_COND, REG_GLOBAL_ID_X, R_TMP, CmpOp::GE));
     const size_t skip_store = p.size();
