@@ -73,9 +73,9 @@ private:
     uint8_t first_ = 0;
 };
 
-// A branch target whose address is not known when the branch is emitted. Five
-// separate tests in Möller-Trumbore jump to one miss path, so nesting if_ would
-// mean nesting five deep; a label suits that shape.
+// A branch target whose address is not known when the branch is emitted. Four
+// separate tests in Möller-Trumbore leave for one miss path, so nesting if_
+// would mean nesting four deep; a label suits that shape.
 class Label {
 public:
     explicit Label(uint32_t id) : id_(id) {}

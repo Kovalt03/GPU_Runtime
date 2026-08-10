@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -15,6 +16,13 @@ constexpr uint32_t HEIGHT = 32;
 // One pixel of slack. The device runs the same arithmetic in a different order,
 // and pass 2 only ever compares these against pixel centres.
 constexpr float PIXEL_EPS = 1e-2f;
+
+void expect_near(Float3 got, Float3 want, float eps, const char* what)
+{
+    EXPECT_NEAR(got.x, want.x, eps) << what << " .x";
+    EXPECT_NEAR(got.y, want.y, eps) << what << " .y";
+    EXPECT_NEAR(got.z, want.z, eps) << what << " .z";
+}
 
 Camera default_camera()
 {
@@ -989,4 +997,208 @@ TEST(Pipeline, SharedRasterStagesThroughSharedMemory)
     EXPECT_GT(stores, 0u) << "the fill has to write shared memory";
     EXPECT_EQ(loads, 9u) << "nine reads per triangle, all of them from shared";
     EXPECT_EQ(barriers, 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Ray tracing — the same image by other arithmetic
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One triangle facing the camera, wound so the intersection test accepts it.
+// The winding matters here in a way it does not for the rasteriser: culling a
+// back face falls out of testing a < eps rather than |a| < eps.
+WorldTriangle facing_triangle()
+{
+    return WorldTriangle{Float3{0.0f, 0.4f, 0.0f}, Float3{-0.4f, -0.4f, 0.0f},
+                         Float3{0.4f, -0.4f, 0.0f}};
+}
+
+RayBasis default_basis()
+{
+    return ray_basis(default_camera(),
+                     static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
+}
+
+// The scene both renderers draw, as world triangles and as a flat vertex list.
+std::vector<WorldTriangle> shared_scene()
+{
+    std::vector<WorldTriangle> out;
+    for (uint32_t g = 0; g < 4; ++g) {
+        const float cx = -1.5f + 1.0f * static_cast<float>(g);
+        out.push_back(WorldTriangle{Float3{cx, 0.3f, 0.0f},
+                                    Float3{cx - 0.3f, -0.3f, 0.0f},
+                                    Float3{cx + 0.3f, -0.3f, 0.0f}});
+    }
+    return out;
+}
+
+std::vector<Float3> as_vertex_list(const std::vector<WorldTriangle>& triangles)
+{
+    std::vector<Float3> out;
+    for (const WorldTriangle& t : triangles) {
+        out.push_back(t.v0);
+        out.push_back(t.v1);
+        out.push_back(t.v2);
+    }
+    return out;
+}
+
+std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
+                                  MyGPURuntime* external = nullptr)
+{
+    MyGPURuntime local(1u << 24);
+    MyGPURuntime& rt = (external != nullptr) ? *external : local;
+
+    std::vector<float> flat;
+    for (const Float3& v : as_vertex_list(triangles)) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
+
+    void* tri_dev = rt.myrt_malloc(flat.size() * sizeof(float));
+    void* frame_dev = rt.myrt_malloc(frame_bytes);
+    rt.myrt_memcpy(tri_dev, flat.data(), flat.size() * sizeof(float),
+                   Direction::HostToDevice);
+
+    RaytraceStageArgs args;
+    args.basis = default_basis();
+    args.triangles_offset = rt.myrt_device_offset(tri_dev);
+    args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = static_cast<uint32_t>(triangles.size());
+    run_raytrace_stage(rt, args);
+
+    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
+    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
+
+    std::vector<Float3> frame;
+    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
+        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
+    }
+    return frame;
+}
+
+}  // namespace
+
+TEST(Pipeline, RayBasisAgreesWithLookAt)
+{
+    // Both cameras have to see the same thing, or comparing the renderers
+    // compares two scenes.
+    const Camera cam = default_camera();
+    const RayBasis basis = default_basis();
+
+    expect_near(basis.origin, cam.eye, PIXEL_EPS, "origin");
+    EXPECT_LT(basis.forward.z, 0.0f) << "the camera looks down -z";
+    EXPECT_NEAR(dot(basis.right, basis.forward), 0.0f, PIXEL_EPS) << "right is square on";
+    EXPECT_NEAR(dot(basis.up, basis.forward), 0.0f, PIXEL_EPS);
+    EXPECT_GT(length(basis.right), length(basis.up))
+        << "a wide frame spreads further across than down";
+}
+
+TEST(Pipeline, IntersectFindsAFrontHit)
+{
+    const WorldTriangle t = facing_triangle();
+    const Hit centre = intersect(t, Float3{0.0f, 0.0f, 3.0f}, Float3{0.0f, 0.0f, -1.0f});
+
+    ASSERT_TRUE(centre.hit);
+    EXPECT_NEAR(centre.t, 3.0f, PIXEL_EPS) << "the triangle sits at z = 0";
+    EXPECT_GT(centre.u, 0.0f);
+    EXPECT_GT(centre.v, 0.0f);
+    EXPECT_LT(centre.u + centre.v, 1.0f) << "inside means the weights sum below one";
+}
+
+TEST(Pipeline, IntersectRejectsWhatItShould)
+{
+    const WorldTriangle t = facing_triangle();
+
+    // Pointing away: the hit is behind the origin, which the eps on t rejects.
+    EXPECT_FALSE(intersect(t, Float3{0, 0, 3}, Float3{0, 0, 1}).hit) << "behind";
+
+    // Past the edge.
+    EXPECT_FALSE(intersect(t, Float3{0, 0, 3}, Float3{2.0f, 0.0f, -1.0f}).hit) << "wide";
+
+    // From behind the triangle, which a < eps culls.
+    EXPECT_FALSE(intersect(t, Float3{0, 0, -3}, Float3{0, 0, 1}).hit) << "back face";
+}
+
+TEST(Pipeline, TracePixelPutsTheTriangleWhereTheProjectionDoes)
+{
+    // The two paths meeting for one pixel, before a whole frame is asked of
+    // them. The centre of the frame looks at the origin, which the triangle
+    // covers.
+    const std::vector<WorldTriangle> scene = {facing_triangle()};
+    const Float3 centre =
+        trace_pixel(scene, default_basis(), WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT);
+    EXPECT_GT(centre.x + centre.y + centre.z, 0.0f) << "the ray has to hit";
+
+    const Float3 corner = trace_pixel(scene, default_basis(), 0, 0, WIDTH, HEIGHT);
+    EXPECT_FLOAT_EQ(corner.x + corner.y + corner.z, 0.0f) << "and miss in the corner";
+}
+
+TEST(Pipeline, RaytraceStageMatchesTheHostTrace)
+{
+    const std::vector<WorldTriangle> scene = shared_scene();
+    const std::vector<Float3> frame = render_traced(scene);
+    ASSERT_EQ(frame.size(), static_cast<size_t>(WIDTH) * HEIGHT);
+
+    const RayBasis basis = default_basis();
+    uint32_t covered = 0;
+    for (uint32_t y = 0; y < HEIGHT; ++y) {
+        for (uint32_t x = 0; x < WIDTH; ++x) {
+            const Float3 want = trace_pixel(scene, basis, x, y, WIDTH, HEIGHT);
+            const Float3 got = frame[y * WIDTH + x];
+            ASSERT_NEAR(got.x, want.x, PIXEL_EPS) << "pixel " << x << "," << y << " r";
+            ASSERT_NEAR(got.y, want.y, PIXEL_EPS) << "pixel " << x << "," << y << " g";
+            ASSERT_NEAR(got.z, want.z, PIXEL_EPS) << "pixel " << x << "," << y << " b";
+            if (want.x + want.y + want.z > 0.0f) {
+                ++covered;
+            }
+        }
+    }
+    EXPECT_GT(covered, 0u) << "a blank frame would satisfy every check above";
+}
+
+TEST(Pipeline, RaytracerAndRasteriserDrawTheSameScene)
+{
+    // What the whole project is for. Möller-Trumbore and edge functions share
+    // no arithmetic, so agreeing on a frame is evidence neither can produce on
+    // its own — the host references they are each checked against were written
+    // from the same conventions, and a sign wrong in both would pass.
+    const std::vector<WorldTriangle> scene = shared_scene();
+
+    const std::vector<Float3> traced = render_traced(scene);
+    const std::vector<Float3> rastered = render_triangle(as_vertex_list(scene));
+    ASSERT_EQ(traced.size(), rastered.size());
+
+    uint32_t differing = 0;
+    for (size_t i = 0; i < traced.size(); ++i) {
+        const bool same = std::abs(traced[i].x - rastered[i].x) < PIXEL_EPS &&
+                          std::abs(traced[i].y - rastered[i].y) < PIXEL_EPS &&
+                          std::abs(traced[i].z - rastered[i].z) < PIXEL_EPS;
+        if (!same) {
+            ++differing;
+        }
+    }
+
+    // Edge pixels can land either side of a boundary the two decide with
+    // different arithmetic, so a handful is expected; a wrong convention shows
+    // as hundreds.
+    EXPECT_LT(differing, traced.size() / 100)
+        << differing << " of " << traced.size() << " pixels disagree";
+}
+
+TEST(Pipeline, RaytraceStageRejectsAnEmptyScene)
+{
+    MyGPURuntime rt(1u << 20);
+    RaytraceStageArgs args;
+    args.basis = default_basis();
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 0;
+
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
 }

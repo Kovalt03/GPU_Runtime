@@ -142,6 +142,11 @@ Float4 transform(const Float4x4& a, Float3 v, float w)
 // Camera matrices
 // ---------------------------------------------------------------------------
 
+float radians(float degrees)
+{
+    return degrees * (PI / 180.0f);
+}
+
 Float4x4 look_at(Float3 eye, Float3 target, Float3 up)
 {
     // Right-handed, looking down -z. normalize does the rejecting: an eye
@@ -186,7 +191,7 @@ Float4x4 perspective(float fov_y_degrees, float aspect, float near_z, float far_
     // std::tan takes radians. Passing degrees still returns a number, and only
     // the two f entries below depend on it — so the mistake survives as a frame
     // with the wrong field of view and nothing else visibly wrong.
-    const float half_fov = fov_y_degrees * (PI / 180.0f) * 0.5f;
+    const float half_fov = radians(fov_y_degrees) * 0.5f;
     const float f = 1.0f / std::tan(half_fov);
 
     // Named so the matrix below fits its own shape. These two map [near, far]

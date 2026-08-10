@@ -280,3 +280,96 @@ Program build_shared_raster_program(void** args);
 // Runs it, one block per tile, as run_tiled_raster_stage does. Throws when a
 // tile holds more triangles than shared memory can stage.
 void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);
+
+// --- ray tracing ------------------------------------------------------------
+// The same scene by the other route, and the comparison the project was built
+// for: two renderers over one image, diverging for different reasons.
+//
+// One launch, not two. Rays are cast in world space and the triangles are
+// already there, so nothing has to be projected first — the vertex stage has no
+// counterpart here. That is the structural difference between the two paths,
+// and the reason the ray tracer needs no matrix at all.
+
+// Three vertices in world space. A separate type from ScreenTriangle for the
+// same reason Float3 is separate from Reg<Vec3>: the two hold identical numbers
+// and mixing them is the mistake worth making impossible.
+struct WorldTriangle {
+    Float3 v0;
+    Float3 v1;
+    Float3 v2;
+};
+
+// The camera as the kernel wants it. right and up arrive already scaled by the
+// field of view and the aspect, so a ray is
+//
+//   direction = right * sx + up * sy + forward
+//
+// for sx and sy in [-1, 1] — five instructions and no matrix. A matrix would
+// cost about the same to apply and sixteen moves to set up, and would make the
+// one path that needs no transform carry one anyway.
+struct RayBasis {
+    Float3 origin;
+    Float3 right;
+    Float3 up;
+    Float3 forward;
+};
+
+RayBasis ray_basis(const Camera& camera, float aspect);
+
+// The tolerance both intersection tests use, the host one and the kernel. One
+// symbol rather than a literal in each, because the two are compared pixel for
+// pixel and an edge lands on a different side the moment they drift apart.
+//
+// Not an argument: it is a property of the test, not of a scene, and passing it
+// in would just move the chance of two callers disagreeing one level up.
+//
+// It does two jobs. Against the determinant it rejects a ray parallel to the
+// triangle — and, being a signed comparison rather than an absolute one, a back
+// face along with it. Against t it keeps a hit behind the origin from counting.
+inline constexpr float INTERSECT_EPSILON = 1e-6f;
+
+// Möller-Trumbore on the host. t is measured in units of the direction given,
+// which is not normalised: the length cancels when t values from one pixel are
+// compared against each other, and a normalise costs 12.
+struct Hit {
+    bool hit = false;
+    float t = 0.0f;
+    float u = 0.0f;  // barycentric weight of v1
+    float v = 0.0f;  // barycentric weight of v2
+};
+
+Hit intersect(const WorldTriangle& triangle, Float3 origin, Float3 direction);
+
+// The colour a pixel takes from the nearest triangle its ray meets, black on a
+// miss — the whole of the kernel for one pixel, and its reference.
+//
+// Coloured (u, v, 1 - u - v), which is what shade_pixel_nearest produces from
+// the barycentric weights it computes a different way. The two renderers have
+// to agree pixel for pixel, and that only works if they agree here first.
+Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& basis,
+                   uint32_t px, uint32_t py, uint32_t width, uint32_t height);
+
+struct RaytraceStageArgs {
+    RayBasis basis;
+
+    // Byte offsets from the base of device memory. Nine floats a triangle, as
+    // the screen buffer holds, but in world space and never rewritten.
+    size_t triangles_offset = 0;
+    size_t framebuffer_offset = 0;
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t triangle_count = 0;
+};
+
+// Builds the ray tracer. args[0] must point at a RaytraceStageArgs.
+//
+// Möller-Trumbore leaves for the next triangle from four separate tests, which
+// is what Label exists for — nesting if_ four deep would pay for the inverted
+// condition each time and read as a staircase.
+Program build_raytrace_program(void** args);
+
+// Runs it, one thread per pixel. The launch geometry matches the untiled
+// rasteriser's exactly, since the divergence figures are meant to be compared
+// and a different warp shape would compare two things at once.
+void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args);

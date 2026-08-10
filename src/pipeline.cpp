@@ -1,7 +1,7 @@
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
-#include <string>
 
 #include "ir_builder.hpp"
 #include "math3d.hpp"
@@ -300,6 +300,7 @@ Program build_raster_program(void** args)
         // One store after the whole walk, rather than one per triangle. Every
         // in-image lane runs it together: the divergence above is the cost of
         // deciding a colour, not of writing one.
+        // One pixel, once, after the whole scene has been walked.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
         const Reg<Scalar> addr =
@@ -554,6 +555,7 @@ Program build_tiled_raster_program(void** args)
             k.branch_to(top, k.lt(i, count));
         });
 
+        // One pixel, once, after the whole scene has been walked.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
         const Reg<Scalar> addr =
@@ -731,6 +733,7 @@ Program build_shared_raster_program(void** args)
             k.branch_to(top, k.lt(i, count));
         });
 
+        // One pixel, once, after the whole scene has been walked.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
         const Reg<Scalar> addr =
@@ -766,4 +769,244 @@ void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
 
     void* raw[] = {const_cast<TiledRasterStageArgs*>(&args)};
     rt.myrt_launch(build_shared_raster_program, grid, block, raw);
+}
+
+// ---------------------------------------------------------------------------
+// Ray tracing
+//
+// The comparison the rasteriser exists to be measured against. Same scene, same
+// image, and divergence from a different cause: the rasteriser splits a warp at
+// a triangle's edge, the ray tracer wherever one lane's ray leaves early.
+// ---------------------------------------------------------------------------
+
+RayBasis ray_basis(const Camera& camera, float aspect)
+{
+    // Same handedness as look_at, and it has to be: the two cameras are
+    // compared by rendering one scene through both.
+    const Float3 forward = normalize(camera.target - camera.eye);
+    const Float3 right = normalize(cross(forward, camera.up));
+    const Float3 up = cross(right, forward);
+
+    // Folding the field of view in here is what leaves the kernel with three
+    // scales and two adds. Applied last and once, so there is no half-scaled
+    // vector for the next line to pick up by mistake.
+    const float half_extent = std::tan(radians(camera.fov_y_degrees) * 0.5f);
+
+    return RayBasis{camera.eye, right * (half_extent * aspect), up * half_extent,
+                    forward};
+}
+
+Hit intersect(const WorldTriangle& triangle, Float3 origin, Float3 direction)
+{
+    const Float3 e1 = triangle.v1 - triangle.v0;
+    const Float3 e2 = triangle.v2 - triangle.v0;
+    const Float3 h = cross(direction, e2);
+    const float a = dot(e1, h);
+
+    // Returning rather than noting a miss and carrying on: a is the divisor
+    // below, and a parallel ray leaves it at zero.
+    //
+    if (a < INTERSECT_EPSILON) {
+        return Hit{};
+    }
+
+    const float f = 1.0f / a;
+    const Float3 s = origin - triangle.v0;
+    const float u = f * dot(s, h);
+    if (u < 0.0f || u > 1.0f) {
+        return Hit{};
+    }
+
+    const Float3 q = cross(s, e1);
+    const float v = f * dot(direction, q);
+    if (v < 0.0f || u + v > 1.0f) {
+        return Hit{};
+    }
+
+    const float t = f * dot(e2, q);
+    if (t < INTERSECT_EPSILON) {
+        return Hit{};
+    }
+
+    // Five ways out, and the kernel has the same five — all of them branching
+    // to one label, which is what Label was added for.
+    return Hit{true, t, u, v};
+}
+
+Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& basis,
+                   uint32_t px, uint32_t py, uint32_t width, uint32_t height)
+{
+    // The pixel centre, as the rasteriser samples it. sx and sy run -1 to 1
+    // across the frame, sy backwards because rows count down while the frame
+    // counts up.
+    const float sx =
+        (static_cast<float>(px) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f;
+    const float sy =
+        1.0f - (static_cast<float>(py) + 0.5f) / static_cast<float>(height) * 2.0f;
+    const Float3 direction = basis.right * sx + basis.up * sy + basis.forward;
+
+    // No depth buffer and no atomics, for the same reason the rasteriser needs
+    // none: the thread owns its pixel. Black to start, so a ray that meets
+    // nothing leaves the background.
+    float best_t = std::numeric_limits<float>::infinity();
+    Float3 colour;
+
+    for (const WorldTriangle& triangle : triangles) {
+        const Hit hit = intersect(triangle, basis.origin, direction);
+
+        // The miss has to be tested, not just the distance. A miss returns t at
+        // zero, which beats every real hit and would paint the frame the colour
+        // of nothing.
+        if (!hit.hit || hit.t >= best_t) {
+            continue;
+        }
+        best_t = hit.t;
+
+        // (u, v, 1 - u - v). shade_pixel orders its weights to match this
+        // rather than the other way round, the ray tracer having got there
+        // first.
+        colour = Float3{hit.u, hit.v, 1.0f - hit.u - hit.v};
+    }
+    return colour;
+}
+
+Program build_raytrace_program(void** args)
+{
+    const RaytraceStageArgs& a = *static_cast<const RaytraceStageArgs*>(args[0]);
+    IRBuilder k;
+
+    // Twelve moves, uniform across the launch — every lane ends up holding its
+    // own copy of the same twelve numbers, as it does for the vertex stage's
+    // matrix and for the tile table. The redundancy a scalar unit exists to
+    // avoid, and the third place it turns up.
+    const RayBasis& b = a.basis;
+    const Reg<Vec3> origin = k.constant(b.origin.x, b.origin.y, b.origin.z);
+    const Reg<Vec3> right = k.constant(b.right.x, b.right.y, b.right.z);
+    const Reg<Vec3> up = k.constant(b.up.x, b.up.y, b.up.z);
+    const Reg<Vec3> forward = k.constant(b.forward.x, b.forward.y, b.forward.z);
+    const Reg<Scalar> px = k.thread_x();
+    const Reg<Scalar> py = k.thread_y();
+    const Reg<Scalar> in_image =
+        k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+              k.lt(py, k.constant(static_cast<float>(a.height))));
+
+    k.if_(in_image, [&] {
+        // The half-pixel offset and the scale fold into one constant each, as
+        // kernels/ray_triangle.cpp does: two multiplies and two adds rather
+        // than six. sy runs backwards because rows count down and the frame up.
+        const Reg<Scalar> sx =
+            k.add(k.mul(px, k.constant(2.0f / static_cast<float>(a.width))),
+                  k.constant(1.0f / static_cast<float>(a.width) - 1.0f));
+        const Reg<Scalar> sy =
+            k.add(k.mul(py, k.constant(-2.0f / static_cast<float>(a.height))),
+                  k.constant(1.0f - 1.0f / static_cast<float>(a.height)));
+        const Reg<Vec3> dir = k.add(k.scale(right, sx), k.add(k.scale(up, sy), forward));
+        // The running best, as in the rasteriser. Infinity rather than the
+        // rasteriser's 2.0f: that worked because NDC depth is bounded, and t is
+        // a ray parameter with no ceiling.
+        const Reg<Scalar> best_t = k.constant(std::numeric_limits<float>::infinity());
+        const Reg<Vec3> best = k.vec3();
+        k.set(best.component(0), 0.0f);
+        k.set(best.component(1), 0.0f);
+        k.set(best.component(2), 0.0f);
+
+        // One run of triangles, nine floats each. count is a host value here,
+        // so unlike the tiled rasteriser there is no table to read first — and
+        // run_raytrace_stage refuses a count of zero, so the loop can test at
+        // the bottom without a guard.
+        const Reg<Scalar> one = k.constant(1.0f);
+        const Reg<Scalar> zero = k.constant(0.0f);
+        const Reg<Scalar> eps = k.constant(INTERSECT_EPSILON);
+        const Reg<Scalar> stride = k.constant(static_cast<float>(3 * WORLD_VERTEX_BYTES));
+        const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
+        const Reg<Scalar> cursor = k.constant(static_cast<float>(a.triangles_offset));
+        const Reg<Scalar> i = k.constant(0.0f);
+
+        // Every miss lands on next, and it is placed before the advance below:
+        // a miss means "on to the next triangle", not "out of the loop", so the
+        // cursor still has to move or the lane meets the same one for ever.
+        const Label top = k.label();
+        const Label next = k.label();
+        k.place(top);
+
+        // The vertices have to arrive as Vec3 for cross and dot to take them,
+        // and load hands back a scalar it allocated itself. load_into is what
+        // puts three of them in one range.
+        const Reg<Vec3> v0 = k.vec3();
+        const Reg<Vec3> v1 = k.vec3();
+        const Reg<Vec3> v2 = k.vec3();
+        for (uint32_t c = 0; c < 3; ++c) {
+            const float component = static_cast<float>(c * sizeof(float));
+            k.load_into(v0.component(c), cursor, component + 0.0f);
+            k.load_into(v1.component(c), cursor, component + 12.0f);
+            k.load_into(v2.component(c), cursor, component + 24.0f);
+        }
+
+        // Möller-Trumbore, a line for each line of intersect().
+        const Reg<Vec3> e1 = k.sub(v1, v0);
+        const Reg<Vec3> e2 = k.sub(v2, v0);
+        const Reg<Vec3> h = k.cross(dir, e2);
+        const Reg<Scalar> a_dot = k.dot(e1, h);
+
+        // a < eps rather than |a| < eps rejects a back face along with a
+        // parallel ray, the ISA having no absolute value.
+        //
+        // First of the four exits. Six conditions, but any() folds each pair
+        // into one flag, so a warp splits four times rather than six.
+        k.branch_to(next, k.lt(a_dot, eps));
+
+        const Reg<Scalar> f = k.rcp(a_dot);
+        const Reg<Vec3> s = k.sub(origin, v0);
+
+        const Reg<Scalar> u = k.mul(f, k.dot(s, h));
+        k.branch_to(next, k.any(k.lt(u, zero), k.gt(u, one)));
+
+        const Reg<Vec3> q = k.cross(s, e1);
+        const Reg<Scalar> v = k.mul(f, k.dot(dir, q));
+        k.branch_to(next, k.any(k.lt(v, zero), k.gt(k.add(u, v), one)));
+
+        const Reg<Scalar> t = k.mul(f, k.dot(e2, q));
+        k.branch_to(next, k.lt(t, eps));
+
+        // Nearest wins. No depth buffer and no atomics: the thread owns its
+        // pixel, so the running best is a register.
+        k.if_(k.lt(t, best_t), [&] {
+            k.copy_into(best_t, t);
+            k.copy_into(best.component(0), u);
+            k.copy_into(best.component(1), v);
+            k.copy_into(best.component(2), k.sub(k.sub(one, u), v));
+        });
+
+        k.place(next);
+        k.fma(cursor, stride, one);
+        k.fma(i, one, one);
+        k.branch_to(top, k.lt(i, count));
+
+        // One pixel, once, after the whole scene has been walked.
+        const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
+        const Reg<Scalar> index = k.add(row, px);
+        const Reg<Scalar> addr =
+            k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
+        const float frame_base = static_cast<float>(a.framebuffer_offset);
+        k.store(addr, best.component(0), frame_base + 0.0f);
+        k.store(addr, best.component(1), frame_base + 4.0f);
+        k.store(addr, best.component(2), frame_base + 8.0f);
+    });
+    return k.build();
+}
+
+void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
+{
+    if (args.width == 0 || args.height == 0) {
+        throw std::runtime_error("run_raytrace_stage: an image with no pixels");
+    }
+    if (args.triangle_count == 0) {
+        throw std::runtime_error("run_raytrace_stage: nothing to trace");
+    }
+
+    const dim3 block{WARP_SIZE, 1, 1};
+    const dim3 grid{(args.width + WARP_SIZE - 1) / WARP_SIZE, args.height, 1};
+
+    void* raw[] = {const_cast<RaytraceStageArgs*>(&args)};
+    rt.myrt_launch(build_raytrace_program, grid, block, raw);
 }

@@ -62,6 +62,11 @@ Float4x4 operator*(const Float4x4& a, const Float4x4& b);
 // Applies the matrix to (v, w), returning all four clip-space components.
 Float4 transform(const Float4x4& a, Float3 v, float w);
 
+// A camera is described in degrees and std::tan takes radians. Both callers of
+// this conversion would get it wrong the same way if each wrote its own, so it
+// lives here once.
+float radians(float degrees);
+
 // Right-handed, looking down -z: the OpenGL and GLM convention, and the one the
 // step 6 ray tracer already assumes for its camera.
 Float4x4 look_at(Float3 eye, Float3 target, Float3 up);
