@@ -77,21 +77,25 @@ std::vector<Float3> run_stage(const std::vector<Float3>& world, uint32_t thread_
 
     std::vector<Float3> screen;
     for (uint32_t i = 0; i < thread_count; ++i) {
-        screen.push_back(Float3{out[i * 3 + 0], out[i * 3 + 1], out[i * 3 + 2]});
+        const size_t at = static_cast<size_t>(i) * SCREEN_VERTEX_FLOATS;
+        screen.push_back(Float3{out[at + 0], out[at + 1], out[at + 2]});
     }
     return screen;
 }
 
-// Where the host says each vertex lands, which is what a rendered frame is
-// checked against.
-std::vector<Float3> project_all(const std::vector<Float3>& world)
+// The same, as whole triangles — which is what the raster path consumes, and
+// the only form that carries the reciprocals of w. A reference built without
+// them is affine, and would agree with the kernel only on a scene whose
+// triangles each sit at one depth.
+std::vector<ScreenTriangle> project_all_triangles(const std::vector<Float3>& world)
 {
     const Float4x4 vp = default_vp();
-    std::vector<Float3> screen;
-    for (const Float3& v : world) {
-        screen.push_back(project_vertex(vp, v, WIDTH, HEIGHT));
+    std::vector<ScreenTriangle> out;
+    for (size_t i = 0; i + 2 < world.size(); i += 3) {
+        out.push_back(
+            project_triangle(vp, world[i], world[i + 1], world[i + 2], WIDTH, HEIGHT));
     }
-    return screen;
+    return out;
 }
 
 // Both passes end to end, returning the framebuffer a pixel at a time.
@@ -192,11 +196,13 @@ std::vector<Float3> render_triangle_tiled(const std::vector<Float3>& world,
     rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
 
     std::vector<ScreenTriangle> triangles;
-    for (size_t i = 0; i + 8 < screen.size(); i += 9) {
+    for (size_t i = 0; i + TILE_TRIANGLE_FLOATS <= screen.size();
+         i += TILE_TRIANGLE_FLOATS) {
         triangles.push_back(
             ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
-                           Float3{screen[i + 3], screen[i + 4], screen[i + 5]},
-                           Float3{screen[i + 6], screen[i + 7], screen[i + 8]}});
+                           Float3{screen[i + 4], screen[i + 5], screen[i + 6]},
+                           Float3{screen[i + 8], screen[i + 9], screen[i + 10]},
+                           screen[i + 3], screen[i + 7], screen[i + 11]});
     }
 
     const TileBinning binning = bin_triangles(triangles, WIDTH, HEIGHT);
@@ -270,11 +276,13 @@ std::vector<Float3> render_triangle_shared(const std::vector<Float3>& world,
     rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
 
     std::vector<ScreenTriangle> triangles;
-    for (size_t i = 0; i + 8 < screen.size(); i += 9) {
+    for (size_t i = 0; i + TILE_TRIANGLE_FLOATS <= screen.size();
+         i += TILE_TRIANGLE_FLOATS) {
         triangles.push_back(
             ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
-                           Float3{screen[i + 3], screen[i + 4], screen[i + 5]},
-                           Float3{screen[i + 6], screen[i + 7], screen[i + 8]}});
+                           Float3{screen[i + 4], screen[i + 5], screen[i + 6]},
+                           Float3{screen[i + 8], screen[i + 9], screen[i + 10]},
+                           screen[i + 3], screen[i + 7], screen[i + 11]});
     }
 
     const TileBinning binning = bin_triangles(triangles, width, height);
@@ -576,6 +584,32 @@ TEST(Pipeline, RasterProgramCarriesNoMatrix)
     }
 }
 
+TEST(Pipeline, PerspectiveCorrectionIsIdentityAtOneDepth)
+{
+    // Every vertex at the same distance leaves the weights alone, which is why
+    // the two renderers agreed on a flat scene before any of this existed — and
+    // why such a scene proves nothing about interpolation.
+    const Float3 affine{0.2f, 0.3f, 0.5f};
+    const Float3 got = perspective_correct(affine, 0.25f, 0.25f, 0.25f);
+
+    EXPECT_NEAR(got.x, affine.x, PIXEL_EPS);
+    EXPECT_NEAR(got.y, affine.y, PIXEL_EPS);
+    EXPECT_NEAR(got.z, affine.z, PIXEL_EPS);
+}
+
+TEST(Pipeline, PerspectiveCorrectionPullsTowardsTheNearerVertex)
+{
+    // A vertex twice as close has twice the 1/w, so it takes more of the weight
+    // than the screen-space split suggests. Halfway along an edge in pixels is
+    // not halfway along it in the world.
+    const Float3 affine{0.5f, 0.5f, 0.0f};
+    const Float3 got = perspective_correct(affine, 1.0f, 0.5f, 0.5f);
+
+    EXPECT_NEAR(got.x + got.y + got.z, 1.0f, PIXEL_EPS) << "still a partition";
+    EXPECT_GT(got.x, affine.x) << "the nearer vertex gains";
+    EXPECT_LT(got.y, affine.y);
+}
+
 TEST(Pipeline, RasterStageMatchesTheHostShading)
 {
     // Both passes end to end: project a world triangle, rasterise it, and check
@@ -589,11 +623,12 @@ TEST(Pipeline, RasterStageMatchesTheHostShading)
     const std::vector<Float3> frame = render_triangle(world);
     ASSERT_EQ(frame.size(), static_cast<size_t>(WIDTH) * HEIGHT);
 
-    const std::vector<Float3> screen = project_all(world);
+    const ScreenTriangle t = project_all_triangles(world)[0];
     uint32_t covered = 0;
     for (uint32_t y = 0; y < HEIGHT; ++y) {
         for (uint32_t x = 0; x < WIDTH; ++x) {
-            const Float3 want = shade_pixel(screen[0], screen[1], screen[2], x, y);
+            const Float3 want =
+                shade_pixel(t.v0, t.v1, t.v2, x, y, t.inv_w0, t.inv_w1, t.inv_w2);
             const Float3 got = frame[y * WIDTH + x];
             ASSERT_NEAR(got.x, want.x, PIXEL_EPS) << "pixel " << x << "," << y << " r";
             ASSERT_NEAR(got.y, want.y, PIXEL_EPS) << "pixel " << x << "," << y << " g";
@@ -730,11 +765,7 @@ TEST(Pipeline, RasterStageDrawsTwoTrianglesInDepthOrder)
     const std::vector<Float3> frame = render_triangle(world);
     ASSERT_EQ(frame.size(), static_cast<size_t>(WIDTH) * HEIGHT);
 
-    const std::vector<Float3> screen = project_all(world);
-    const std::vector<ScreenTriangle> triangles = {
-        ScreenTriangle{screen[0], screen[1], screen[2]},
-        ScreenTriangle{screen[3], screen[4], screen[5]},
-    };
+    const std::vector<ScreenTriangle> triangles = project_all_triangles(world);
 
     uint32_t covered = 0;
     for (uint32_t y = 0; y < HEIGHT; ++y) {
@@ -804,7 +835,7 @@ TEST(Pipeline, BinningPutsEachTriangleWhereItReaches)
     EXPECT_EQ(tile_triangle_count(binning, 1, 0), 0u);
 }
 
-TEST(Pipeline, BinningStoresNineFloatsPerEntry)
+TEST(Pipeline, BinningStoresOneScreenTrianglePerEntry)
 {
     const TileBinning binning = bin_triangles(spread_triangles(), WIDTH, HEIGHT);
 
@@ -812,7 +843,7 @@ TEST(Pipeline, BinningStoresNineFloatsPerEntry)
     for (uint32_t t = 0; t < binning.tile_count(); ++t) {
         entries += static_cast<uint32_t>(binning.table[t * 2 + 1]);
     }
-    EXPECT_EQ(binning.vertices.size(), entries * 9u);
+    EXPECT_EQ(binning.vertices.size(), entries * TILE_TRIANGLE_FLOATS);
     EXPECT_GE(entries, 2u) << "each triangle reaches at least one tile";
 }
 
@@ -925,7 +956,7 @@ TEST(Pipeline, SharedRasterDrawsTheSameFrameAsTheTiledWalk)
 TEST(Pipeline, SharedRasterIssuesLessWorkThanTheTiledWalk)
 {
     // Staging costs a fill and a barrier once per block; it saves 92 units on
-    // every one of the nine loads each pixel makes per triangle.
+    // every one of the twelve loads each pixel makes per triangle.
     const std::vector<Float3> world = scattered_scene();
 
     MyGPURuntime tiled_rt(1u << 24);
@@ -995,7 +1026,8 @@ TEST(Pipeline, SharedRasterStagesThroughSharedMemory)
         barriers += (i.op == Opcode::BARRIER) ? 1 : 0;
     }
     EXPECT_GT(stores, 0u) << "the fill has to write shared memory";
-    EXPECT_EQ(loads, 9u) << "nine reads per triangle, all of them from shared";
+    EXPECT_EQ(loads, TILE_TRIANGLE_FLOATS)
+        << "a whole screen triangle per pass, all of it from shared";
     EXPECT_EQ(barriers, 1u);
 }
 
@@ -1044,8 +1076,8 @@ std::vector<Float3> as_vertex_list(const std::vector<WorldTriangle>& triangles)
     return out;
 }
 
-std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
-                                  MyGPURuntime* external = nullptr)
+std::vector<Float3> render_traced_with(const std::vector<WorldTriangle>& triangles,
+                                       const Camera& camera, MyGPURuntime* external)
 {
     MyGPURuntime local(1u << 24);
     MyGPURuntime& rt = (external != nullptr) ? *external : local;
@@ -1064,13 +1096,77 @@ std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
                    Direction::HostToDevice);
 
     RaytraceStageArgs args;
-    args.basis = default_basis();
+    args.basis =
+        ray_basis(camera, static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
     args.triangles_offset = rt.myrt_device_offset(tri_dev);
     args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
     args.width = WIDTH;
     args.height = HEIGHT;
     args.triangle_count = static_cast<uint32_t>(triangles.size());
     run_raytrace_stage(rt, args);
+
+    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
+    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
+
+    std::vector<Float3> frame;
+    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
+        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
+    }
+    return frame;
+}
+
+std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
+                                  MyGPURuntime* external = nullptr)
+{
+    return render_traced_with(triangles, default_camera(), external);
+}
+
+std::vector<Float3> render_traced_from(const std::vector<WorldTriangle>& triangles,
+                                       const Camera& camera)
+{
+    return render_traced_with(triangles, camera, nullptr);
+}
+
+// The raster path from an arbitrary camera, which only the angled-view test
+// needs — render_triangle keeps its own default.
+std::vector<Float3> render_triangle_from(const std::vector<Float3>& world,
+                                         const Camera& camera)
+{
+    MyGPURuntime rt(1u << 24);
+
+    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
+    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
+    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
+
+    void* world_dev = rt.myrt_malloc(world_bytes);
+    void* screen_dev = rt.myrt_malloc(screen_bytes);
+    void* frame_dev = rt.myrt_malloc(frame_bytes);
+
+    std::vector<float> flat;
+    for (const Float3& v : world) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
+
+    VertexStageArgs vertex_args;
+    vertex_args.view_projection =
+        camera.view_projection(static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
+    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
+    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
+    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
+    vertex_args.width = WIDTH;
+    vertex_args.height = HEIGHT;
+    run_vertex_stage(rt, vertex_args);
+
+    RasterStageArgs raster_args;
+    raster_args.screen_offset = rt.myrt_device_offset(screen_dev);
+    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
+    raster_args.width = WIDTH;
+    raster_args.height = HEIGHT;
+    raster_args.triangle_count = static_cast<uint32_t>(world.size() / 3);
+    run_raster_stage(rt, raster_args);
 
     std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
     rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
@@ -1201,4 +1297,78 @@ TEST(Pipeline, RaytraceStageRejectsAnEmptyScene)
     args.triangle_count = 0;
 
     EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// A camera that moves
+//
+// Both paths already take an arbitrary Camera — ray_basis and view_projection
+// each build their own from one. What was missing is evidence that the two
+// build the *same* one anywhere but the axis-aligned default, where several
+// conventions happen to agree.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+Camera angled_camera()
+{
+    Camera cam;
+    cam.eye = Float3{2.0f, 1.5f, 2.5f};
+    cam.target = Float3{0.0f, 0.0f, 0.0f};
+    cam.up = Float3{0.0f, 1.0f, 0.0f};
+    cam.fov_y_degrees = 45.0f;
+    return cam;
+}
+
+}  // namespace
+
+TEST(Pipeline, MovingTheCameraMovesThePicture)
+{
+    const std::vector<WorldTriangle> scene = shared_scene();
+
+    const std::vector<Float3> straight = render_traced(scene);
+    const std::vector<Float3> angled = render_traced_from(scene, angled_camera());
+
+    uint32_t differing = 0;
+    uint32_t angled_covered = 0;
+    for (size_t i = 0; i < straight.size(); ++i) {
+        if (std::abs(straight[i].x - angled[i].x) > PIXEL_EPS) {
+            ++differing;
+        }
+        if (angled[i].x + angled[i].y + angled[i].z > 0.0f) {
+            ++angled_covered;
+        }
+    }
+    EXPECT_GT(differing, straight.size() / 20) << "the view has to have changed";
+    EXPECT_GT(angled_covered, 0u) << "and the scene must still be in frame";
+}
+
+TEST(Pipeline, BothRenderersAgreeFromAnAngle)
+{
+    // The stronger form of the agreement test. Off the axis, look_at and
+    // ray_basis have nothing left to agree on by accident — a handedness or an
+    // aspect applied to the wrong axis shows here and not at the default.
+    const std::vector<WorldTriangle> scene = shared_scene();
+
+    const std::vector<Float3> traced = render_traced_from(scene, angled_camera());
+    const std::vector<Float3> rastered =
+        render_triangle_from(as_vertex_list(scene), angled_camera());
+    ASSERT_EQ(traced.size(), rastered.size());
+
+    uint32_t differing = 0;
+    uint32_t covered = 0;
+    for (size_t i = 0; i < traced.size(); ++i) {
+        const bool same = std::abs(traced[i].x - rastered[i].x) < PIXEL_EPS &&
+                          std::abs(traced[i].y - rastered[i].y) < PIXEL_EPS &&
+                          std::abs(traced[i].z - rastered[i].z) < PIXEL_EPS;
+        if (!same) {
+            ++differing;
+        }
+        if (traced[i].x + traced[i].y + traced[i].z > 0.0f) {
+            ++covered;
+        }
+    }
+    EXPECT_GT(covered, 0u) << "two blank frames agree perfectly and prove nothing";
+    EXPECT_LT(differing, traced.size() / 100)
+        << differing << " of " << traced.size() << " pixels disagree";
 }

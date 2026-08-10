@@ -26,6 +26,23 @@ Reg<Scalar> emit_edge(IRBuilder& k, Reg<Scalar> ax, Reg<Scalar> ay, Reg<Scalar> 
                  k.mul(k.sub(py, ay), k.sub(bx, ax)));
 }
 
+// Writes the corrected weights into dst as (w1, w2, w0), the order the
+// framebuffer takes. The device counterpart of perspective_correct, minus its
+// guard against a zero denominator: inside a covered pixel the affine weights
+// sum to one and every 1/w is positive, so the sum cannot reach zero.
+void emit_shade(IRBuilder& k, Reg<Vec3> dst, Reg<Scalar> w0, Reg<Scalar> w1,
+                Reg<Scalar> w2, Reg<Scalar> iw0, Reg<Scalar> iw1, Reg<Scalar> iw2)
+{
+    const Reg<Scalar> a0 = k.mul(w0, iw0);
+    const Reg<Scalar> a1 = k.mul(w1, iw1);
+    const Reg<Scalar> a2 = k.mul(w2, iw2);
+    const Reg<Scalar> inv_total = k.rcp(k.add(k.add(a0, a1), a2));
+
+    k.copy_into(dst.component(0), k.mul(a1, inv_total));
+    k.copy_into(dst.component(1), k.mul(a2, inv_total));
+    k.copy_into(dst.component(2), k.mul(a0, inv_total));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -36,20 +53,37 @@ Reg<Scalar> emit_edge(IRBuilder& k, Reg<Scalar> ax, Reg<Scalar> ay, Reg<Scalar> 
 // the only practical way to debug one here.
 // ---------------------------------------------------------------------------
 
-Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t width,
-                      uint32_t height)
-{
-    Float3 screen;
-    const Float4 clip = transform(view_projection, world, 1.0f);
+namespace {
 
+// clip space to pixels, the half of pass 1 that does not depend on how clip was
+// reached. Shared so project_vertex and project_triangle cannot drift.
+Float3 to_viewport(Float4 clip, uint32_t width, uint32_t height)
+{
+    // The perspective divide. Nothing guards w, deliberately: this is the
+    // reference the kernel is measured against, and the kernel divides with
+    // V_RCP_F32 unconditionally. A host that threw, or clamped, would stop being
+    // a reference at exactly the inputs worth checking.
     const float inv_w = 1.0f / clip.w;
     const Float3 ndc{clip.x * inv_w, clip.y * inv_w, clip.z * inv_w};
 
-    screen.x = ((ndc.x + 1.0f) * 0.5f) * width;
-    screen.y = (0.5f - ndc.y * 0.5f) * height;
-    screen.z = ndc.z;
+    // NDC counts upward from the bottom of the frame; image rows count downward
+    // from the top. Hence y is flipped and x is not.
+    return Float3{
+        (ndc.x + 1.0f) * 0.5f * static_cast<float>(width),
+        (1.0f - ndc.y) * 0.5f * static_cast<float>(height),
+        ndc.z,
+    };
+}
 
-    return screen;
+}  // namespace
+
+Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t width,
+                      uint32_t height)
+{
+    // w = 1 because a vertex is a position: the last column of the matrix is
+    // the translation, and it has to apply. A normal or a ray direction would
+    // pass 0 here.
+    return to_viewport(transform(view_projection, world, 1.0f), width, height);
 }
 
 // The same projection as a program: the first kernel written entirely with
@@ -111,14 +145,19 @@ Program build_vertex_program(void** args)
         const Reg<Scalar> sy = k.mul(k.sub(one, ndc.component(1)), half_h);
         const Reg<Scalar> sz = ndc.component(2);
 
-        // One address register serves both buffers, which holds only while the
-        // strides agree.
-        static_assert(WORLD_VERTEX_BYTES == SCREEN_VERTEX_BYTES,
-                      "reusing addr for the store needs both strides to match");
+        // A second address register, the two buffers no longer sharing a
+        // stride: the screen vertex carries 1/w and the world one does not.
+        const Reg<Scalar> out_addr =
+            k.mul(id, k.constant(static_cast<float>(SCREEN_VERTEX_BYTES)));
+
         const float screen_base = static_cast<float>(a.screen_offset);
-        k.store(addr, sx, screen_base + 0.0f);
-        k.store(addr, sy, screen_base + 4.0f);
-        k.store(addr, sz, screen_base + 8.0f);
+        k.store(out_addr, sx, screen_base + 0.0f);
+        k.store(out_addr, sy, screen_base + 4.0f);
+        k.store(out_addr, sz, screen_base + 8.0f);
+
+        // inv_w falls out of the divide above at no extra cost, and pass 2
+        // cannot recover it once w is gone.
+        k.store(out_addr, inv_w, screen_base + 12.0f);
     });
 
     return k.build();
@@ -142,6 +181,24 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
     // come off. The kernel only reads it, and args outlives the call.
     void* raw[] = {const_cast<VertexStageArgs*>(&args)};
     rt.myrt_launch(build_vertex_program, grid, block, raw);
+}
+
+ScreenTriangle project_triangle(const Float4x4& view_projection, Float3 v0, Float3 v1,
+                                Float3 v2, uint32_t width, uint32_t height)
+{
+    const Float3 corners[3] = {v0, v1, v2};
+    ScreenTriangle out;
+    Float3* positions[3] = {&out.v0, &out.v1, &out.v2};
+    float* reciprocals[3] = {&out.inv_w0, &out.inv_w1, &out.inv_w2};
+
+    for (uint32_t c = 0; c < 3; ++c) {
+        // One transform, both answers. Computing them separately would leave two
+        // places that have to agree about which w the divide used.
+        const Float4 clip = transform(view_projection, corners[c], 1.0f);
+        *positions[c] = to_viewport(clip, width, height);
+        *reciprocals[c] = 1.0f / clip.w;
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +226,23 @@ Float3 barycentric(Float3 v0, Float3 v1, Float3 v2, float px, float py)
     return Float3{w[0] * inv_area, w[1] * inv_area, w[2] * inv_area};
 }
 
-Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py)
+Float3 perspective_correct(Float3 affine, float inv_w0, float inv_w1, float inv_w2)
+{
+    const float weighted_x = affine.x * inv_w0;
+    const float weighted_y = affine.y * inv_w1;
+    const float weighted_z = affine.z * inv_w2;
+
+    const float total = weighted_x + weighted_y + weighted_z;
+    if (total == 0.0f) {
+        return affine;
+    }
+
+    const float inv_total = 1.0f / total;
+    return Float3{weighted_x * inv_total, weighted_y * inv_total, weighted_z * inv_total};
+}
+
+Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py,
+                   float inv_w0, float inv_w1, float inv_w2)
 {
     const float cx = static_cast<float>(px) + 0.5f;
     const float cy = static_cast<float>(py) + 0.5f;
@@ -180,10 +253,15 @@ Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py)
     // every weight NaN, and NaN fails >= as well as <, so it falls through to
     // the background instead of writing NaN into the frame.
     if (w.x >= 0.0f && w.y >= 0.0f && w.z >= 0.0f) {
+        // Coverage is decided on the affine weights and colour on the corrected
+        // ones. Only the second is an attribute carried across the triangle;
+        // the first is a question about which side of three lines the pixel is.
+        const Float3 c = perspective_correct(w, inv_w0, inv_w1, inv_w2);
+
         // (w1, w2, w0). The ray tracer colours a hit (u, v, 1 - u - v), where u
         // weights v1 and v weights v2 — so this ordering is what makes the two
         // renderers produce the same picture rather than one rotated in hue.
-        return Float3{w.y, w.z, w.x};
+        return Float3{c.y, c.z, c.x};
     }
     return Float3{0.0f, 0.0f, 0.0f};
 }
@@ -242,7 +320,7 @@ Program build_raster_program(void** args)
         // iterations and reaches the backward branch together. Only the
         // coverage test inside it diverges.
         //
-        // Every lane also loads the same nine floats, the triangle not
+        // Every lane also loads the same twelve floats, the triangle not
         // depending on the pixel. Real hardware broadcasts these from a scalar
         // unit; here all 32 lanes issue the same load — the redundancy the
         // sixteen matrix moves already cost pass 1, and the reason the ISA
@@ -250,15 +328,20 @@ Program build_raster_program(void** args)
         const Label top = k.label();
         k.place(top);
 
+        // Position then 1/w, three times — the layout pass 1 writes and
+        // bin_triangles copies.
         const Reg<Scalar> x0 = k.load(tri_addr, 0.0f);
         const Reg<Scalar> y0 = k.load(tri_addr, 4.0f);
         const Reg<Scalar> z0 = k.load(tri_addr, 8.0f);
-        const Reg<Scalar> x1 = k.load(tri_addr, 12.0f);
-        const Reg<Scalar> y1 = k.load(tri_addr, 16.0f);
-        const Reg<Scalar> z1 = k.load(tri_addr, 20.0f);
-        const Reg<Scalar> x2 = k.load(tri_addr, 24.0f);
-        const Reg<Scalar> y2 = k.load(tri_addr, 28.0f);
-        const Reg<Scalar> z2 = k.load(tri_addr, 32.0f);
+        const Reg<Scalar> iw0 = k.load(tri_addr, 12.0f);
+        const Reg<Scalar> x1 = k.load(tri_addr, 16.0f);
+        const Reg<Scalar> y1 = k.load(tri_addr, 20.0f);
+        const Reg<Scalar> z1 = k.load(tri_addr, 24.0f);
+        const Reg<Scalar> iw1 = k.load(tri_addr, 28.0f);
+        const Reg<Scalar> x2 = k.load(tri_addr, 32.0f);
+        const Reg<Scalar> y2 = k.load(tri_addr, 36.0f);
+        const Reg<Scalar> z2 = k.load(tri_addr, 40.0f);
+        const Reg<Scalar> iw2 = k.load(tri_addr, 44.0f);
 
         // Each weight is the edge opposite its vertex, as in barycentric().
         const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
@@ -285,12 +368,11 @@ Program build_raster_program(void** args)
         // Both conditions folded into one flag, and so one divergence point:
         // covered, and nearer than anything kept so far.
         const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+        // Depth from the affine weights, colour from the corrected ones:
+        // NDC z is linear in screen space and an attribute is not.
         k.if_(take, [&] {
-            // (w1, w2, w0), the ordering shade_pixel explains.
             k.copy_into(best_z, depth);
-            k.copy_into(best.component(0), w1);
-            k.copy_into(best.component(1), w2);
-            k.copy_into(best.component(2), w0);
+            emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
         });
 
         k.fma(tri_addr, stride, one);
@@ -372,12 +454,16 @@ Float3 shade_pixel_nearest(const std::vector<ScreenTriangle>& triangles, uint32_
             continue;
         }
 
+        // Depth from the affine weights — NDC z is linear in screen space, and
+        // correcting it would be wrong rather than merely wasteful.
+        //
         // Strict <, so coplanar triangles resolve to the first in the buffer
         // rather than flickering on a rounding difference.
         const float z = interpolate_depth(t.v0, t.v1, t.v2, w);
         if (z < best_z) {
             best_z = z;
-            best = Float3{w.y, w.z, w.x};
+            const Float3 c = perspective_correct(w, t.inv_w0, t.inv_w1, t.inv_w2);
+            best = Float3{c.y, c.z, c.x};
         }
     }
     return best;
@@ -427,7 +513,8 @@ TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t
             const float left = static_cast<float>(tx * TILE_WIDTH);
             const float top = static_cast<float>(ty * TILE_HEIGHT);
 
-            binning.table.push_back(static_cast<float>(binning.vertices.size() / 9));
+            binning.table.push_back(
+                static_cast<float>(binning.vertices.size() / TILE_TRIANGLE_FLOATS));
             uint32_t count = 0;
 
             for (size_t i = 0; i < triangles.size(); ++i) {
@@ -441,11 +528,17 @@ TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t
                     continue;
                 }
 
+                // Interleaved as pass 1 writes it — position then 1/w, three
+                // times — so a kernel reads a binned triangle and a screen one
+                // with the same offsets.
                 const ScreenTriangle& t = triangles[i];
-                for (const Float3& v : {t.v0, t.v1, t.v2}) {
-                    binning.vertices.push_back(v.x);
-                    binning.vertices.push_back(v.y);
-                    binning.vertices.push_back(v.z);
+                const float reciprocals[3] = {t.inv_w0, t.inv_w1, t.inv_w2};
+                const Float3 corners[3] = {t.v0, t.v1, t.v2};
+                for (uint32_t c = 0; c < 3; ++c) {
+                    binning.vertices.push_back(corners[c].x);
+                    binning.vertices.push_back(corners[c].y);
+                    binning.vertices.push_back(corners[c].z);
+                    binning.vertices.push_back(reciprocals[c]);
                 }
                 ++count;
             }
@@ -515,15 +608,20 @@ Program build_tiled_raster_program(void** args)
             const Label top = k.label();
             k.place(top);
 
+            // Position then 1/w, three times — the layout pass 1 writes and
+            // bin_triangles copies.
             const Reg<Scalar> x0 = k.load(tri_addr, 0.0f);
             const Reg<Scalar> y0 = k.load(tri_addr, 4.0f);
             const Reg<Scalar> z0 = k.load(tri_addr, 8.0f);
-            const Reg<Scalar> x1 = k.load(tri_addr, 12.0f);
-            const Reg<Scalar> y1 = k.load(tri_addr, 16.0f);
-            const Reg<Scalar> z1 = k.load(tri_addr, 20.0f);
-            const Reg<Scalar> x2 = k.load(tri_addr, 24.0f);
-            const Reg<Scalar> y2 = k.load(tri_addr, 28.0f);
-            const Reg<Scalar> z2 = k.load(tri_addr, 32.0f);
+            const Reg<Scalar> iw0 = k.load(tri_addr, 12.0f);
+            const Reg<Scalar> x1 = k.load(tri_addr, 16.0f);
+            const Reg<Scalar> y1 = k.load(tri_addr, 20.0f);
+            const Reg<Scalar> z1 = k.load(tri_addr, 24.0f);
+            const Reg<Scalar> iw1 = k.load(tri_addr, 28.0f);
+            const Reg<Scalar> x2 = k.load(tri_addr, 32.0f);
+            const Reg<Scalar> y2 = k.load(tri_addr, 36.0f);
+            const Reg<Scalar> z2 = k.load(tri_addr, 40.0f);
+            const Reg<Scalar> iw2 = k.load(tri_addr, 44.0f);
 
             const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
             const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
@@ -543,11 +641,11 @@ Program build_tiled_raster_program(void** args)
             k.fma(depth, w2, z2);
 
             const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+            // Depth from the affine weights, colour from the corrected ones:
+            // NDC z is linear in screen space and an attribute is not.
             k.if_(take, [&] {
                 k.copy_into(best_z, depth);
-                k.copy_into(best.component(0), w1);
-                k.copy_into(best.component(1), w2);
-                k.copy_into(best.component(2), w0);
+                emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
             });
 
             k.fma(tri_addr, stride, one);
@@ -629,14 +727,15 @@ Program build_shared_raster_program(void** args)
     // 0 .. 255, and the stride the cooperative fill steps by.
     const Reg<Scalar> lane = k.add(k.mul(ty, tile_w), tx);
 
-    // The fill. Nine floats a triangle, shared out across the block's 256
-    // threads: each takes the entry at its own lane index, then every 256th
-    // one after that.
+    // The fill. A screen triangle a triangle — position and 1/w three times over
+    // — shared out across the block's 256 threads: each takes the float at its
+    // own lane index, then every 256th one after that.
     const Reg<Scalar> one = k.constant(1.0f);
     const Reg<Scalar> four = k.constant(4.0f);
     const Reg<Scalar> block_threads =
         k.constant(static_cast<float>(TILE_WIDTH * TILE_HEIGHT));
-    const Reg<Scalar> staged = k.mul(count, k.constant(9.0f));
+    const Reg<Scalar> staged =
+        k.mul(count, k.constant(static_cast<float>(TILE_TRIANGLE_FLOATS)));
 
     // A copy, because fma advances the cursor in place and a loop counter that
     // doubles as the thread's identity reads badly.
@@ -693,15 +792,20 @@ Program build_shared_raster_program(void** args)
             const Label top = k.label();
             k.place(top);
 
+            // Position then 1/w, three times — the layout pass 1 writes and
+            // bin_triangles copies.
             const Reg<Scalar> x0 = k.load_shared(shared_addr, 0.0f);
             const Reg<Scalar> y0 = k.load_shared(shared_addr, 4.0f);
             const Reg<Scalar> z0 = k.load_shared(shared_addr, 8.0f);
-            const Reg<Scalar> x1 = k.load_shared(shared_addr, 12.0f);
-            const Reg<Scalar> y1 = k.load_shared(shared_addr, 16.0f);
-            const Reg<Scalar> z1 = k.load_shared(shared_addr, 20.0f);
-            const Reg<Scalar> x2 = k.load_shared(shared_addr, 24.0f);
-            const Reg<Scalar> y2 = k.load_shared(shared_addr, 28.0f);
-            const Reg<Scalar> z2 = k.load_shared(shared_addr, 32.0f);
+            const Reg<Scalar> iw0 = k.load_shared(shared_addr, 12.0f);
+            const Reg<Scalar> x1 = k.load_shared(shared_addr, 16.0f);
+            const Reg<Scalar> y1 = k.load_shared(shared_addr, 20.0f);
+            const Reg<Scalar> z1 = k.load_shared(shared_addr, 24.0f);
+            const Reg<Scalar> iw1 = k.load_shared(shared_addr, 28.0f);
+            const Reg<Scalar> x2 = k.load_shared(shared_addr, 32.0f);
+            const Reg<Scalar> y2 = k.load_shared(shared_addr, 36.0f);
+            const Reg<Scalar> z2 = k.load_shared(shared_addr, 40.0f);
+            const Reg<Scalar> iw2 = k.load_shared(shared_addr, 44.0f);
 
             const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
             const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
@@ -721,11 +825,11 @@ Program build_shared_raster_program(void** args)
             k.fma(depth, w2, z2);
 
             const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+            // Depth from the affine weights, colour from the corrected ones:
+            // NDC z is linear in screen space and an attribute is not.
             k.if_(take, [&] {
                 k.copy_into(best_z, depth);
-                k.copy_into(best.component(0), w1);
-                k.copy_into(best.component(1), w2);
-                k.copy_into(best.component(2), w0);
+                emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
             });
 
             k.fma(shared_addr, shared_stride, one);
@@ -910,7 +1014,8 @@ Program build_raytrace_program(void** args)
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
 
-        // One run of triangles, nine floats each. count is a host value here,
+        // One run of triangles, a screen triangle each. count is a host value
+        // here,
         // so unlike the tiled rasteriser there is no table to read first — and
         // run_raytrace_stage refuses a count of zero, so the loop can test at
         // the bottom without a guard.

@@ -29,10 +29,19 @@
 inline constexpr uint32_t WORLD_VERTEX_FLOATS = 3;
 inline constexpr uint32_t WORLD_VERTEX_BYTES = WORLD_VERTEX_FLOATS * sizeof(float);
 
-// x, y in pixels, plus the NDC depth that pass 2 compares. Not four: the
-// perspective divide happens in pass 1, so w has served its purpose by the time
-// anything is written.
-inline constexpr uint32_t SCREEN_VERTEX_FLOATS = 3;
+// x, y in pixels, the NDC depth pass 2 compares, and 1/w.
+//
+// w is kept because the divide is exactly what makes screen-space interpolation
+// wrong for anything but depth. Barycentric weights taken from projected
+// vertices are affine; an attribute carried across a perspective-projected
+// triangle needs them weighted by 1/w and renormalised. Depth does not, being
+// linear in screen space by construction — which is the whole reason a depth
+// buffer stores NDC z.
+//
+// Costs a float per vertex and a reciprocal per pixel, and without it the
+// rasteriser and the ray tracer only agree on a scene whose triangles all sit
+// at one depth.
+inline constexpr uint32_t SCREEN_VERTEX_FLOATS = 4;
 inline constexpr uint32_t SCREEN_VERTEX_BYTES = SCREEN_VERTEX_FLOATS * sizeof(float);
 
 // --- pass 1 -----------------------------------------------------------------
@@ -80,6 +89,27 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args);
 // downward from the top row.
 Float3 project_vertex(const Float4x4& view_projection, Float3 world, uint32_t width,
                       uint32_t height);
+
+// A triangle as pass 1 leaves it: x and y in pixels, z the NDC depth.
+struct ScreenTriangle {
+    Float3 v0;
+    Float3 v1;
+    Float3 v2;
+
+    // One per vertex, in that order. Named rather than packed into a Float3,
+    // which would read as a vector and is three unrelated scalars.
+    float inv_w0 = 1.0f;
+    float inv_w1 = 1.0f;
+    float inv_w2 = 1.0f;
+};
+
+// A whole triangle through pass 1, on the host: the positions project_vertex
+// gives plus the reciprocals of w that the kernel keeps alongside them.
+//
+// The natural unit, since a ScreenTriangle is what the raster path consumes and
+// a vertex on its own cannot carry the reciprocal.
+ScreenTriangle project_triangle(const Float4x4& view_projection, Float3 v0, Float3 v1,
+                                Float3 v2, uint32_t width, uint32_t height);
 
 // --- pass 2 -----------------------------------------------------------------
 // Coverage, one thread per pixel, and the first kernel whose lanes disagree
@@ -146,14 +176,22 @@ Float3 barycentric(Float3 v0, Float3 v1, Float3 v2, float px, float py);
 // kernels/ray_triangle.cpp produces from (u, v, 1 - u - v). The two renderers
 // are meant to be compared as images, and a rotation in hue is the kind of
 // wrong that still looks deliberate.
-Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py);
+//
+// The reciprocals default to 1, which is the affine case — every vertex at one
+// depth. Tests that build a triangle by hand rather than projecting one want
+// exactly that.
+Float3 shade_pixel(Float3 v0, Float3 v1, Float3 v2, uint32_t px, uint32_t py,
+                   float inv_w0 = 1.0f, float inv_w1 = 1.0f, float inv_w2 = 1.0f);
 
-// A triangle as pass 1 leaves it: x and y in pixels, z the NDC depth.
-struct ScreenTriangle {
-    Float3 v0;
-    Float3 v1;
-    Float3 v2;
-};
+// Turns affine barycentric weights into the ones an attribute needs.
+//
+//   denominator = w0/w0_clip + w1/w1_clip + w2/w2_clip
+//   corrected_i = (w_i / wi_clip) / denominator
+//
+// Leaves the weights alone when every vertex shares a depth, which is why the
+// two renderers agreed before this existed and why a scene like that proves
+// nothing about interpolation.
+Float3 perspective_correct(Float3 affine, float inv_w0, float inv_w1, float inv_w2);
 
 // Depth of the triangle at a pixel.
 //
@@ -203,7 +241,9 @@ inline constexpr uint32_t TILE_HEIGHT = 8;
 // save 36 bytes — and the duplication is bounded by how many tiles a triangle
 // spans.
 struct TileBinning {
-    // Nine floats per triangle, tile by tile, in tile order.
+    // One screen triangle per entry, tile by tile, in tile order — laid out
+    // exactly as pass 1 writes three consecutive vertices, so a kernel reads a
+    // binned triangle with the offsets it already has.
     std::vector<float> vertices;
 
     // Two floats per tile: where its run starts, counted in triangles, and how
@@ -225,6 +265,8 @@ struct TileBinning {
 // near — which costs a few wasted coverage tests and never a missing pixel. An
 // exact test would be a triangle/rectangle intersection per pair, and the tiles
 // it saves are the cheapest ones to have kept.
+//
+// A tile's run is TILE_TRIANGLE_FLOATS per entry.
 TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t width,
                           uint32_t height);
 
@@ -264,7 +306,12 @@ void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);
 // 4096 floats of shared memory, nine per triangle. A tile holding more than
 // this cannot be staged in one pass, and real hardware has the same problem —
 // it splits the tile across passes. Refused here instead.
-inline constexpr uint32_t SHARED_TRIANGLE_CAPACITY = SHARED_MEM_FLOATS / 9;
+// A binned triangle is laid out exactly as three consecutive screen vertices,
+// so all three raster kernels read it with one set of offsets.
+inline constexpr uint32_t TILE_TRIANGLE_FLOATS = 3 * SCREEN_VERTEX_FLOATS;
+
+inline constexpr uint32_t SHARED_TRIANGLE_CAPACITY =
+    SHARED_MEM_FLOATS / TILE_TRIANGLE_FLOATS;
 
 // Builds the shared-memory pass 2. args[0] must point at a
 // TiledRasterStageArgs, whose max_tile_triangles must not exceed
@@ -352,8 +399,9 @@ Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& 
 struct RaytraceStageArgs {
     RayBasis basis;
 
-    // Byte offsets from the base of device memory. Nine floats a triangle, as
-    // the screen buffer holds, but in world space and never rewritten.
+    // Byte offsets from the base of device memory. Three floats a vertex, in
+    // world space and never rewritten — no 1/w, there being no projection on
+    // this path to produce one.
     size_t triangles_offset = 0;
     size_t framebuffer_offset = 0;
 
