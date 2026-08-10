@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -892,8 +893,7 @@ RayBasis ray_basis(const Camera& camera, float aspect)
     const Float3 up = cross(right, forward);
 
     // Folding the field of view in here is what leaves the kernel with three
-    // scales and two adds. Applied last and once, so there is no half-scaled
-    // vector for the next line to pick up by mistake.
+    // scales and two adds.
     const float half_extent = std::tan(radians(camera.fov_y_degrees) * 0.5f);
 
     return RayBasis{camera.eye, right * (half_extent * aspect), up * half_extent,
@@ -909,7 +909,6 @@ Hit intersect(const WorldTriangle& triangle, Float3 origin, Float3 direction)
 
     // Returning rather than noting a miss and carrying on: a is the divisor
     // below, and a parallel ray leaves it at zero.
-    //
     if (a < INTERSECT_EPSILON) {
         return Hit{};
     }
@@ -932,26 +931,31 @@ Hit intersect(const WorldTriangle& triangle, Float3 origin, Float3 direction)
         return Hit{};
     }
 
-    // Five ways out, and the kernel has the same five — all of them branching
-    // to one label, which is what Label was added for.
     return Hit{true, t, u, v};
 }
 
-Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& basis,
-                   uint32_t px, uint32_t py, uint32_t width, uint32_t height)
+Float3 shade_diffuse(Float3 normal, Float3 hit, const Shading& shading)
 {
-    // The pixel centre, as the rasteriser samples it. sx and sy run -1 to 1
-    // across the frame, sy backwards because rows count down while the frame
-    // counts up.
+    // The one place this reference is stricter than the kernel it stands for:
+    // normalize throws on a light sitting exactly on the surface, where
+    // V_NORM_VEC3_F32 divides by zero and carries on.
+    const Float3 to_light = normalize(shading.light_position - hit);
+    const float diffuse = std::max(0.0f, dot(normal, to_light));
+    const Float3 colour = shading.base_colour * diffuse;
+    return colour;
+}
+
+Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& basis,
+                   uint32_t px, uint32_t py, uint32_t width, uint32_t height,
+                   const Shading& shading)
+{
     const float sx =
         (static_cast<float>(px) + 0.5f) / static_cast<float>(width) * 2.0f - 1.0f;
     const float sy =
         1.0f - (static_cast<float>(py) + 0.5f) / static_cast<float>(height) * 2.0f;
     const Float3 direction = basis.right * sx + basis.up * sy + basis.forward;
 
-    // No depth buffer and no atomics, for the same reason the rasteriser needs
-    // none: the thread owns its pixel. Black to start, so a ray that meets
-    // nothing leaves the background.
+    // Black to start, so a ray that meets nothing leaves the background.
     float best_t = std::numeric_limits<float>::infinity();
     Float3 colour;
 
@@ -966,10 +970,17 @@ Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& 
         }
         best_t = hit.t;
 
-        // (u, v, 1 - u - v). shade_pixel orders its weights to match this
-        // rather than the other way round, the ray tracer having got there
-        // first.
-        colour = Float3{hit.u, hit.v, 1.0f - hit.u - hit.v};
+        if (shading.mode == ShadingMode::Diffuse) {
+            // No flipping: intersect culls back faces, so every hit that gets
+            // here is wound the way cross expects.
+            const Float3 normal =
+                normalize(cross(triangle.v1 - triangle.v0, triangle.v2 - triangle.v0));
+
+            const Float3 point = basis.origin + direction * hit.t;
+            colour = shade_diffuse(normal, point, shading);
+        } else {
+            colour = Float3{hit.u, hit.v, 1.0f - hit.u - hit.v};
+        }
     }
     return colour;
 }
@@ -1014,11 +1025,10 @@ Program build_raytrace_program(void** args)
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
 
-        // One run of triangles, a screen triangle each. count is a host value
-        // here,
-        // so unlike the tiled rasteriser there is no table to read first — and
-        // run_raytrace_stage refuses a count of zero, so the loop can test at
-        // the bottom without a guard.
+        // One run of world triangles. count is a host value, so unlike the tiled
+        // rasteriser there is no table to read first — and run_raytrace_stage
+        // refuses a count of zero, so the loop can test at the bottom without a
+        // guard.
         const Reg<Scalar> one = k.constant(1.0f);
         const Reg<Scalar> zero = k.constant(0.0f);
         const Reg<Scalar> eps = k.constant(INTERSECT_EPSILON);
@@ -1026,6 +1036,14 @@ Program build_raytrace_program(void** args)
         const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
         const Reg<Scalar> cursor = k.constant(static_cast<float>(a.triangles_offset));
         const Reg<Scalar> i = k.constant(0.0f);
+
+        // Above k.place(top) because a constant below it is issued once per
+        // triangle. Emitted whatever the mode: six moves outside the loop cost
+        // less than the optional it would take to declare them conditionally.
+        const Float3& lp = a.shading.light_position;
+        const Float3& bc = a.shading.base_colour;
+        const Reg<Vec3> light = k.constant(lp.x, lp.y, lp.z);
+        const Reg<Vec3> base = k.constant(bc.x, bc.y, bc.z);
 
         // Every miss lands on next, and it is placed before the advance below:
         // a miss means "on to the next triangle", not "out of the loop", so the
@@ -1077,9 +1095,35 @@ Program build_raytrace_program(void** args)
         // pixel, so the running best is a register.
         k.if_(k.lt(t, best_t), [&] {
             k.copy_into(best_t, t);
-            k.copy_into(best.component(0), u);
-            k.copy_into(best.component(1), v);
-            k.copy_into(best.component(2), k.sub(k.sub(one, u), v));
+
+            // Read at build time, not by the device: a KernelFunc runs once per
+            // launch, so only one of these arms reaches the instruction stream.
+            if (a.shading.mode == ShadingMode::Diffuse) {
+                // Shaded inside the loop, so a pixel that meets three triangles
+                // shades three times. Carrying a normal and a point out to the
+                // end would cost six registers to save work the twelve loads
+                // above already dominate.
+
+                // e1 and e2 are the intersection test's, not rebuilt from the
+                // vertices: a normal wound off different edges than a_dot was
+                // would cull one face and shade the other.
+                const Reg<Vec3> normal = k.normalize(k.cross(e1, e2));
+
+                // dir is not normalised and does not need to be — t is measured
+                // in units of it, so the two cancel.
+                const Reg<Vec3> point = k.add(origin, k.scale(dir, t));
+                const Reg<Vec3> to_light = k.normalize(k.sub(light, point));
+                const Reg<Scalar> diffuse = k.max(zero, k.dot(normal, to_light));
+                const Reg<Vec3> shaded = k.scale(base, diffuse);
+
+                k.copy_into(best.component(0), shaded.component(0));
+                k.copy_into(best.component(1), shaded.component(1));
+                k.copy_into(best.component(2), shaded.component(2));
+            } else {
+                k.copy_into(best.component(0), u);
+                k.copy_into(best.component(1), v);
+                k.copy_into(best.component(2), k.sub(k.sub(one, u), v));
+            }
         });
 
         k.place(next);

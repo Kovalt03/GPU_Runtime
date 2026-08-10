@@ -1077,7 +1077,8 @@ std::vector<Float3> as_vertex_list(const std::vector<WorldTriangle>& triangles)
 }
 
 std::vector<Float3> render_traced_with(const std::vector<WorldTriangle>& triangles,
-                                       const Camera& camera, MyGPURuntime* external)
+                                       const Camera& camera, const Shading& shading,
+                                       MyGPURuntime* external)
 {
     MyGPURuntime local(1u << 24);
     MyGPURuntime& rt = (external != nullptr) ? *external : local;
@@ -1098,6 +1099,7 @@ std::vector<Float3> render_traced_with(const std::vector<WorldTriangle>& triangl
     RaytraceStageArgs args;
     args.basis =
         ray_basis(camera, static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
+    args.shading = shading;
     args.triangles_offset = rt.myrt_device_offset(tri_dev);
     args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
     args.width = WIDTH;
@@ -1116,15 +1118,16 @@ std::vector<Float3> render_traced_with(const std::vector<WorldTriangle>& triangl
 }
 
 std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
-                                  MyGPURuntime* external = nullptr)
+                                  MyGPURuntime* external = nullptr,
+                                  const Shading& shading = Shading{})
 {
-    return render_traced_with(triangles, default_camera(), external);
+    return render_traced_with(triangles, default_camera(), shading, external);
 }
 
 std::vector<Float3> render_traced_from(const std::vector<WorldTriangle>& triangles,
                                        const Camera& camera)
 {
-    return render_traced_with(triangles, camera, nullptr);
+    return render_traced_with(triangles, camera, Shading{}, nullptr);
 }
 
 // The raster path from an arbitrary camera, which only the angled-view test
@@ -1297,6 +1300,97 @@ TEST(Pipeline, RaytraceStageRejectsAnEmptyScene)
     args.triangle_count = 0;
 
     EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Diffuse lighting — the point at which the two paths stop being comparable
+// ---------------------------------------------------------------------------
+
+namespace {
+
+Shading lit()
+{
+    Shading s;
+    s.mode = ShadingMode::Diffuse;
+    s.light_position = Float3{0.0f, 0.0f, 5.0f};
+    s.base_colour = Float3{1.0f, 1.0f, 1.0f};
+    return s;
+}
+
+}  // namespace
+
+TEST(Pipeline, DiffuseIsBrightestFacingTheLight)
+{
+    // The light is straight down +z; a surface whose normal points at it takes
+    // the full base colour, and one turned away takes less.
+    const Float3 at_light = shade_diffuse(Float3{0, 0, 1}, Float3{0, 0, 0}, lit());
+    EXPECT_NEAR(at_light.x, 1.0f, PIXEL_EPS);
+
+    const Float3 tilted =
+        shade_diffuse(normalize(Float3{1, 0, 1}), Float3{0, 0, 0}, lit());
+    EXPECT_LT(tilted.x, at_light.x);
+    EXPECT_GT(tilted.x, 0.0f);
+}
+
+TEST(Pipeline, DiffuseNeverLightsFromBehind)
+{
+    // dot goes negative once the surface turns away, and a negative scale would
+    // brighten it again as it turned further.
+    const Float3 away = shade_diffuse(Float3{0, 0, -1}, Float3{0, 0, 0}, lit());
+    EXPECT_FLOAT_EQ(away.x, 0.0f);
+    EXPECT_FLOAT_EQ(away.y, 0.0f);
+    EXPECT_FLOAT_EQ(away.z, 0.0f);
+}
+
+TEST(Pipeline, DiffuseScalesTheBaseColour)
+{
+    Shading s = lit();
+    s.base_colour = Float3{0.5f, 0.25f, 0.0f};
+
+    const Float3 got = shade_diffuse(Float3{0, 0, 1}, Float3{0, 0, 0}, s);
+    EXPECT_NEAR(got.x, 0.5f, PIXEL_EPS);
+    EXPECT_NEAR(got.y, 0.25f, PIXEL_EPS);
+    EXPECT_NEAR(got.z, 0.0f, PIXEL_EPS);
+}
+
+TEST(Pipeline, LitTracePixelIsNotTheBarycentricOne)
+{
+    // Both hit; only the colouring differs. Checked so that wiring the mode up
+    // and then ignoring it would fail rather than pass quietly.
+    const std::vector<WorldTriangle> scene = {facing_triangle()};
+
+    const Float3 flat =
+        trace_pixel(scene, default_basis(), WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT);
+    const Float3 shaded =
+        trace_pixel(scene, default_basis(), WIDTH / 2, HEIGHT / 2, WIDTH, HEIGHT, lit());
+
+    EXPECT_GT(flat.x + flat.y + flat.z, 0.0f) << "the unlit one still hits";
+    EXPECT_GT(shaded.x + shaded.y + shaded.z, 0.0f) << "and so does the lit one";
+    EXPECT_GT(std::abs(shaded.x - flat.x) + std::abs(shaded.y - flat.y) +
+                  std::abs(shaded.z - flat.z),
+              PIXEL_EPS)
+        << "but they must not agree";
+}
+
+TEST(Pipeline, LitKernelMatchesTheLitHost)
+{
+    const std::vector<WorldTriangle> scene = shared_scene();
+    const std::vector<Float3> frame = render_traced(scene, nullptr, lit());
+    ASSERT_EQ(frame.size(), static_cast<size_t>(WIDTH) * HEIGHT);
+
+    const RayBasis basis = default_basis();
+    uint32_t covered = 0;
+    for (uint32_t y = 0; y < HEIGHT; ++y) {
+        for (uint32_t x = 0; x < WIDTH; ++x) {
+            const Float3 want = trace_pixel(scene, basis, x, y, WIDTH, HEIGHT, lit());
+            const Float3 got = frame[y * WIDTH + x];
+            ASSERT_NEAR(got.x, want.x, PIXEL_EPS) << "pixel " << x << "," << y;
+            if (want.x + want.y + want.z > 0.0f) {
+                ++covered;
+            }
+        }
+    }
+    EXPECT_GT(covered, 0u);
 }
 
 // ---------------------------------------------------------------------------

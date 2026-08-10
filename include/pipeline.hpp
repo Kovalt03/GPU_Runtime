@@ -387,17 +387,49 @@ struct Hit {
 
 Hit intersect(const WorldTriangle& triangle, Float3 origin, Float3 direction);
 
+// How a hit is coloured.
+//
+// Barycentric is the debug colouring both renderers share, and the only one the
+// rasteriser can produce: pass 1 keeps screen x, y and depth, so the world
+// position and normal a light needs are gone by the time it runs. Lighting is
+// therefore the point at which the two paths stop being directly comparable,
+// which is why it is a mode rather than a replacement.
+enum class ShadingMode {
+    Barycentric,
+    Diffuse,
+};
+
+struct Shading {
+    ShadingMode mode = ShadingMode::Barycentric;
+
+    // World space. Only read in Diffuse.
+    Float3 light_position{2.0f, 3.0f, 1.0f};
+    Float3 base_colour{1.0f, 1.0f, 1.0f};
+};
+
+// Lambert, for one hit. normal and to_light are expected normalised; the
+// clamp at zero is what stops a surface facing away from the light from
+// being lit from behind.
+//
+//   diffuse = max(0, dot(normal, to_light))
+//   colour  = base * diffuse
+Float3 shade_diffuse(Float3 normal, Float3 hit, const Shading& shading);
+
 // The colour a pixel takes from the nearest triangle its ray meets, black on a
 // miss — the whole of the kernel for one pixel, and its reference.
 //
 // Coloured (u, v, 1 - u - v), which is what shade_pixel_nearest produces from
 // the barycentric weights it computes a different way. The two renderers have
 // to agree pixel for pixel, and that only works if they agree here first.
+//
+// Defaulted so the calls that predate lighting keep meaning what they did.
 Float3 trace_pixel(const std::vector<WorldTriangle>& triangles, const RayBasis& basis,
-                   uint32_t px, uint32_t py, uint32_t width, uint32_t height);
+                   uint32_t px, uint32_t py, uint32_t width, uint32_t height,
+                   const Shading& shading = Shading{});
 
 struct RaytraceStageArgs {
     RayBasis basis;
+    Shading shading;
 
     // Byte offsets from the base of device memory. Three floats a vertex, in
     // world space and never rewritten — no 1/w, there being no projection on
