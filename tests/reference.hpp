@@ -4,7 +4,8 @@
 #include <vector>
 
 #include "math3d.hpp"
-#include "pipeline.hpp"
+#include "pipeline/raytrace.hpp"
+#include "pipeline/types.hpp"
 
 // Host implementations of what the kernels compute, and the oracle each kernel
 // is checked against. Nothing here runs on the simulated GPU, and no

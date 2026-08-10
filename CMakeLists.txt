@@ -32,7 +32,7 @@ target_compile_options(project_warnings INTERFACE
 #   5) Runtime    src/runtime.cpp    (done)
 #   8) IRBuilder  src/ir_builder.cpp (done)
 #   9) Graphics   src/math3d.cpp     (done)
-#                 src/pipeline.cpp   (vertex stage done)
+#                 src/pipeline/*.cpp (done)
 # ---------------------------------------------------------------------------
 add_library(gpurt STATIC
     src/isa.cpp
@@ -42,7 +42,10 @@ add_library(gpurt STATIC
     src/runtime.cpp
     src/ir_builder.cpp
     src/math3d.cpp
-    src/pipeline.cpp
+    src/pipeline/vertex.cpp
+    src/pipeline/raster.cpp
+    src/pipeline/raster_tiled.cpp
+    src/pipeline/raytrace.cpp
 )
 target_include_directories(gpurt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(gpurt PRIVATE project_warnings)

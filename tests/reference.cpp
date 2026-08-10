@@ -7,7 +7,8 @@
 #include <vector>
 
 #include "math3d.hpp"
-#include "pipeline.hpp"
+#include "pipeline/raytrace.hpp"
+#include "pipeline/types.hpp"
 
 namespace {
 

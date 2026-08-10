@@ -13,7 +13,9 @@
 #include <cstdlib>
 #include <vector>
 
-#include "pipeline.hpp"
+#include "pipeline/raster.hpp"
+#include "pipeline/types.hpp"
+#include "pipeline/vertex.hpp"
 #include "ppm.hpp"
 #include "runtime.hpp"
 #include "scheduler.hpp"

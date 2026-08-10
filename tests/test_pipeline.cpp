@@ -6,7 +6,11 @@
 #include <gtest/gtest.h>
 
 #include "math3d.hpp"
-#include "pipeline.hpp"
+#include "pipeline/raster.hpp"
+#include "pipeline/raster_tiled.hpp"
+#include "pipeline/raytrace.hpp"
+#include "pipeline/types.hpp"
+#include "pipeline/vertex.hpp"
 #include "reference.hpp"
 
 namespace {

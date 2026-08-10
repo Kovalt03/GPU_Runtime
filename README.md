@@ -40,7 +40,7 @@ grows only with the perimeter.
                        │  Mesh · Camera · two launches
   ┌────────────────────▼─────────────────────────────┐
   │              Graphics Pipeline                   │
-  │      include/pipeline.hpp · include/math3d.hpp    │
+  │       include/pipeline/ · include/math3d.hpp     │
   │   vertex stage → tile binning → raster stage     │
   │   host-side Float3 / Float4x4, staged in shared  │
   └────────────────────┬─────────────────────────────┘
@@ -130,9 +130,9 @@ opcodes are added.
 | 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | ✅ |
 | 8 | IR Builder | `include/ir_builder.hpp` · `src/ir_builder.cpp` | ✅ |
 | 9 | Host geometry | `include/math3d.hpp` · `src/math3d.cpp` | ✅ |
-| 10 | Rasteriser | `include/pipeline.hpp` · `src/pipeline.cpp` | ✅ |
-| 11 | Tile binning + shared memory | `src/pipeline.cpp` · `BARRIER` | ✅ |
-| 12 | Ray tracer over the same scene | `src/pipeline.cpp` | 🔲 |
+| 10 | Rasteriser | `pipeline/vertex.*` · `pipeline/raster.*` | ✅ |
+| 11 | Tile binning + shared memory | `pipeline/raster_tiled.*` · `BARRIER` | ✅ |
+| 12 | Ray tracer over the same scene | `pipeline/raytrace.*` | 🔲 |
 
 ---
 
@@ -282,7 +282,12 @@ gpu-runtime-sim/
 │   ├── runtime.hpp
 │   ├── ir_builder.hpp
 │   ├── math3d.hpp
-│   └── pipeline.hpp
+│   └── pipeline/
+│       ├── types.hpp        # strides and ScreenTriangle, shared by the stages
+│       ├── vertex.hpp
+│       ├── raster.hpp
+│       ├── raster_tiled.hpp
+│       └── raytrace.hpp
 ├── src/
 │   ├── isa.cpp
 │   ├── memory.cpp
@@ -291,7 +296,12 @@ gpu-runtime-sim/
 │   ├── runtime.cpp
 │   ├── ir_builder.cpp
 │   ├── math3d.cpp
-│   └── pipeline.cpp
+│   └── pipeline/
+│       ├── raster_emit.hpp   # private: the emitters the raster kernels share
+│       ├── vertex.cpp
+│       ├── raster.cpp
+│       ├── raster_tiled.cpp
+│       └── raytrace.cpp
 ├── kernels/
 │   ├── ppm.hpp
 │   ├── ray_triangle.cpp
@@ -305,7 +315,9 @@ gpu-runtime-sim/
 │   ├── test_runtime.cpp
 │   ├── test_ir_builder.cpp
 │   ├── test_math3d.cpp
-│   └── test_pipeline.cpp
+│   ├── test_pipeline.cpp
+│   ├── reference.hpp        # host oracles, built into the test target only
+│   └── reference.cpp
 ├── benchmarks/
 │   ├── CMakeLists.txt
 │   ├── RESULTS.md
