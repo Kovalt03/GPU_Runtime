@@ -6,6 +6,7 @@
 #include "isa.hpp"
 #include "math3d.hpp"
 #include "runtime.hpp"
+#include "thread.hpp"  // SHARED_MEM_FLOATS, the staging budget
 
 // The graphics layer. Everything below is a thin wrapper over myrt_launch: the
 // runtime stays general-purpose the way CUDA is, and the knowledge that these
@@ -236,6 +237,10 @@ struct TiledRasterStageArgs {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t tiles_x = 0;
+
+    // The fullest tile in the binning. Only the shared-memory variant needs
+    // it, to refuse a tile it cannot hold; the global-memory one ignores it.
+    uint32_t max_tile_triangles = 0;
 };
 
 // Builds the tiled pass 2. Same picture as build_raster_program, reached by
@@ -245,3 +250,33 @@ Program build_tiled_raster_program(void** args);
 // Runs it, one block per tile. The grid is the tile grid, which is what makes
 // blockIdx the tile index.
 void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);
+
+// --- tiling, through shared memory ------------------------------------------
+// The same frame again. What changes is where the tile's triangles are read
+// from: every pixel of a block walks the same list, so reading it from global
+// once per pixel is 32 lanes issuing the same load. The block loads it once
+// into shared memory instead, at 8 units a load rather than 100.
+//
+// That is what BARRIER was added for. The threads that fill shared memory are
+// not the ones that read each entry, so without a rendezvous between the two a
+// fast warp reads a slot a slow one has not written.
+
+// 4096 floats of shared memory, nine per triangle. A tile holding more than
+// this cannot be staged in one pass, and real hardware has the same problem —
+// it splits the tile across passes. Refused here instead.
+inline constexpr uint32_t SHARED_TRIANGLE_CAPACITY = SHARED_MEM_FLOATS / 9;
+
+// Builds the shared-memory pass 2. args[0] must point at a
+// TiledRasterStageArgs, whose max_tile_triangles must not exceed
+// SHARED_TRIANGLE_CAPACITY.
+//
+// The fill and the barrier sit *outside* the bounds check, unlike everything
+// else in this file. Every thread of the block has to reach a barrier, and the
+// edge blocks of a frame hold threads whose pixel is off screen — guarding the
+// barrier along with the pixel work would have those threads branch past it
+// and the scheduler would refuse the launch.
+Program build_shared_raster_program(void** args);
+
+// Runs it, one block per tile, as run_tiled_raster_stage does. Throws when a
+// tile holds more triangles than shared memory can stage.
+void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args);

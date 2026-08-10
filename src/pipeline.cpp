@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #include "ir_builder.hpp"
 #include "math3d.hpp"
@@ -582,4 +583,187 @@ void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
 
     void* raw[] = {const_cast<TiledRasterStageArgs*>(&args)};
     rt.myrt_launch(build_tiled_raster_program, grid, block, raw);
+}
+
+// ---------------------------------------------------------------------------
+// Tiling, through shared memory
+//
+// Same frame, same walk. The tile's triangles are staged once per block rather
+// than read from global by every pixel — the first kernel here that has two
+// warps depend on each other, and so the first that needs BARRIER.
+// ---------------------------------------------------------------------------
+
+Program build_shared_raster_program(void** args)
+{
+    (void)args;
+
+    const TiledRasterStageArgs& a = *static_cast<const TiledRasterStageArgs*>(args[0]);
+    IRBuilder k;
+    //
+    // [a] Which tile, and where its run starts — unchanged from
+    //     build_tiled_raster_program:
+    //
+    const Reg<Scalar> tile =
+        k.add(k.mul(k.block_y(), k.constant(static_cast<float>(a.tiles_x))), k.block_x());
+    const Reg<Scalar> table_addr = k.mul(tile, k.constant(2.0f * sizeof(float)));
+
+    const float table_base = static_cast<float>(a.tile_table_offset);
+    const Reg<Scalar> first = k.load(table_addr, table_base + 0.0f);
+    const Reg<Scalar> count = k.load(table_addr, table_base + 4.0f);
+
+    const Reg<Scalar> stride = k.constant(static_cast<float>(3 * SCREEN_VERTEX_BYTES));
+    const Reg<Scalar> tri_addr = k.add(
+        k.mul(first, stride), k.constant(static_cast<float>(a.tile_vertices_offset)));
+    // thread_x and thread_y are global coordinates, so the block's own origin
+    // has to come off before they can index anything the block owns. Both are
+    // kept: the pixel work below still wants them as they are.
+    const Reg<Scalar> tile_w = k.constant(static_cast<float>(TILE_WIDTH));
+    const Reg<Scalar> px = k.thread_x();
+    const Reg<Scalar> py = k.thread_y();
+    const Reg<Scalar> tx = k.sub(px, k.mul(k.block_x(), tile_w));
+    const Reg<Scalar> ty =
+        k.sub(py, k.mul(k.block_y(), k.constant(static_cast<float>(TILE_HEIGHT))));
+
+    // 0 .. 255, and the stride the cooperative fill steps by.
+    const Reg<Scalar> lane = k.add(k.mul(ty, tile_w), tx);
+
+    // The fill. Nine floats a triangle, shared out across the block's 256
+    // threads: each takes the entry at its own lane index, then every 256th
+    // one after that.
+    const Reg<Scalar> one = k.constant(1.0f);
+    const Reg<Scalar> four = k.constant(4.0f);
+    const Reg<Scalar> block_threads =
+        k.constant(static_cast<float>(TILE_WIDTH * TILE_HEIGHT));
+    const Reg<Scalar> staged = k.mul(count, k.constant(9.0f));
+
+    // A copy, because fma advances the cursor in place and a loop counter that
+    // doubles as the thread's identity reads badly.
+    const Reg<Scalar> cursor = k.copy(lane);
+
+    // Rotated rather than wrapped in if_: a lane with nothing to stage leaves
+    // before the body instead of entering it against a guard, and the rest drop
+    // out one at a time as the cursor passes the end. min-PC keeps issuing the
+    // body for whoever is left, and they all meet again at fill_done.
+    const Label fill_done = k.label();
+    const Label fill_top = k.label();
+
+    k.branch_to(fill_done, k.ge(cursor, staged));
+    k.place(fill_top);
+
+    const Reg<Scalar> byte = k.mul(cursor, four);
+    k.store_shared(byte, k.load(k.add(tri_addr, byte), 0.0f), 0.0f);
+
+    k.fma(cursor, block_threads, one);
+    k.branch_to(fill_top, k.lt(cursor, staged));
+    k.place(fill_done);
+
+    // Everything above runs for every thread of the block, including the ones
+    // whose pixel is off screen in an edge tile. A thread that branched past
+    // this would be one the rest wait for and never see, and the scheduler
+    // refuses that rather than hanging.
+    k.barrier();
+
+    // From here the walk is build_tiled_raster_program's, with load_shared in
+    // place of load and a cursor that starts at zero — the tile's run begins at
+    // the front of shared memory however far into the buffer it sat.
+    const Reg<Scalar> zero = k.constant(0.0f);
+    const Reg<Scalar> half = k.constant(0.5f);
+    const Reg<Scalar> cx = k.add(px, half);
+    const Reg<Scalar> cy = k.add(py, half);
+
+    const Reg<Scalar> in_image =
+        k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+              k.lt(py, k.constant(static_cast<float>(a.height))));
+
+    k.if_(in_image, [&] {
+        const Reg<Scalar> best_z = k.constant(2.0f);
+        const Reg<Vec3> best = k.vec3();
+        k.set(best.component(0), 0.0f);
+        k.set(best.component(1), 0.0f);
+        k.set(best.component(2), 0.0f);
+
+        k.if_(k.gt(count, zero), [&] {
+            const Reg<Scalar> shared_stride =
+                k.constant(static_cast<float>(3 * SCREEN_VERTEX_BYTES));
+            const Reg<Scalar> shared_addr = k.copy(zero);
+            const Reg<Scalar> i = k.copy(zero);
+
+            const Label top = k.label();
+            k.place(top);
+
+            const Reg<Scalar> x0 = k.load_shared(shared_addr, 0.0f);
+            const Reg<Scalar> y0 = k.load_shared(shared_addr, 4.0f);
+            const Reg<Scalar> z0 = k.load_shared(shared_addr, 8.0f);
+            const Reg<Scalar> x1 = k.load_shared(shared_addr, 12.0f);
+            const Reg<Scalar> y1 = k.load_shared(shared_addr, 16.0f);
+            const Reg<Scalar> z1 = k.load_shared(shared_addr, 20.0f);
+            const Reg<Scalar> x2 = k.load_shared(shared_addr, 24.0f);
+            const Reg<Scalar> y2 = k.load_shared(shared_addr, 28.0f);
+            const Reg<Scalar> z2 = k.load_shared(shared_addr, 32.0f);
+
+            const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
+            const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
+            const Reg<Scalar> e2 = emit_edge(k, x0, y0, x1, y1, cx, cy);
+
+            const Reg<Scalar> area = k.add(k.add(e0, e1), e2);
+            const Reg<Scalar> inv_area = k.rcp(area);
+            const Reg<Scalar> w0 = k.mul(e0, inv_area);
+            const Reg<Scalar> w1 = k.mul(e1, inv_area);
+            const Reg<Scalar> w2 = k.mul(e2, inv_area);
+
+            const Reg<Scalar> inside =
+                k.min(k.min(k.ge(w0, zero), k.ge(w1, zero)), k.ge(w2, zero));
+
+            const Reg<Scalar> depth = k.mul(w0, z0);
+            k.fma(depth, w1, z1);
+            k.fma(depth, w2, z2);
+
+            const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+            k.if_(take, [&] {
+                k.copy_into(best_z, depth);
+                k.copy_into(best.component(0), w1);
+                k.copy_into(best.component(1), w2);
+                k.copy_into(best.component(2), w0);
+            });
+
+            k.fma(shared_addr, shared_stride, one);
+            k.fma(i, one, one);
+            k.branch_to(top, k.lt(i, count));
+        });
+
+        const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
+        const Reg<Scalar> index = k.add(row, px);
+        const Reg<Scalar> addr =
+            k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
+
+        const float frame_base = static_cast<float>(a.framebuffer_offset);
+        k.store(addr, best.component(0), frame_base + 0.0f);
+        k.store(addr, best.component(1), frame_base + 4.0f);
+        k.store(addr, best.component(2), frame_base + 8.0f);
+    });
+
+    return k.build();
+}
+
+void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
+{
+    if (args.width == 0 || args.height == 0) {
+        throw std::runtime_error("run_shared_raster_stage: an image with no pixels");
+    }
+
+    // Real hardware splits an overfull tile across passes. Doing that here
+    // would have the fill, the barrier and the walk repeat per pass, which is a
+    // different kernel; refusing is honest until a scene needs it.
+    if (args.max_tile_triangles > SHARED_TRIANGLE_CAPACITY) {
+        throw std::runtime_error("run_shared_raster_stage: a tile holds " +
+                                 std::to_string(args.max_tile_triangles) +
+                                 " triangles, and shared memory " + "stages " +
+                                 std::to_string(SHARED_TRIANGLE_CAPACITY));
+    }
+
+    const dim3 block{TILE_WIDTH, TILE_HEIGHT, 1};
+    const dim3 grid{args.tiles_x, (args.height + TILE_HEIGHT - 1) / TILE_HEIGHT, 1};
+
+    void* raw[] = {const_cast<TiledRasterStageArgs*>(&args)};
+    rt.myrt_launch(build_shared_raster_program, grid, block, raw);
 }

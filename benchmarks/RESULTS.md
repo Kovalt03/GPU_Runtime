@@ -111,6 +111,57 @@ Five times the divergence rate for a sixth of the work. Anyone tuning on
 
 ---
 
+## Rasteriser, staged through shared memory
+
+Each block loads its tile's triangles into shared memory once, then meets at a
+barrier before any pixel reads them back. A shared load costs 8 against a
+global load's 100, and every pixel of a block was making the same nine.
+
+| Scene | Triangles | walk | tiled | shared | vs tiled | vs walk |
+|---|---:|---:|---:|---:|---:|---:|
+| small, spread | 4 | 8,427,632 | 2,064,496 | 1,263,700 | -38.8% | -85.0% |
+| small, spread | 16 | 31,701,456 | 4,979,152 | 1,646,944 | -66.9% | **-94.8%** |
+| small, spread | 64 | 124,796,616 | 24,374,984 | 4,166,696 | -82.9% | **-96.7%** |
+| medium, stacked | 16 | 31,701,064 | 16,610,376 | 3,152,520 | -81.0% | -90.1% |
+| full-frame, stacked | 16 | 31,709,184 | 32,139,264 | 5,180,544 | -83.9% | -83.7% |
+
+### The two changes attack different waste
+
+The last row is the one worth reading twice. Binning *lost* 1.4% there, having
+nothing to remove: every triangle covers every tile. Staging wins 83.9% on the
+same scene, because it never depended on binning — the waste it removes is 256
+threads issuing the same nine loads, which happens whether or not the list is
+short.
+
+Tiling removes triangles a pixel need not see. Staging removes re-reads of the
+triangles it does. Neither subsumes the other, and a scene can be hostile to one
+while the other still pays.
+
+### The divergence prediction failed, and the reason is the useful part
+
+Both earlier sections ended with the same finding — cost falls, `divergence_rate`
+rises — and predicted it would happen again here. It did not:
+
+| Scene | vs tiled | divergence, tiled | divergence, shared |
+|---|---:|---:|---:|
+| 16 small, spread | -66.9% | 2.1% | 2.0% |
+| 64 small, spread | -82.9% | 1.7% | 1.7% |
+| 16 medium, stacked | -81.0% | 0.1% | 0.2% |
+
+Flat, against a two-thirds cut in cost.
+
+`divergence_rate` is `masked_lane_slots / lane_slots`, and both are counted in
+warp steps rather than weighted by `instruction_cost`. It cannot see cost at
+all. Binning changed the numbers because it removed whole *iterations* and with
+them their lane masks; staging changes what an instruction costs while leaving
+every mask exactly as it was.
+
+So the earlier readings were right about their own cause and wrong as a rule.
+Removing uniform work raises the rate; making uniform work cheaper does not move
+it. Both are invisible to a metric that counts slots.
+
+---
+
 ## Two renderers, one image
 
 `ray_triangle` and `raster_triangle` write byte-identical PPMs on a square frame

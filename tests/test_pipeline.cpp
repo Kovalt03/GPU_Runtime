@@ -219,6 +219,96 @@ std::vector<Float3> render_triangle_tiled(const std::vector<Float3>& world,
     return frame;
 }
 
+// As render_triangle_tiled, but staging each tile through shared memory. The
+// frame size is a parameter because the interesting case for the barrier is a
+// frame that does not divide evenly into tiles: the edge blocks then hold
+// threads whose pixel is off screen, and those threads still have to reach it.
+std::vector<Float3> render_triangle_shared(const std::vector<Float3>& world,
+                                           uint32_t width = WIDTH,
+                                           uint32_t height = HEIGHT,
+                                           MyGPURuntime* external = nullptr)
+{
+    MyGPURuntime local(1u << 24);
+    MyGPURuntime& rt = (external != nullptr) ? *external : local;
+
+    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
+    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
+    const size_t frame_bytes = static_cast<size_t>(width) * height * PIXEL_BYTES;
+
+    void* world_dev = rt.myrt_malloc(world_bytes);
+    void* screen_dev = rt.myrt_malloc(screen_bytes);
+    void* frame_dev = rt.myrt_malloc(frame_bytes);
+
+    std::vector<float> flat;
+    for (const Float3& v : world) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
+
+    VertexStageArgs vertex_args;
+    vertex_args.view_projection = default_camera().view_projection(
+        static_cast<float>(width) / static_cast<float>(height));
+    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
+    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
+    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
+    vertex_args.width = width;
+    vertex_args.height = height;
+    run_vertex_stage(rt, vertex_args);
+    rt.myrt_sync();
+
+    std::vector<float> screen(world.size() * SCREEN_VERTEX_FLOATS, 0.0f);
+    rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
+
+    std::vector<ScreenTriangle> triangles;
+    for (size_t i = 0; i + 8 < screen.size(); i += 9) {
+        triangles.push_back(
+            ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
+                           Float3{screen[i + 3], screen[i + 4], screen[i + 5]},
+                           Float3{screen[i + 6], screen[i + 7], screen[i + 8]}});
+    }
+
+    const TileBinning binning = bin_triangles(triangles, width, height);
+
+    uint32_t fullest = 0;
+    for (uint32_t t = 0; t < binning.tile_count(); ++t) {
+        const uint32_t c = static_cast<uint32_t>(binning.table[t * 2 + 1]);
+        if (c > fullest) {
+            fullest = c;
+        }
+    }
+
+    // A tile with nothing in it still needs somewhere to point.
+    void* verts_dev = rt.myrt_malloc(binning.vertices.size() * sizeof(float) + 16);
+    void* table_dev = rt.myrt_malloc(binning.table.size() * sizeof(float));
+    if (!binning.vertices.empty()) {
+        rt.myrt_memcpy(verts_dev, binning.vertices.data(),
+                       binning.vertices.size() * sizeof(float), Direction::HostToDevice);
+    }
+    rt.myrt_memcpy(table_dev, binning.table.data(), binning.table.size() * sizeof(float),
+                   Direction::HostToDevice);
+
+    TiledRasterStageArgs raster_args;
+    raster_args.tile_vertices_offset = rt.myrt_device_offset(verts_dev);
+    raster_args.tile_table_offset = rt.myrt_device_offset(table_dev);
+    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
+    raster_args.width = width;
+    raster_args.height = height;
+    raster_args.tiles_x = binning.tiles_x;
+    raster_args.max_tile_triangles = fullest;
+    run_shared_raster_stage(rt, raster_args);
+
+    std::vector<float> out(static_cast<size_t>(width) * height * PIXEL_FLOATS, 0.0f);
+    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
+
+    std::vector<Float3> frame;
+    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
+        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
+    }
+    return frame;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -782,4 +872,121 @@ TEST(Pipeline, TiledRasterIssuesLessWorkThanTheWalk)
 
     EXPECT_LT(tiled, walked) << "binning has to save something";
     EXPECT_LT(tiled * 2, walked) << "and enough to be worth the change";
+}
+
+// ---------------------------------------------------------------------------
+// Tiling through shared memory
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Sixteen small triangles spread over the frame, the shape binning is for.
+std::vector<Float3> scattered_scene()
+{
+    std::vector<Float3> world;
+    for (uint32_t gy = 0; gy < 4; ++gy) {
+        for (uint32_t gx = 0; gx < 4; ++gx) {
+            const float cx = -2.4f + 1.6f * static_cast<float>(gx);
+            const float cy = -1.2f + 0.8f * static_cast<float>(gy);
+            world.push_back(Float3{cx, cy + 0.25f, 0.0f});
+            world.push_back(Float3{cx - 0.25f, cy - 0.25f, 0.0f});
+            world.push_back(Float3{cx + 0.25f, cy - 0.25f, 0.0f});
+        }
+    }
+    return world;
+}
+
+}  // namespace
+
+TEST(Pipeline, SharedRasterDrawsTheSameFrameAsTheTiledWalk)
+{
+    // Where the triangles are read from is the only thing that changed.
+    const std::vector<Float3> world = scattered_scene();
+
+    const std::vector<Float3> tiled = render_triangle_tiled(world);
+    const std::vector<Float3> shared = render_triangle_shared(world);
+    ASSERT_EQ(shared.size(), tiled.size());
+
+    for (size_t i = 0; i < tiled.size(); ++i) {
+        ASSERT_NEAR(shared[i].x, tiled[i].x, PIXEL_EPS) << "pixel " << i << " r";
+        ASSERT_NEAR(shared[i].y, tiled[i].y, PIXEL_EPS) << "pixel " << i << " g";
+        ASSERT_NEAR(shared[i].z, tiled[i].z, PIXEL_EPS) << "pixel " << i << " b";
+    }
+}
+
+TEST(Pipeline, SharedRasterIssuesLessWorkThanTheTiledWalk)
+{
+    // Staging costs a fill and a barrier once per block; it saves 92 units on
+    // every one of the nine loads each pixel makes per triangle.
+    const std::vector<Float3> world = scattered_scene();
+
+    MyGPURuntime tiled_rt(1u << 24);
+    render_triangle_tiled(world, &tiled_rt);
+    const uint64_t tiled = tiled_rt.stats().weighted_lane_ops;
+
+    MyGPURuntime shared_rt(1u << 24);
+    render_triangle_shared(world, WIDTH, HEIGHT, &shared_rt);
+    const uint64_t shared = shared_rt.stats().weighted_lane_ops;
+
+    EXPECT_LT(shared, tiled) << "staging has to pay for itself";
+    EXPECT_LT(shared * 2, tiled) << "and by more than the fill costs";
+}
+
+TEST(Pipeline, SharedRasterSurvivesAFrameThatDoesNotFillItsTiles)
+{
+    // The test the barrier placement exists for. 50x20 leaves edge blocks whose
+    // last threads are off screen; if the fill and the barrier sat inside the
+    // bounds check, those threads would branch past it and the scheduler would
+    // refuse the launch.
+    const std::vector<Float3> world = scattered_scene();
+
+    std::vector<Float3> frame;
+    ASSERT_NO_THROW(frame = render_triangle_shared(world, 50, 20));
+    ASSERT_EQ(frame.size(), 50u * 20u);
+
+    uint32_t covered = 0;
+    for (const Float3& pixel : frame) {
+        if (pixel.x + pixel.y + pixel.z > 0.0f) {
+            ++covered;
+        }
+    }
+    EXPECT_GT(covered, 0u) << "a blank frame would satisfy the check above";
+}
+
+TEST(Pipeline, SharedRasterRejectsATileItCannotStage)
+{
+    MyGPURuntime rt(1u << 20);
+    TiledRasterStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.tiles_x = 2;
+    args.max_tile_triangles = SHARED_TRIANGLE_CAPACITY + 1;
+
+    EXPECT_THROW(run_shared_raster_stage(rt, args), std::runtime_error);
+}
+
+TEST(Pipeline, SharedRasterStagesThroughSharedMemory)
+{
+    // Cheap structural check: the triangles have to arrive in shared memory,
+    // and the block has to meet before anyone reads them back.
+    TiledRasterStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.tiles_x = 2;
+    args.max_tile_triangles = 4;
+
+    void* raw[] = {&args};
+    const Program p = build_shared_raster_program(raw);
+
+    uint32_t stores = 0;
+    uint32_t loads = 0;
+    uint32_t barriers = 0;
+    for (const Instruction& i : p) {
+        stores += (i.op == Opcode::V_ST_SHARED_F32) ? 1 : 0;
+        loads += (i.op == Opcode::V_LD_SHARED_F32) ? 1 : 0;
+        barriers += (i.op == Opcode::BARRIER) ? 1 : 0;
+    }
+    EXPECT_GT(stores, 0u) << "the fill has to write shared memory";
+    EXPECT_EQ(loads, 9u) << "nine reads per triangle, all of them from shared";
+    EXPECT_EQ(barriers, 1u);
 }
