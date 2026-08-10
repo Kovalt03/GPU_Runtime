@@ -7,6 +7,7 @@
 
 #include "math3d.hpp"
 #include "pipeline.hpp"
+#include "reference.hpp"
 
 namespace {
 
