@@ -329,13 +329,9 @@ void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
 TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t width,
                           uint32_t height)
 {
-    (void)triangles;
-    (void)width;
-    (void)height;
     // tiles_x = ceil(width / TILE_WIDTH), tiles_y likewise. Rounding up, so the
     // last tile is partly off screen and its threads fall out on the bounds
     // check the kernel already has.
-    //
     TileBinning binning;
     binning.tiles_x = (width + TILE_WIDTH - 1) / TILE_WIDTH;
     binning.tiles_y = (height + TILE_HEIGHT - 1) / TILE_HEIGHT;
@@ -345,7 +341,6 @@ TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t
     //   min/max of the three x and the three y
     //   overlap when  min.x < (tx + 1) * TILE_WIDTH  and  max.x >= tx * TILE_WIDTH
     //   and the same along y
-    //
     struct Box {
         float min_x, min_y, max_x, max_y;
     };
@@ -544,14 +539,11 @@ void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
 
 Program build_shared_raster_program(void** args)
 {
-    (void)args;
-
     const TiledRasterStageArgs& a = *static_cast<const TiledRasterStageArgs*>(args[0]);
     IRBuilder k;
-    //
-    // [a] Which tile, and where its run starts — unchanged from
-    //     build_tiled_raster_program:
-    //
+
+    // Which tile, and where its run starts — unchanged from
+    // build_tiled_raster_program.
     const Reg<Scalar> tile =
         k.add(k.mul(k.block_y(), k.constant(static_cast<float>(a.tiles_x))), k.block_x());
     const Reg<Scalar> table_addr = k.mul(tile, k.constant(2.0f * sizeof(float)));
