@@ -339,6 +339,18 @@ Reg<Vec3> IRBuilder::load_vec3(Reg<Scalar> address, float offset)
     return dst;
 }
 
+Reg<Scalar> IRBuilder::load_shared(Reg<Scalar> address, float offset)
+{
+    const Reg<Scalar> dst = alloc<Scalar>();
+    emit(make_v_ld_shared_f32(dst.first(), address.first(), offset));
+    return dst;
+}
+
+void IRBuilder::store_shared(Reg<Scalar> address, Reg<Scalar> value, float offset)
+{
+    emit(make_v_st_shared_f32(address.first(), value.first(), offset));
+}
+
 void IRBuilder::store(Reg<Scalar> address, Reg<Scalar> value, float offset)
 {
     emit(make_v_st_global_f32(address.first(), value.first(), offset));

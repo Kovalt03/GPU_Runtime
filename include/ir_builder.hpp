@@ -205,6 +205,15 @@ public:
     // As load, into a register the caller already holds — the counterpart to
     // set(), and what fills the first three slots of a VEC4 in place.
     void load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
+
+    // The block's own scratchpad. Addresses are byte offsets, as the global
+    // pair uses, so the two read alike at a call site.
+    //
+    // Nothing above says "global" because nothing else existed when they were
+    // written. The asymmetry is a wart; renaming them would touch every kernel
+    // and is not worth doing in the change that adds these.
+    Reg<Scalar> load_shared(Reg<Scalar> address, float offset = 0.0f);
+    void store_shared(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
     void store(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
     void store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset = 0.0f);
 
