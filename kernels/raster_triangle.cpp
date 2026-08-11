@@ -15,7 +15,6 @@
 
 #include "app_run.hpp"
 #include "pipeline/draw.hpp"
-#include "pipeline/raster_tiled.hpp"  // TILE_WIDTH, the binning geometry
 #include "pipeline/types.hpp"
 #include "ppm.hpp"
 #include "runtime.hpp"
@@ -96,14 +95,16 @@ int main(int argc, char** argv)
 
     const size_t pixels = static_cast<size_t>(width) * height;
 
-    // Room for both framebuffers, the screen vertices, and the binned runs — a
-    // triangle is copied into every tile it reaches, so the worst case is one
-    // entry per tile per triangle.
-    const size_t tiles = ((width + TILE_WIDTH - 1) / TILE_WIDTH) *
-                         ((height + TILE_HEIGHT - 1) / TILE_HEIGHT);
-    const size_t budget = pixels * PIXEL_BYTES + world.size() * SCREEN_VERTEX_BYTES +
-                          tiles * triangles * TILE_TRIANGLE_FLOATS * sizeof(float) +
-                          (1u << 20);
+    // Asked for rather than worked out here, so that a resolution this cannot
+    // hold is arithmetic the library got wrong and not arithmetic spelled out
+    // again in every program.
+    BufferPlan plan;
+    plan.world_vertices = static_cast<uint32_t>(world.size());
+    plan.screen_vertices = plan.world_vertices;
+    plan.width = width;
+    plan.height = height;
+    const size_t budget = plan.device_bytes() +
+                          BufferPlan::binned_bytes(width, height, triangles) + (1u << 20);
 
     const DrawTarget target{width, height, scene_camera()};
 

@@ -5,9 +5,11 @@
 
 #include "math3d.hpp"
 #include "mesh.hpp"
+#include "pipeline/raster_tiled.hpp"
 #include "pipeline/raytrace.hpp"
 #include "pipeline/types.hpp"
 #include "runtime.hpp"
+#include "scheduler.hpp"
 
 // The four routes from world triangles to a frame, end to end: allocate,
 // upload, run the passes, read the framebuffer back.
@@ -16,6 +18,39 @@
 // the point. A benchmark and a test that each drove the pipeline their own way
 // would drift, and the figures in benchmarks/RESULTS.md would stop describing
 // what the tests check.
+
+// How much device memory a draw will ask for, stated rather than inferred.
+//
+// A graphics API makes the host do this — glBufferData and CreateBuffer both
+// take a byte count — because only the host knows how many vertices it is
+// about to send and how large a target it is drawing into. Inferring the sizes
+// inside the upload is what let a path that never writes a pixel quietly
+// reserve a framebuffer, and a benchmark size the runtime for a scene it could
+// not hold.
+//
+// device_bytes() is what MyGPURuntime has to be given. Callers that go on to
+// bin triangles add binned_bytes() to it.
+struct BufferPlan {
+    uint32_t world_vertices = 0;
+
+    // One per world vertex: pass 1 runs a thread each and writes x, y, depth
+    // and 1/w. Zero for a route with no vertex stage — the ray tracer reads
+    // world triangles where they lie and never projects.
+    uint32_t screen_vertices = 0;
+
+    // Three per triangle, when the geometry arrives indexed.
+    uint32_t indices = 0;
+
+    // Zero on a path that measures rather than renders.
+    uint32_t width = 0;
+    uint32_t height = 0;
+
+    size_t device_bytes() const;
+
+    // What binning costs at worst: a triangle is copied into every tile its
+    // bounding box reaches, so the bound is one entry per tile per triangle.
+    static size_t binned_bytes(uint32_t width, uint32_t height, uint32_t triangles);
+};
 
 // Where a draw lands, and through which camera.
 //
@@ -90,3 +125,11 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
                                   const DrawTarget& target,
                                   const Shading& shading = Shading{});
+
+// What pass 1 costs on its own.
+//
+// The draw routes clear the counters between their passes so a caller reads
+// pass 2 alone, which leaves the vertex stage — the half indexing actually
+// saves — with nowhere to be seen. This runs it and nothing else.
+SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
+                                 const DrawTarget& target);

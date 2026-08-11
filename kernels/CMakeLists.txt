@@ -8,6 +8,12 @@ target_link_libraries(ray_triangle PRIVATE gpurt project_warnings)
 add_executable(raster_triangle raster_triangle.cpp)
 target_link_libraries(raster_triangle PRIVATE gpurt project_warnings)
 
+# A mesh through every route, with an image and a number from each. The two
+# above hold one hard-coded triangle, which is what makes them a fixed reference
+# between the renderers and also what stops them showing a shared vertex.
+add_executable(mesh_render mesh_render.cpp)
+target_link_libraries(mesh_render PRIVATE gpurt project_warnings)
+
 # Written relative to the working directory, so run it from the project root.
 # The directory is tracked via benchmarks/result/.gitkeep; create it if a fresh clone has
 # not got one yet.

@@ -24,16 +24,23 @@ struct Buffers {
     void* index = nullptr;
 };
 
-Buffers upload(MyGPURuntime& rt, const std::vector<Float3>& world,
-               const DrawTarget& target)
+// Allocates exactly what the plan names, and nothing it does not. A zero
+// count means the buffer is not bound at all, and its pointer stays null.
+Buffers upload(MyGPURuntime& rt, const std::vector<Float3>& world, const BufferPlan& plan)
 {
     Buffers b;
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    b.frame_bytes = static_cast<size_t>(target.width) * target.height * PIXEL_BYTES;
+    const size_t world_bytes =
+        static_cast<size_t>(plan.world_vertices) * WORLD_VERTEX_BYTES;
+    b.frame_bytes = static_cast<size_t>(plan.width) * plan.height * PIXEL_BYTES;
 
     b.world = rt.myrt_malloc(world_bytes);
-    b.screen = rt.myrt_malloc(world.size() * SCREEN_VERTEX_BYTES);
-    b.frame = rt.myrt_malloc(b.frame_bytes);
+    if (plan.screen_vertices > 0) {
+        b.screen = rt.myrt_malloc(static_cast<size_t>(plan.screen_vertices) *
+                                  SCREEN_VERTEX_BYTES);
+    }
+    if (b.frame_bytes > 0) {
+        b.frame = rt.myrt_malloc(b.frame_bytes);
+    }
 
     std::vector<float> flat;
     flat.reserve(world.size() * WORLD_VERTEX_FLOATS);
@@ -46,6 +53,18 @@ Buffers upload(MyGPURuntime& rt, const std::vector<Float3>& world,
     return b;
 }
 
+// A plan for the routes that project first: one screen vertex per world vertex,
+// and a framebuffer the size of the target.
+BufferPlan raster_plan(size_t vertices, const DrawTarget& target)
+{
+    BufferPlan plan;
+    plan.world_vertices = static_cast<uint32_t>(vertices);
+    plan.screen_vertices = static_cast<uint32_t>(vertices);
+    plan.width = target.width;
+    plan.height = target.height;
+    return plan;
+}
+
 // The same, for an indexed mesh.
 //
 // The vertex half delegates, and handing over mesh.vertices rather than
@@ -54,7 +73,9 @@ Buffers upload(MyGPURuntime& rt, const std::vector<Float3>& world,
 // list needed thirty-six.
 Buffers upload(MyGPURuntime& rt, const Mesh& mesh, const DrawTarget& target)
 {
-    Buffers b = upload(rt, mesh.vertices, target);
+    BufferPlan plan = raster_plan(mesh.vertex_count(), target);
+    plan.indices = static_cast<uint32_t>(mesh.indices.size());
+    Buffers b = upload(rt, mesh.vertices, plan);
 
     // Indices reach the device as floats: the ISA has no integer registers, and
     // the kernel multiplies an index by a vertex stride to get an address, so
@@ -231,10 +252,30 @@ TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const Mesh& mesh,
 
 }  // namespace
 
+size_t BufferPlan::device_bytes() const
+{
+    return static_cast<size_t>(world_vertices) * WORLD_VERTEX_BYTES +
+           static_cast<size_t>(screen_vertices) * SCREEN_VERTEX_BYTES +
+           static_cast<size_t>(indices) * sizeof(float) +
+           static_cast<size_t>(width) * height * PIXEL_BYTES;
+}
+
+size_t BufferPlan::binned_bytes(uint32_t width, uint32_t height, uint32_t triangles)
+{
+    const size_t tiles = static_cast<size_t>((width + TILE_WIDTH - 1) / TILE_WIDTH) *
+                         ((height + TILE_HEIGHT - 1) / TILE_HEIGHT);
+
+    // A triangle is copied into every tile its bounding box reaches, so the
+    // bound is one entry per tile per triangle — plus two floats a tile saying
+    // where its run starts and how long it is.
+    return tiles * triangles * TILE_TRIANGLE_FLOATS * sizeof(float) +
+           tiles * 2 * sizeof(float);
+}
+
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world,
                               const DrawTarget& target)
 {
-    const Buffers b = upload(rt, world, target);
+    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
 
     RasterStageArgs args;
@@ -251,7 +292,7 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& world,
                                const DrawTarget& target)
 {
-    const Buffers b = upload(rt, world, target);
+    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
     run_tiled_raster_stage(rt, bin_and_upload(rt, world, target, b));
     return download(rt, b);
@@ -260,7 +301,7 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& worl
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& world,
                                 const DrawTarget& target)
 {
-    const Buffers b = upload(rt, world, target);
+    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
     run_shared_raster_stage(rt, bin_and_upload(rt, world, target, b));
     return download(rt, b);
@@ -269,10 +310,13 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& wor
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& world,
                                   const DrawTarget& target, const Shading& shading)
 {
-    // upload allocates a screen buffer this route never touches. Left as it is
-    // rather than split: the counters ignore allocation, and one upload path is
-    // one fewer place for the two renderers to receive different vertices.
-    const Buffers b = upload(rt, world, target);
+    // screen_vertices stays zero: there is no vertex stage here, so nothing
+    // ever projects and no buffer holds the result.
+    BufferPlan plan;
+    plan.world_vertices = static_cast<uint32_t>(world.size());
+    plan.width = target.width;
+    plan.height = target.height;
+    const Buffers b = upload(rt, world, plan);
 
     RaytraceStageArgs args;
     args.basis = ray_basis(target.camera, target.aspect());
@@ -353,4 +397,32 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
     // linear walk of every triangle. Indexing a brute-force walk is cost with
     // nothing on the other side of it.
     return draw_raytrace(rt, mesh.flattened(), target, shading);
+}
+
+SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
+                                 const DrawTarget& target)
+{
+    // No width or height in the plan, so no framebuffer: this runs pass 1 and
+    // never writes a pixel. Saying so is the point of BufferPlan — this path
+    // used to reach for a raster upload and reserve three megabytes of frame at
+    // 512, which the runtime it had been given could not hold.
+    BufferPlan plan;
+    plan.world_vertices = static_cast<uint32_t>(vertices.size());
+    plan.screen_vertices = plan.world_vertices;
+
+    // Its own runtime, so the reading is a total rather than a difference, and
+    // run_pass_one's sync is what leaves the counters holding this pass alone.
+    MyGPURuntime rt(plan.device_bytes() + (1u << 16));
+    const Buffers b = upload(rt, vertices, plan);
+
+    VertexStageArgs args;
+    args.view_projection = target.camera.view_projection(target.aspect());
+    args.world_offset = rt.myrt_device_offset(b.world);
+    args.screen_offset = rt.myrt_device_offset(b.screen);
+    args.vertex_count = plan.world_vertices;
+    args.width = target.width;
+    args.height = target.height;
+    run_vertex_stage(rt, args);
+
+    return rt.stats();
 }
