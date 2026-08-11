@@ -46,10 +46,14 @@ Float4x4 default_vp()
 }
 
 // Uploads world vertices, runs pass 1, reads the screen vertices back.
+// external lets a caller read the counters. run_stage does not sync, so what
+// the runtime holds afterwards is pass 1 alone — which is the only way to see
+// it, draw_* clearing the counters between its passes on purpose.
 std::vector<Float3> run_stage(const std::vector<Float3>& world, uint32_t thread_count,
-                              float sentinel = -1.0f)
+                              float sentinel = -1.0f, MyGPURuntime* external = nullptr)
 {
-    MyGPURuntime rt(1u << 20);
+    MyGPURuntime local(1u << 20);
+    MyGPURuntime& rt = (external != nullptr) ? *external : local;
 
     const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
     const size_t screen_bytes = thread_count * SCREEN_VERTEX_BYTES;
@@ -1252,9 +1256,42 @@ TEST(Pipeline, MeshDrawsAsTheVertexListItExpandsTo)
         EXPECT_FLOAT_EQ(indexed[i].z, flat[i].z) << "pixel " << i << " b";
     }
 
-    // And it is the same work, pass 1 still running a thread per flattened
-    // vertex. [9b] is what changes this number.
-    EXPECT_EQ(indexed_rt.stats().weighted_lane_ops, flat_rt.stats().weighted_lane_ops);
+    // Greater, not smaller, and that is the trade rather than a regression.
+    // These runtimes hold pass 2 alone — the draw clears the counters between
+    // its passes — and pass 2 is where indexing costs: fifteen loads a triangle
+    // against twelve, the index having to arrive before the vertex it names.
+    //
+    // What it buys sits in pass 1, which IndexingTransformsEachVertexOnce
+    // measures. The tiled and shared routes take that saving with none of this
+    // cost, bin_triangles handing the kernel de-indexed triangles either way.
+    EXPECT_GT(indexed_rt.stats().weighted_lane_ops, flat_rt.stats().weighted_lane_ops);
+}
+
+TEST(Pipeline, IndexingTransformsEachVertexOnce)
+{
+    // What indexing is for, and the one figure the draw routes hide: pass 1
+    // runs a thread per vertex, so a cube's eight corners are eight transforms
+    // where the flattened list spends thirty-six.
+    const Mesh cube = cube_mesh();
+    const std::vector<Float3> flat = cube.flattened();
+    ASSERT_EQ(cube.vertex_count(), 8u);
+    ASSERT_EQ(flat.size(), 36u);
+
+    MyGPURuntime indexed_rt(1u << 20);
+    run_stage(cube.vertices, cube.vertex_count(), -1.0f, &indexed_rt);
+
+    MyGPURuntime flat_rt(1u << 20);
+    run_stage(flat, static_cast<uint32_t>(flat.size()), -1.0f, &flat_rt);
+
+    const uint64_t indexed = indexed_rt.stats().weighted_lane_ops;
+    const uint64_t flattened = flat_rt.stats().weighted_lane_ops;
+
+    EXPECT_LT(indexed, flattened);
+
+    // Under a third, not merely less. Eight vertices against thirty-six is a
+    // ratio of 0.22, and a bare EXPECT_LT would still pass on a saving too
+    // small to have been worth building a second kernel for.
+    EXPECT_LT(indexed * 3, flattened);
 }
 
 TEST(Pipeline, EveryRouteDrawsTheSameCube)
