@@ -212,3 +212,36 @@ TEST(Mesh, TriangleSetSurvivesTheAssetRoundTrip)
     EXPECT_EQ(sorted_triangles(load_obj(ASSETS + "/cube.obj")),
               sorted_triangles(cube_mesh()));
 }
+
+TEST(Mesh, EveryCommittedAssetLoads)
+{
+    // The benchmarks name these by path, so a malformed one surfaces as a
+    // benchmark that will not start rather than as a failing test. They are
+    // chosen to spread vertices per triangle, which is how much of a mesh is
+    // shared and so how much indexing has to save.
+    struct Expected {
+        const char* file;
+        uint32_t vertices;
+        uint32_t triangles;
+        bool closed;
+    };
+    const Expected assets[] = {
+        {"tetrahedron.obj", 4, 4, true},
+        {"cube.obj", 8, 12, true},
+        {"grid.obj", 81, 128, false},  // flat, so no outside to face
+        {"sphere.obj", 182, 360, true},
+    };
+
+    for (const Expected& want : assets) {
+        const Mesh mesh = load_obj(ASSETS + "/" + want.file);
+        EXPECT_EQ(mesh.vertex_count(), want.vertices) << want.file;
+        EXPECT_EQ(mesh.triangle_count(), want.triangles) << want.file;
+        if (want.closed) {
+            EXPECT_TRUE(faces_outward(mesh)) << want.file;
+        }
+
+        // Under one vertex per triangle, or nothing is being shared and the
+        // mesh has no more to say than a list of loose triangles.
+        EXPECT_LE(mesh.vertex_count(), mesh.triangle_count()) << want.file;
+    }
+}
