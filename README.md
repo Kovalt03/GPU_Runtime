@@ -132,7 +132,7 @@ opcodes are added.
 | 9 | Host geometry | `include/math3d.hpp` · `src/math3d.cpp` | ✅ |
 | 10 | Rasteriser | `pipeline/vertex.*` · `pipeline/raster.*` | ✅ |
 | 11 | Tile binning + shared memory | `pipeline/raster_tiled.*` · `BARRIER` | ✅ |
-| 12 | Ray tracer over the same scene | `pipeline/raytrace.*` | 🔲 |
+| 12 | Ray tracer over the same scene | `pipeline/raytrace.*` | ✅ |
 
 ---
 
@@ -169,9 +169,12 @@ leaving the stale binaries in place.
 sips -s format png output/result.ppm --out result.png   # macOS
 convert output/result.ppm result.png                    # ImageMagick
 
-# Divergence benchmark
+# Benchmarks
 ./build/benchmarks/divergence_bench
 ./build/benchmarks/divergence_bench --csv   # output/divergence.csv
+
+# Four routes to one frame — walk, tiled, shared memory, ray tracer
+./build/benchmarks/render_bench             # output/render_bench.{md,csv}
 ```
 
 ### Formatting
@@ -198,10 +201,10 @@ on their own line, `int* ptr`.
 | Warp divergence rate (ray kernel, 256x256) | 2.6% |
 | Warp divergence rate (64x64) | 10.1% |
 | Issue overhead once a warp splits | 1.80x |
-| Rasteriser, tile binning | **-84%** issued work |
-| Rasteriser, staged through shared memory | **-95%** against the naive walk |
+| Rasteriser, tile binning | **-85%** issued work |
+| Rasteriser, staged through shared memory | **-96%** against the naive walk |
 | Opcodes | 25 |
-| Tests | 191 |
+| Tests | 200 |
 
 ### What divergence costs
 
@@ -237,27 +240,37 @@ Möller-Trumbore against edge functions — and their PPMs are byte-identical.
 That is the check neither can make alone: each kernel is tested against a host
 reference written from the same conventions, so a sign wrong in both would pass.
 
+`raster_triangle` draws the frame twice, once per route, and writes the file
+from the tiled one — so the PPM that matches the ray tracer is the optimised
+path's output rather than something claimed to match it. It prints what binning
+removed on the way: 32.6% for one triangle, 71.7% for sixteen.
+
 The rasteriser was then made faster twice, measured in issued work rather than
 wall clock so the figures reproduce. Sixteen small triangles over a 64x32 frame:
 
 | | weighted lane ops | against the previous | against the walk |
 |---|---:|---:|---:|
-| every pixel walks every triangle | 31,701,456 | — | — |
-| triangles binned into 32x8 tiles | 4,979,152 | -84.3% | -84.3% |
-| each tile staged in shared memory | 1,646,944 | -66.9% | **-94.8%** |
+| every pixel walks every triangle | 41,534,048 | — | — |
+| triangles binned into 32x8 tiles | 6,210,144 | -85.0% | -85.0% |
+| each tile staged in shared memory | 1,752,864 | -71.8% | **-95.8%** |
 
 The two changes remove different waste, which shows on a scene built to defeat
-the first: when every triangle covers every tile, **binning loses 1.4%** having
-nothing to drop, while staging still wins 84% — 256 threads were issuing the
-same nine global loads either way.
+the first: when every triangle covers every tile, **binning loses 1.0%** having
+nothing to drop, while staging still wins 85.7% — 256 threads were issuing the
+same twelve global loads either way.
 
 Staging needed `BARRIER`, the project's `__syncthreads()`. The fill and the
 barrier sit outside the kernel's bounds check, because a thread whose pixel is
 off screen still has to arrive; reaching a barrier under divergence is refused
 rather than left to hang.
 
-`benchmarks/RESULTS.md` carries the full tables, the method, and a prediction
-about divergence that the measurements contradicted.
+Every figure above comes out of `./build/benchmarks/render_bench`, which
+defines its scenes in code and drives the same `draw_walk` / `draw_tiled` /
+`draw_shared` / `draw_raytrace` the tests call. Both renderers take their
+camera from one `DrawTarget`, so a comparison between them cannot be of two
+different views. `benchmarks/RESULTS.md` carries the full tables,
+the method, and a prediction about divergence that the measurements
+contradicted.
 
 ---
 
@@ -287,7 +300,8 @@ gpu-runtime-sim/
 │       ├── vertex.hpp
 │       ├── raster.hpp
 │       ├── raster_tiled.hpp
-│       └── raytrace.hpp
+│       ├── raytrace.hpp
+│       └── draw.hpp          # draw_walk / draw_tiled / draw_shared / draw_raytrace
 ├── src/
 │   ├── isa.cpp
 │   ├── memory.cpp
@@ -298,6 +312,7 @@ gpu-runtime-sim/
 │   ├── math3d.cpp
 │   └── pipeline/
 │       ├── raster_emit.hpp   # private: the emitters the raster kernels share
+│       ├── draw.cpp          # the four routes end to end, shared with the tests
 │       ├── vertex.cpp
 │       ├── raster.cpp
 │       ├── raster_tiled.cpp
@@ -321,7 +336,8 @@ gpu-runtime-sim/
 ├── benchmarks/
 │   ├── CMakeLists.txt
 │   ├── RESULTS.md
-│   └── divergence_bench.cpp
+│   ├── divergence_bench.cpp
+│   └── render_bench.cpp     # generates the measurement tables in RESULTS.md
 └── output/
     └── .gitkeep
 ```

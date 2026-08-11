@@ -1,8 +1,23 @@
 # Measurements
 
 A running record, so that each change can be stated as a number rather than as
-an intention. Every figure here comes from the counters below, at the revision
-named in its own section.
+an intention. Every figure here comes from the counters below.
+
+**Reproducing these.** Every table below comes from a program, not from a
+session:
+
+```
+cmake --build build -j8
+./build/benchmarks/render_bench     # stdout, plus output/render_bench.{md,csv}
+```
+
+The scenes are code in `benchmarks/render_bench.cpp`, and the four routes it
+measures are the same `draw_walk` / `draw_tiled` / `draw_shared` /
+`draw_raytrace` the tests call.
+That is the fix for how these figures went stale once already: they had been
+taken from scenes built by hand and never committed, so when 1/w joined the
+screen vertex — moving a binned triangle from nine floats to twelve — nothing
+could be re-run to catch it.
 
 ## What is measured, and what is not
 
@@ -73,13 +88,13 @@ Triangles sorted into 32x8 screen tiles on the host, one ThreadBlock per tile,
 each pixel walking only its own tile's list. 64x32, pass 2 only, against the
 naive walk on the same scene.
 
-| Scene | Triangles | Worst tile | walk | tiled | Change |
-|---|---:|---:|---:|---:|---:|
-| small, spread over the frame | 4 | 1 | 8,427,632 | 2,064,496 | **-75.5%** |
-| small, spread over the frame | 16 | 2 | 31,701,456 | 4,979,152 | **-84.3%** |
-| small, spread over the frame | 64 | 16 | 124,796,616 | 24,374,984 | **-80.5%** |
-| medium, stacked at the centre | 16 | 16 | 31,701,064 | 16,610,376 | -47.6% |
-| full-frame, stacked | 16 | 16 | 31,709,184 | 32,139,264 | **+1.4%** |
+| Scene | Triangles | walk | tiled | Change |
+|---|---:|---:|---:|---:|
+| small, spread over the frame | 4 | 10,885,760 | 2,372,224 | **-78.2%** |
+| small, spread over the frame | 16 | 41,534,048 | 6,210,144 | **-85.0%** |
+| small, spread over the frame | 64 | 164,126,592 | 31,756,160 | **-80.7%** |
+| medium, stacked at the centre | 16 | 41,532,192 | 21,526,304 | **-48.2%** |
+| full-frame, stacked | 16 | 41,550,336 | 41,980,416 | **+1.0%** |
 
 The saving is in the tiles a triangle never reaches. Sixteen small triangles
 leave two per tile instead of sixteen, and most tiles hold none at all — those
@@ -103,8 +118,8 @@ splits a warp.
 
 | Scene | Cost | divergence, walk | divergence, tiled |
 |---|---:|---:|---:|
-| 16 small, spread | -84.3% | 0.4% | 2.1% |
-| 64 small, spread | -80.5% | 0.3% | 1.7% |
+| 16 small, spread | -85.0% | 1.3% | 7.4% |
+| 64 small, spread | -80.7% | 1.4% | 6.5% |
 
 Five times the divergence rate for a sixth of the work. Anyone tuning on
 `divergence_rate` alone would read this change as a regression.
@@ -115,22 +130,22 @@ Five times the divergence rate for a sixth of the work. Anyone tuning on
 
 Each block loads its tile's triangles into shared memory once, then meets at a
 barrier before any pixel reads them back. A shared load costs 8 against a
-global load's 100, and every pixel of a block was making the same nine.
+global load's 100, and every pixel of a block was making the same twelve.
 
 | Scene | Triangles | walk | tiled | shared | vs tiled | vs walk |
 |---|---:|---:|---:|---:|---:|---:|
-| small, spread | 4 | 8,427,632 | 2,064,496 | 1,263,700 | -38.8% | -85.0% |
-| small, spread | 16 | 31,701,456 | 4,979,152 | 1,646,944 | -66.9% | **-94.8%** |
-| small, spread | 64 | 124,796,616 | 24,374,984 | 4,166,696 | -82.9% | **-96.7%** |
-| medium, stacked | 16 | 31,701,064 | 16,610,376 | 3,152,520 | -81.0% | -90.1% |
-| full-frame, stacked | 16 | 31,709,184 | 32,139,264 | 5,180,544 | -83.9% | -83.7% |
+| small, spread | 4 | 10,885,760 | 2,372,224 | 1,290,160 | -45.6% | -88.1% |
+| small, spread | 16 | 41,534,048 | 6,210,144 | 1,752,864 | -71.8% | **-95.8%** |
+| small, spread | 64 | 164,126,592 | 31,756,160 | 4,797,440 | -84.9% | **-97.1%** |
+| medium, stacked | 16 | 41,532,192 | 21,526,304 | 3,568,160 | -83.4% | -91.4% |
+| full-frame, stacked | 16 | 41,550,336 | 41,980,416 | 6,021,120 | -85.7% | -85.5% |
 
 ### The two changes attack different waste
 
-The last row is the one worth reading twice. Binning *lost* 1.4% there, having
-nothing to remove: every triangle covers every tile. Staging wins 83.9% on the
+The last row is the one worth reading twice. Binning *lost* 1.0% there, having
+nothing to remove: every triangle covers every tile. Staging wins 85.7% on the
 same scene, because it never depended on binning — the waste it removes is 256
-threads issuing the same nine loads, which happens whether or not the list is
+threads issuing the same twelve loads, which happens whether or not the list is
 short.
 
 Tiling removes triangles a pixel need not see. Staging removes re-reads of the
@@ -159,6 +174,55 @@ every mask exactly as it was.
 So the earlier readings were right about their own cause and wrong as a rule.
 Removing uniform work raises the rate; making uniform work cheaper does not move
 it. Both are invisible to a metric that counts slots.
+
+---
+
+## Two renderers, one image, different divergence
+
+The comparison the project was built for. Same scene, same launch geometry — a
+warp covering 32 adjacent pixels of one row — and the same frame out. Both
+routes take their camera from one `DrawTarget`, so they cannot have seen it
+from different places.
+
+64x32, one launch each. `raster` is the naive walk, the ray tracer having no
+binning to compare against.
+
+| Scene | Triangles | raster ops | raster divergence | ray ops | ray divergence |
+|---|---:|---:|---:|---:|---:|
+| small, spread over the frame | 4 | 10,885,760 | 1.2% | 8,446,072 | **8.8%** |
+| small, spread over the frame | 16 | 41,534,048 | 1.3% | 31,556,398 | **12.5%** |
+| small, spread over the frame | 64 | 164,126,592 | 1.4% | 124,000,212 | **13.7%** |
+| medium, stacked at the centre | 16 | 41,532,192 | 0.4% | 31,602,380 | **17.6%** |
+| full-frame, stacked | 16 | 41,550,336 | 0.6% | 32,165,408 | **11.5%** |
+
+The ray tracer issues 22-24% *less* work while diverging seven to forty times
+as much. An earlier reading of this table had the two within 3% of each other,
+which was wrong in the direction that mattered: it made the trade look free.
+
+Both figures come from the same cause, which is the paragraph below.
+
+### Why the gap widens as the triangles shrink
+
+The rasteriser branches once per triangle, on coverage. A warp is 32 pixels of
+one row, and for a small triangle almost every warp is *entirely* outside it —
+all 32 lanes compute the same three edge functions, all fail the same test, and
+the warp never splits. The more triangles miss, the more converged it gets,
+which is why 64 small triangles read 0.1%.
+
+The ray tracer leaves for the next triangle from four separate tests. Lanes of
+one warp miss the same triangle *for different reasons at different points* —
+one fails on the determinant, its neighbour survives to fail on u, a third on
+v. A unanimous miss still splits the warp.
+
+So the early exits that make Möller-Trumbore cheap are the same thing that
+makes it diverge — and the 22-24% is what they are worth. The walk computes
+three edge functions and a normalisation for every triangle whatever the
+answer; the ray tracer stops at the first test that fails, which is most of
+them on a scene of small triangles.
+
+Removing the early exits would flatten the rate and issue more work. That trade
+is the shape of the whole problem, and it does not exist for the rasteriser at
+all.
 
 ---
 
