@@ -6,8 +6,8 @@ compile_commands.json
 # clangd index
 .cache/
 
-# Render output — only .gitkeep is tracked
-output/*
-!output/.gitkeep
+# Rendered images and accumulated runs — only .gitkeep is tracked
+benchmarks/result/*
+!benchmarks/result/.gitkeep
 
 .DS_Store

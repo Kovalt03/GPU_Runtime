@@ -5,7 +5,8 @@
 // constant, so the two can be put side by side.
 //
 //   ./build/benchmarks/divergence_bench
-//   ./build/benchmarks/divergence_bench --csv    (writes output/divergence.csv)
+//   ./build/benchmarks/divergence_bench --csv    (writes
+//   benchmarks/result/divergence.csv)
 
 #include <cstdint>
 #include <cstdio>
@@ -164,7 +165,7 @@ int main(int argc, char** argv)
     std::printf("  GIOPS = this simulator on this host (indicative, ratios only)\n");
 
     if (csv) {
-        const std::string path = "output/divergence.csv";
+        const std::string path = "benchmarks/result/divergence.csv";
         write_csv(samples, path);
         std::printf("\n  wrote %s\n", path.c_str());
     }

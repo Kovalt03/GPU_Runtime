@@ -9,6 +9,6 @@ add_executable(raster_triangle raster_triangle.cpp)
 target_link_libraries(raster_triangle PRIVATE gpurt project_warnings)
 
 # Written relative to the working directory, so run it from the project root.
-# The directory is tracked via output/.gitkeep; create it if a fresh clone has
+# The directory is tracked via benchmarks/result/.gitkeep; create it if a fresh clone has
 # not got one yet.
 file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/output)

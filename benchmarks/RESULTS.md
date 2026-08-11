@@ -8,7 +8,7 @@ session:
 
 ```
 cmake --build build -j8
-./build/benchmarks/render_bench     # stdout, plus output/render_bench.{md,csv}
+./build/benchmarks/render_bench     # stdout, plus benchmarks/result/render_bench.{md,csv}
 ```
 
 The scenes are code in `benchmarks/render_bench.cpp`, and the four routes it

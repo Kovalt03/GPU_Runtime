@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <vector>
 
+#include "app_run.hpp"
 #include "pipeline/draw.hpp"
 #include "pipeline/raster_tiled.hpp"  // TILE_WIDTH, the binning geometry
 #include "pipeline/types.hpp"
@@ -53,13 +54,13 @@ std::vector<Float3> scene(uint32_t triangles)
 // Pass 2 only: each draw syncs between its passes, which clears the counters.
 // Pass 1 puts three vertices in a 32-lane warp and reads 45% diverged from the
 // 29 idle ones, which says nothing about the rasteriser.
-void report(const char* label, const SchedulerStats& s)
+void report(const char* label, const SchedulerStats& s, double seconds)
 {
-    std::printf("%-14s %12llu %14llu %14llu %9.1f%%\n", label,
+    std::printf("%-14s %12llu %14llu %14llu %9.1f%% %8.2f\n", label,
                 static_cast<unsigned long long>(s.warp_steps),
                 static_cast<unsigned long long>(s.active_lane_ops),
                 static_cast<unsigned long long>(s.weighted_lane_ops),
-                100.0 * s.divergence_rate());
+                100.0 * s.divergence_rate(), seconds);
 }
 
 Camera scene_camera()
@@ -86,10 +87,10 @@ Camera scene_camera()
 
 int main(int argc, char** argv)
 {
-    const uint32_t width = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 256;
-    const uint32_t height =
-        (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : width;
-    const uint32_t triangles = (argc > 3) ? static_cast<uint32_t>(std::atoi(argv[3])) : 1;
+    const Args args = parse_args(argc, argv);
+    const uint32_t width = args.number(0, 256);
+    const uint32_t height = args.number(1, width);
+    const uint32_t triangles = args.number(2, 1);
 
     const std::vector<Float3> world = scene(triangles);
 
@@ -108,17 +109,21 @@ int main(int argc, char** argv)
 
     std::printf("rasterising %ux%u — %zu pixels, %u triangles\n\n", width, height, pixels,
                 triangles);
-    std::printf("%-14s %12s %14s %14s %10s\n", "", "warp steps", "lane ops", "weighted",
-                "divergence");
+    std::printf("%-14s %12s %14s %14s %10s %8s\n", "", "warp steps", "lane ops",
+                "weighted", "divergence", "seconds");
 
     // A runtime each, so neither reading has to be a difference of two totals.
     MyGPURuntime walk_rt(budget);
+    Stopwatch watch;
     const std::vector<Float3> walk_frame = draw_walk(walk_rt, world, target);
-    report("walk", walk_rt.stats());
+    const double walk_seconds = watch.seconds();
+    report("walk", walk_rt.stats(), walk_seconds);
 
     MyGPURuntime tiled_rt(budget);
+    watch.restart();
     const std::vector<Float3> tiled_frame = draw_tiled(tiled_rt, world, target);
-    report("tiled", tiled_rt.stats());
+    const double tiled_seconds = watch.seconds();
+    report("tiled", tiled_rt.stats(), tiled_seconds);
 
     const double saved =
         100.0 * (1.0 - static_cast<double>(tiled_rt.stats().weighted_lane_ops) /
@@ -147,9 +152,9 @@ int main(int argc, char** argv)
         flat.push_back(p.z);
     }
 
-    const std::string path = "output/raster.ppm";
+    const std::string path = args.images_dir() + "raster.ppm";
     write_ppm(path, flat, width, height);
     std::printf("wrote %s\n", path.c_str());
-    std::printf("compare against output/result.ppm from ray_triangle\n");
+    std::printf("compare against %sresult.ppm from ray_triangle\n", args.out_dir.c_str());
     return (differing == 0) ? 0 : 1;
 }

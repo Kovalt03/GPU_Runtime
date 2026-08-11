@@ -36,6 +36,7 @@ add_library(gpurt STATIC
     src/ir_builder.cpp
     src/math3d.cpp
     src/mesh.cpp
+    src/app_run.cpp
     src/pipeline/vertex.cpp
     src/pipeline/draw.cpp
     src/pipeline/raster.cpp

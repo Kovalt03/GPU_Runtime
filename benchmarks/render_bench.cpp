@@ -8,8 +8,9 @@
 // load count, nothing could be re-run to catch it. The scenes are code here,
 // and the tables printed are meant to be pasted straight into RESULTS.md.
 //
-//   ./build/benchmarks/render_bench                 stdout, plus output/*.md, *.csv
-//   ./build/benchmarks/render_bench --out some/path writes some/path.md and .csv
+//   ./build/benchmarks/render_bench                stdout, plus
+//   benchmarks/result/render_bench.*
+//   ./build/benchmarks/render_bench --out some/dir writes into that directory
 //
 // Every column is a count of what the scheduler issued, so two runs on any
 // machine agree. Nothing here is timed.
@@ -22,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "app_run.hpp"
 #include "math3d.hpp"
 #include "pipeline/draw.hpp"
 #include "runtime.hpp"
@@ -148,12 +150,10 @@ std::string with_commas(uint64_t v)
 
 int main(int argc, char** argv)
 {
-    std::string prefix = "output/render_bench";
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--out" && i + 1 < argc) {
-            prefix = argv[++i];
-        }
-    }
+    // --out names a directory, as it does for every executable here, so one run
+    // can gather its images and numbers in one place.
+    const Args args = parse_args(argc, argv);
+    const std::string prefix = args.out_dir + "render_bench";
 
     const std::vector<std::pair<std::string, std::vector<Float3>>> scenes = {
         {"small, spread over the frame", spread(2)},

@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "app_run.hpp"
 #include "isa.hpp"
 #include "ppm.hpp"
 #include "runtime.hpp"
@@ -257,9 +258,9 @@ Program build_ray_triangle_program(void** args)
 
 int main(int argc, char** argv)
 {
-    const uint32_t width = (argc > 1) ? static_cast<uint32_t>(std::atoi(argv[1])) : 256;
-    const uint32_t height =
-        (argc > 2) ? static_cast<uint32_t>(std::atoi(argv[2])) : width;
+    const Args args = parse_args(argc, argv);
+    const uint32_t width = args.number(0, 256);
+    const uint32_t height = args.number(1, width);
     const size_t pixels = static_cast<size_t>(width) * height;
     const size_t fb_bytes = pixels * 3 * sizeof(float);
 
@@ -277,7 +278,7 @@ int main(int argc, char** argv)
     // keeps the kernel correct if anything is ever allocated ahead of it.
     kargs.framebuffer_offset = 0;
 
-    void* args[] = {&kargs};
+    void* kernel_args[] = {&kargs};
 
     // A 2D launch, so that REG_GLOBAL_ID_X/_Y arrive as pixel coordinates
     // directly. A flat index would have to be split with an integer division
@@ -291,15 +292,17 @@ int main(int argc, char** argv)
 
     std::printf("rendering %ux%u — %zu pixels, %u blocks of %u threads\n", width, height,
                 pixels, grid.volume(), block.volume());
-    rt.myrt_launch(build_ray_triangle_program, grid, block, args);
+    const Stopwatch watch;
+    rt.myrt_launch(build_ray_triangle_program, grid, block, kernel_args);
     rt.myrt_sync();
+    const double seconds = watch.seconds();
 
     std::vector<float> host_fb(pixels * 3, 0.0f);
     rt.myrt_memcpy(host_fb.data(), fb, fb_bytes, Direction::DeviceToHost);
 
-    const std::string path = "output/result.ppm";
+    const std::string path = args.images_dir() + "result.ppm";
     write_ppm(path, host_fb, width, height);
-    std::printf("wrote %s\n", path.c_str());
+    std::printf("wrote %s in %.2fs\n", path.c_str(), seconds);
 
     rt.myrt_free(fb);
     return 0;
