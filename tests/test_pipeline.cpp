@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "math3d.hpp"
+#include "mesh.hpp"
 #include "pipeline/draw.hpp"
 #include "pipeline/raster.hpp"
 #include "pipeline/raster_tiled.hpp"
@@ -1211,4 +1212,79 @@ TEST(Pipeline, BothRenderersAgreeFromAnAngle)
     EXPECT_GT(covered, 0u) << "two blank frames agree perfectly and prove nothing";
     EXPECT_LT(differing, traced.size() / 100)
         << differing << " of " << traced.size() << " pixels disagree";
+}
+
+// ---------------------------------------------------------------------------
+// Meshes
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Far enough back that the whole cube lands on the frame, and turned so that
+// more than one face shows — a straight-on cube would exercise a single quad.
+Camera cube_camera()
+{
+    Camera cam;
+    cam.eye = Float3{1.6f, 1.2f, 2.4f};
+    cam.target = Float3{0.0f, 0.0f, 0.0f};
+    return cam;
+}
+
+}  // namespace
+
+TEST(Pipeline, MeshDrawsAsTheVertexListItExpandsTo)
+{
+    // What the Mesh overloads have to promise: indexing changes how the
+    // geometry is stored, never what is drawn.
+    const Mesh cube = cube_mesh();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime indexed_rt(1u << 24);
+    const std::vector<Float3> indexed = draw_walk(indexed_rt, cube, target);
+
+    MyGPURuntime flat_rt(1u << 24);
+    const std::vector<Float3> flat = draw_walk(flat_rt, cube.flattened(), target);
+
+    ASSERT_EQ(indexed.size(), flat.size());
+    for (size_t i = 0; i < flat.size(); ++i) {
+        EXPECT_FLOAT_EQ(indexed[i].x, flat[i].x) << "pixel " << i << " r";
+        EXPECT_FLOAT_EQ(indexed[i].y, flat[i].y) << "pixel " << i << " g";
+        EXPECT_FLOAT_EQ(indexed[i].z, flat[i].z) << "pixel " << i << " b";
+    }
+
+    // And it is the same work, pass 1 still running a thread per flattened
+    // vertex. [9b] is what changes this number.
+    EXPECT_EQ(indexed_rt.stats().weighted_lane_ops, flat_rt.stats().weighted_lane_ops);
+}
+
+TEST(Pipeline, EveryRouteDrawsTheSameCube)
+{
+    const Mesh cube = cube_mesh();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime walk_rt(1u << 24);
+    const std::vector<Float3> walked = draw_walk(walk_rt, cube, target);
+
+    MyGPURuntime tiled_rt(1u << 24);
+    const std::vector<Float3> tiled = draw_tiled(tiled_rt, cube, target);
+
+    MyGPURuntime shared_rt(1u << 24);
+    const std::vector<Float3> shared = draw_shared(shared_rt, cube, target);
+
+    // A cube seen from an angle has faces at different depths, so this fails if
+    // nearest-wins is wrong in any of the three.
+    ASSERT_EQ(tiled.size(), walked.size());
+    for (size_t i = 0; i < walked.size(); ++i) {
+        ASSERT_NEAR(tiled[i].x, walked[i].x, PIXEL_EPS) << "tiled pixel " << i;
+        ASSERT_NEAR(shared[i].x, walked[i].x, PIXEL_EPS) << "shared pixel " << i;
+        ASSERT_NEAR(tiled[i].y, walked[i].y, PIXEL_EPS) << "tiled pixel " << i;
+        ASSERT_NEAR(shared[i].y, walked[i].y, PIXEL_EPS) << "shared pixel " << i;
+    }
+
+    // Not a blank frame, which every comparison above would also pass.
+    bool lit = false;
+    for (const Float3& p : walked) {
+        lit = lit || p.x > 0.0f || p.y > 0.0f || p.z > 0.0f;
+    }
+    EXPECT_TRUE(lit) << "the cube did not reach the frame";
 }

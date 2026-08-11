@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "math3d.hpp"
+#include "mesh.hpp"
 #include "pipeline/raytrace.hpp"
 #include "pipeline/types.hpp"
 #include "runtime.hpp"
@@ -70,5 +71,22 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& wor
 // Defaults to Barycentric so a frame can be compared against the rasteriser's;
 // Diffuse is the mode the rasteriser cannot follow it into.
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                  const DrawTarget& target,
+                                  const Shading& shading = Shading{});
+
+// The same four, taking a mesh.
+//
+// They flatten on the host and call the overloads above, so an indexed mesh
+// renders identically to the vertex list it expands to — which is what the
+// tests assert. Pass 1 still transforms one thread per flattened vertex; making
+// it transform each unique vertex once is a separate change, with a number
+// attached to it.
+std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
+                              const DrawTarget& target);
+std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
+                               const DrawTarget& target);
+std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
+                                const DrawTarget& target);
+std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
                                   const DrawTarget& target,
                                   const Shading& shading = Shading{});

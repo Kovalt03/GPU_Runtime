@@ -1,0 +1,23 @@
+# A unit cube at the origin, matching cube_mesh() in include/mesh.hpp.
+#
+# The faces are quads on purpose: fanned from their first corner they produce
+# exactly the twelve triangles cube_mesh() lists, so the round trip through
+# load_obj checks fan triangulation and the parser at once.
+#
+# Wound counter-clockwise as seen from outside.
+
+v -0.5 -0.5 -0.5
+v  0.5 -0.5 -0.5
+v  0.5  0.5 -0.5
+v -0.5  0.5 -0.5
+v -0.5 -0.5  0.5
+v  0.5 -0.5  0.5
+v  0.5  0.5  0.5
+v -0.5  0.5  0.5
+
+f 5 6 7 8
+f 2 1 4 3
+f 6 2 3 7
+f 1 5 8 4
+f 4 8 7 3
+f 1 2 6 5

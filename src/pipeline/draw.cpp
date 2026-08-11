@@ -186,3 +186,27 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& w
 
     return download(rt, b);
 }
+
+std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
+                              const DrawTarget& target)
+{
+    return draw_walk(rt, mesh.flattened(), target);
+}
+
+std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
+                               const DrawTarget& target)
+{
+    return draw_tiled(rt, mesh.flattened(), target);
+}
+
+std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
+                                const DrawTarget& target)
+{
+    return draw_shared(rt, mesh.flattened(), target);
+}
+
+std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
+                                  const DrawTarget& target, const Shading& shading)
+{
+    return draw_raytrace(rt, mesh.flattened(), target, shading);
+}

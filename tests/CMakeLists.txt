@@ -23,6 +23,10 @@ function(add_layer_test name)
     add_executable(${name} ${name}.cpp ${ARGN})
     target_link_libraries(${name} PRIVATE gpurt project_warnings GTest::gtest_main)
     # Register each TEST() as its own ctest case, so a failure names the test.
+    # assets/ is found by an absolute path baked in at configure time: ctest
+    # runs the binaries from the build tree, where a relative one would miss.
+    target_compile_definitions(${name} PRIVATE
+        GPURT_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets")
     gtest_discover_tests(${name})
 endfunction()
 
@@ -33,4 +37,5 @@ add_layer_test(test_scheduler)
 add_layer_test(test_runtime)
 add_layer_test(test_ir_builder)
 add_layer_test(test_math3d)
+add_layer_test(test_mesh)
 add_layer_test(test_pipeline reference.cpp)
