@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "math3d.hpp"
+#include "pipeline/draw.hpp"
 #include "pipeline/raster.hpp"
 #include "pipeline/raster_tiled.hpp"
 #include "pipeline/raytrace.hpp"
@@ -103,144 +104,31 @@ std::vector<ScreenTriangle> project_all_triangles(const std::vector<Float3>& wor
     return out;
 }
 
-// Both passes end to end, returning the framebuffer a pixel at a time.
-//
-// Pass 1 is followed by myrt_sync, which clears the statistics: with three
-// vertices in a 32-lane warp its range guard masks 29 of them, and leaving that
-// in would swamp any reading of what pass 2 alone costs. A caller that passes
-// its own runtime therefore sees the raster pass's divergence and nothing else.
+// The three routes, each on its own runtime unless the caller wants to read the
+// counters. The bodies live in pipeline/draw.cpp so that what these tests check
+// and what benchmarks/raster_bench measures cannot come apart.
+
+DrawTarget default_target(uint32_t width = WIDTH, uint32_t height = HEIGHT)
+{
+    return DrawTarget{width, height, default_camera()};
+}
+
 std::vector<Float3> render_triangle(const std::vector<Float3>& world,
                                     MyGPURuntime* external = nullptr)
 {
     MyGPURuntime local(1u << 22);
-    MyGPURuntime& rt = (external != nullptr) ? *external : local;
-
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
-    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
-
-    void* world_dev = rt.myrt_malloc(world_bytes);
-    void* screen_dev = rt.myrt_malloc(screen_bytes);
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-
-    std::vector<float> flat;
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
-
-    VertexStageArgs vertex_args;
-    vertex_args.view_projection = default_vp();
-    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
-    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
-    vertex_args.width = WIDTH;
-    vertex_args.height = HEIGHT;
-    run_vertex_stage(rt, vertex_args);
-    rt.myrt_sync();
-
-    RasterStageArgs raster_args;
-    raster_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    raster_args.width = WIDTH;
-    raster_args.height = HEIGHT;
-    raster_args.triangle_count = static_cast<uint32_t>(world.size() / 3);
-    run_raster_stage(rt, raster_args);
-
-    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
-
-    std::vector<Float3> frame;
-    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
-        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
-    }
-    return frame;
+    return draw_walk((external != nullptr) ? *external : local, world, default_target());
 }
 
-// The tiled route to the same frame: bin on the host, then one block per tile.
-// Pass 1 is followed by myrt_sync for the same reason as above, so a caller's
-// runtime sees only what the raster pass cost.
 std::vector<Float3> render_triangle_tiled(const std::vector<Float3>& world,
                                           MyGPURuntime* external = nullptr)
 {
     MyGPURuntime local(1u << 24);
-    MyGPURuntime& rt = (external != nullptr) ? *external : local;
-
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
-    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
-
-    void* world_dev = rt.myrt_malloc(world_bytes);
-    void* screen_dev = rt.myrt_malloc(screen_bytes);
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-
-    std::vector<float> flat;
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
-
-    VertexStageArgs vertex_args;
-    vertex_args.view_projection = default_vp();
-    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
-    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
-    vertex_args.width = WIDTH;
-    vertex_args.height = HEIGHT;
-    run_vertex_stage(rt, vertex_args);
-    rt.myrt_sync();
-
-    // Binning reads the projected vertices, so it happens after pass 1 — on the
-    // host, which means reading them back first. Real hardware bins in a
-    // geometry stage without the round trip.
-    std::vector<float> screen(world.size() * SCREEN_VERTEX_FLOATS, 0.0f);
-    rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
-
-    std::vector<ScreenTriangle> triangles;
-    for (size_t i = 0; i + TILE_TRIANGLE_FLOATS <= screen.size();
-         i += TILE_TRIANGLE_FLOATS) {
-        triangles.push_back(
-            ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
-                           Float3{screen[i + 4], screen[i + 5], screen[i + 6]},
-                           Float3{screen[i + 8], screen[i + 9], screen[i + 10]},
-                           screen[i + 3], screen[i + 7], screen[i + 11]});
-    }
-
-    const TileBinning binning = bin_triangles(triangles, WIDTH, HEIGHT);
-
-    void* verts_dev = rt.myrt_malloc(binning.vertices.size() * sizeof(float));
-    void* table_dev = rt.myrt_malloc(binning.table.size() * sizeof(float));
-    rt.myrt_memcpy(verts_dev, binning.vertices.data(),
-                   binning.vertices.size() * sizeof(float), Direction::HostToDevice);
-    rt.myrt_memcpy(table_dev, binning.table.data(), binning.table.size() * sizeof(float),
-                   Direction::HostToDevice);
-
-    TiledRasterStageArgs raster_args;
-    raster_args.tile_vertices_offset = rt.myrt_device_offset(verts_dev);
-    raster_args.tile_table_offset = rt.myrt_device_offset(table_dev);
-    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    raster_args.width = WIDTH;
-    raster_args.height = HEIGHT;
-    raster_args.tiles_x = binning.tiles_x;
-    run_tiled_raster_stage(rt, raster_args);
-
-    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
-
-    std::vector<Float3> frame;
-    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
-        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
-    }
-    return frame;
+    return draw_tiled((external != nullptr) ? *external : local, world, default_target());
 }
 
-// As render_triangle_tiled, but staging each tile through shared memory. The
-// frame size is a parameter because the interesting case for the barrier is a
-// frame that does not divide evenly into tiles: the edge blocks then hold
+// The frame size is a parameter because the interesting case for the barrier is
+// a frame that does not divide evenly into tiles: the edge blocks then hold
 // threads whose pixel is off screen, and those threads still have to reach it.
 std::vector<Float3> render_triangle_shared(const std::vector<Float3>& world,
                                            uint32_t width = WIDTH,
@@ -248,86 +136,8 @@ std::vector<Float3> render_triangle_shared(const std::vector<Float3>& world,
                                            MyGPURuntime* external = nullptr)
 {
     MyGPURuntime local(1u << 24);
-    MyGPURuntime& rt = (external != nullptr) ? *external : local;
-
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
-    const size_t frame_bytes = static_cast<size_t>(width) * height * PIXEL_BYTES;
-
-    void* world_dev = rt.myrt_malloc(world_bytes);
-    void* screen_dev = rt.myrt_malloc(screen_bytes);
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-
-    std::vector<float> flat;
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
-
-    VertexStageArgs vertex_args;
-    vertex_args.view_projection = default_camera().view_projection(
-        static_cast<float>(width) / static_cast<float>(height));
-    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
-    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
-    vertex_args.width = width;
-    vertex_args.height = height;
-    run_vertex_stage(rt, vertex_args);
-    rt.myrt_sync();
-
-    std::vector<float> screen(world.size() * SCREEN_VERTEX_FLOATS, 0.0f);
-    rt.myrt_memcpy(screen.data(), screen_dev, screen_bytes, Direction::DeviceToHost);
-
-    std::vector<ScreenTriangle> triangles;
-    for (size_t i = 0; i + TILE_TRIANGLE_FLOATS <= screen.size();
-         i += TILE_TRIANGLE_FLOATS) {
-        triangles.push_back(
-            ScreenTriangle{Float3{screen[i + 0], screen[i + 1], screen[i + 2]},
-                           Float3{screen[i + 4], screen[i + 5], screen[i + 6]},
-                           Float3{screen[i + 8], screen[i + 9], screen[i + 10]},
-                           screen[i + 3], screen[i + 7], screen[i + 11]});
-    }
-
-    const TileBinning binning = bin_triangles(triangles, width, height);
-
-    uint32_t fullest = 0;
-    for (uint32_t t = 0; t < binning.tile_count(); ++t) {
-        const uint32_t c = static_cast<uint32_t>(binning.table[t * 2 + 1]);
-        if (c > fullest) {
-            fullest = c;
-        }
-    }
-
-    // A tile with nothing in it still needs somewhere to point.
-    void* verts_dev = rt.myrt_malloc(binning.vertices.size() * sizeof(float) + 16);
-    void* table_dev = rt.myrt_malloc(binning.table.size() * sizeof(float));
-    if (!binning.vertices.empty()) {
-        rt.myrt_memcpy(verts_dev, binning.vertices.data(),
-                       binning.vertices.size() * sizeof(float), Direction::HostToDevice);
-    }
-    rt.myrt_memcpy(table_dev, binning.table.data(), binning.table.size() * sizeof(float),
-                   Direction::HostToDevice);
-
-    TiledRasterStageArgs raster_args;
-    raster_args.tile_vertices_offset = rt.myrt_device_offset(verts_dev);
-    raster_args.tile_table_offset = rt.myrt_device_offset(table_dev);
-    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    raster_args.width = width;
-    raster_args.height = height;
-    raster_args.tiles_x = binning.tiles_x;
-    raster_args.max_tile_triangles = fullest;
-    run_shared_raster_stage(rt, raster_args);
-
-    std::vector<float> out(static_cast<size_t>(width) * height * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
-
-    std::vector<Float3> frame;
-    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
-        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
-    }
-    return frame;
+    return draw_shared((external != nullptr) ? *external : local, world,
+                       default_target(width, height));
 }
 
 }  // namespace
@@ -1081,45 +891,18 @@ std::vector<Float3> as_vertex_list(const std::vector<WorldTriangle>& triangles)
     return out;
 }
 
+// Through draw_raytrace, so the kernel these tests check is the one
+// benchmarks/render_bench times. It allocates a screen buffer this route never
+// reads — the price of one upload path for both renderers, and invisible to
+// counters that ignore allocation.
 std::vector<Float3> render_traced_with(const std::vector<WorldTriangle>& triangles,
                                        const Camera& camera, const Shading& shading,
                                        MyGPURuntime* external)
 {
     MyGPURuntime local(1u << 24);
-    MyGPURuntime& rt = (external != nullptr) ? *external : local;
-
-    std::vector<float> flat;
-    for (const Float3& v : as_vertex_list(triangles)) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
-
-    void* tri_dev = rt.myrt_malloc(flat.size() * sizeof(float));
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-    rt.myrt_memcpy(tri_dev, flat.data(), flat.size() * sizeof(float),
-                   Direction::HostToDevice);
-
-    RaytraceStageArgs args;
-    args.basis =
-        ray_basis(camera, static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
-    args.shading = shading;
-    args.triangles_offset = rt.myrt_device_offset(tri_dev);
-    args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    args.width = WIDTH;
-    args.height = HEIGHT;
-    args.triangle_count = static_cast<uint32_t>(triangles.size());
-    run_raytrace_stage(rt, args);
-
-    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
-
-    std::vector<Float3> frame;
-    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
-        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
-    }
-    return frame;
+    return draw_raytrace((external != nullptr) ? *external : local,
+                         as_vertex_list(triangles), DrawTarget{WIDTH, HEIGHT, camera},
+                         shading);
 }
 
 std::vector<Float3> render_traced(const std::vector<WorldTriangle>& triangles,
@@ -1141,49 +924,7 @@ std::vector<Float3> render_triangle_from(const std::vector<Float3>& world,
                                          const Camera& camera)
 {
     MyGPURuntime rt(1u << 24);
-
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
-    const size_t frame_bytes = static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_BYTES;
-
-    void* world_dev = rt.myrt_malloc(world_bytes);
-    void* screen_dev = rt.myrt_malloc(screen_bytes);
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-
-    std::vector<float> flat;
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(world_dev, flat.data(), world_bytes, Direction::HostToDevice);
-
-    VertexStageArgs vertex_args;
-    vertex_args.view_projection =
-        camera.view_projection(static_cast<float>(WIDTH) / static_cast<float>(HEIGHT));
-    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
-    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
-    vertex_args.width = WIDTH;
-    vertex_args.height = HEIGHT;
-    run_vertex_stage(rt, vertex_args);
-
-    RasterStageArgs raster_args;
-    raster_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    raster_args.width = WIDTH;
-    raster_args.height = HEIGHT;
-    raster_args.triangle_count = static_cast<uint32_t>(world.size() / 3);
-    run_raster_stage(rt, raster_args);
-
-    std::vector<float> out(static_cast<size_t>(WIDTH) * HEIGHT * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(out.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
-
-    std::vector<Float3> frame;
-    for (size_t i = 0; i < out.size(); i += PIXEL_FLOATS) {
-        frame.push_back(Float3{out[i + 0], out[i + 1], out[i + 2]});
-    }
-    return frame;
+    return draw_walk(rt, world, DrawTarget{WIDTH, HEIGHT, camera});
 }
 
 }  // namespace

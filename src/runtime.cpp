@@ -107,12 +107,14 @@ void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** 
     }
 }
 
-void MyGPURuntime::myrt_sync()
+void MyGPURuntime::myrt_sync(bool report)
 {
     // Nothing to wait for: execution is synchronous. Reporting and clearing is
     // what makes this the natural end of a kernel run. Both fields reset
     // together, or the next launch would divide its work by carried-over time.
-    print_stats();
+    if (report) {
+        print_stats();
+    }
     stats_ = SchedulerStats{};
     elapsed_seconds_ = 0.0;
 }

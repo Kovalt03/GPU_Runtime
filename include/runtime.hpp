@@ -80,7 +80,10 @@ public:
     // Nothing to wait for in a synchronous simulator; this reports the
     // statistics gathered since the last call and clears them, which is what
     // makes it the natural place to end a kernel run.
-    void myrt_sync();
+    // report=false still waits and still clears the counters, but prints
+    // nothing. For a sync in the middle of a draw, which ends a pass rather
+    // than a kernel run — and for a benchmark making fifteen of them.
+    void myrt_sync(bool report = true);
 
     // --- statistics ---------------------------------------------------------
     // Accumulated across every launch since construction or the last

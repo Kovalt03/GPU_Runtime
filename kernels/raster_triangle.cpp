@@ -13,9 +13,9 @@
 #include <cstdlib>
 #include <vector>
 
-#include "pipeline/raster.hpp"
+#include "pipeline/draw.hpp"
+#include "pipeline/raster_tiled.hpp"  // TILE_WIDTH, the binning geometry
 #include "pipeline/types.hpp"
-#include "pipeline/vertex.hpp"
 #include "ppm.hpp"
 #include "runtime.hpp"
 #include "scheduler.hpp"
@@ -47,20 +47,19 @@ std::vector<Float3> scene(uint32_t triangles)
     return world;
 }
 
-// Issued work, which is reproducible; the GIOPS figure alongside it is not,
-// depending as it does on how fast the host happens to be.
-void report(const char* label, const SchedulerStats& before, const SchedulerStats& after)
+// Issued work, which is reproducible; the GIOPS figure the runtime prints
+// alongside it is not, depending as it does on how fast the host happens to be.
+//
+// Pass 2 only: each draw syncs between its passes, which clears the counters.
+// Pass 1 puts three vertices in a 32-lane warp and reads 45% diverged from the
+// 29 idle ones, which says nothing about the rasteriser.
+void report(const char* label, const SchedulerStats& s)
 {
-    SchedulerStats d;
-    d.warp_steps = after.warp_steps - before.warp_steps;
-    d.active_lane_ops = after.active_lane_ops - before.active_lane_ops;
-    d.weighted_lane_ops = after.weighted_lane_ops - before.weighted_lane_ops;
-
     std::printf("%-14s %12llu %14llu %14llu %9.1f%%\n", label,
-                static_cast<unsigned long long>(d.warp_steps),
-                static_cast<unsigned long long>(d.active_lane_ops),
-                static_cast<unsigned long long>(d.weighted_lane_ops),
-                100.0 * d.divergence_rate());
+                static_cast<unsigned long long>(s.warp_steps),
+                static_cast<unsigned long long>(s.active_lane_ops),
+                static_cast<unsigned long long>(s.weighted_lane_ops),
+                100.0 * s.divergence_rate());
 }
 
 Camera scene_camera()
@@ -95,69 +94,62 @@ int main(int argc, char** argv)
     const std::vector<Float3> world = scene(triangles);
 
     const size_t pixels = static_cast<size_t>(width) * height;
-    const size_t world_bytes = world.size() * WORLD_VERTEX_BYTES;
-    const size_t screen_bytes = world.size() * SCREEN_VERTEX_BYTES;
-    const size_t frame_bytes = pixels * PIXEL_BYTES;
 
-    MyGPURuntime rt(frame_bytes + screen_bytes + (1u << 20));
+    // Room for both framebuffers, the screen vertices, and the binned runs — a
+    // triangle is copied into every tile it reaches, so the worst case is one
+    // entry per tile per triangle.
+    const size_t tiles = ((width + TILE_WIDTH - 1) / TILE_WIDTH) *
+                         ((height + TILE_HEIGHT - 1) / TILE_HEIGHT);
+    const size_t budget = pixels * PIXEL_BYTES + world.size() * SCREEN_VERTEX_BYTES +
+                          tiles * triangles * TILE_TRIANGLE_FLOATS * sizeof(float) +
+                          (1u << 20);
 
-    // Three separate allocations, which is why the offsets are asked for rather
-    // than assumed: only the first of them sits at zero.
-    void* world_dev = rt.myrt_malloc(world_bytes);
-    void* screen_dev = rt.myrt_malloc(screen_bytes);
-    void* frame_dev = rt.myrt_malloc(frame_bytes);
-
-    std::vector<float> world_flat;
-    for (const Float3& v : world) {
-        world_flat.push_back(v.x);
-        world_flat.push_back(v.y);
-        world_flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(world_dev, world_flat.data(), world_bytes, Direction::HostToDevice);
-
-    const Camera camera = scene_camera();
-    const float aspect = static_cast<float>(width) / static_cast<float>(height);
+    const DrawTarget target{width, height, scene_camera()};
 
     std::printf("rasterising %ux%u — %zu pixels, %u triangles\n\n", width, height, pixels,
                 triangles);
     std::printf("%-14s %12s %14s %14s %10s\n", "", "warp steps", "lane ops", "weighted",
                 "divergence");
 
-    // Pass 1: one thread per vertex.
-    VertexStageArgs vertex_args;
-    vertex_args.view_projection = camera.view_projection(aspect);
-    vertex_args.world_offset = rt.myrt_device_offset(world_dev);
-    vertex_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    vertex_args.vertex_count = static_cast<uint32_t>(world.size());
-    vertex_args.width = width;
-    vertex_args.height = height;
+    // A runtime each, so neither reading has to be a difference of two totals.
+    MyGPURuntime walk_rt(budget);
+    const std::vector<Float3> walk_frame = draw_walk(walk_rt, world, target);
+    report("walk", walk_rt.stats());
 
-    const SchedulerStats at_start = rt.stats();
-    run_vertex_stage(rt, vertex_args);
-    const SchedulerStats after_vertex = rt.stats();
-    report("pass 1 vertex", at_start, after_vertex);
+    MyGPURuntime tiled_rt(budget);
+    const std::vector<Float3> tiled_frame = draw_tiled(tiled_rt, world, target);
+    report("tiled", tiled_rt.stats());
 
-    // Pass 2: one thread per pixel. Reported separately, because pass 1 runs a
-    // single warp with 29 of its lanes idle and would otherwise drown out the
-    // figure worth reading.
-    RasterStageArgs raster_args;
-    raster_args.screen_offset = rt.myrt_device_offset(screen_dev);
-    raster_args.framebuffer_offset = rt.myrt_device_offset(frame_dev);
-    raster_args.width = width;
-    raster_args.height = height;
-    raster_args.triangle_count = triangles;
+    const double saved =
+        100.0 * (1.0 - static_cast<double>(tiled_rt.stats().weighted_lane_ops) /
+                           static_cast<double>(walk_rt.stats().weighted_lane_ops));
+    std::printf("\nbinning removed %.1f%% of the issued work\n", saved);
 
-    run_raster_stage(rt, raster_args);
-    report("pass 2 raster", after_vertex, rt.stats());
-    std::printf("\n");
-    rt.myrt_sync();
+    // The claim the two routes make, checked rather than asserted in prose: the
+    // tile a pixel belongs to changes which triangles it sees, never which
+    // colour it ends up.
+    size_t differing = 0;
+    for (size_t i = 0; i < walk_frame.size(); ++i) {
+        if (walk_frame[i].x != tiled_frame[i].x || walk_frame[i].y != tiled_frame[i].y ||
+            walk_frame[i].z != tiled_frame[i].z) {
+            ++differing;
+        }
+    }
+    std::printf("frames agree: %s\n\n", (differing == 0) ? "yes" : "NO");
 
-    std::vector<float> host_frame(pixels * PIXEL_FLOATS, 0.0f);
-    rt.myrt_memcpy(host_frame.data(), frame_dev, frame_bytes, Direction::DeviceToHost);
+    // Written from the tiled frame, the two being identical — so the file on
+    // disk is the optimised path's output and not merely claimed to match it.
+    std::vector<float> flat;
+    flat.reserve(pixels * PIXEL_FLOATS);
+    for (const Float3& p : tiled_frame) {
+        flat.push_back(p.x);
+        flat.push_back(p.y);
+        flat.push_back(p.z);
+    }
 
     const std::string path = "output/raster.ppm";
-    write_ppm(path, host_frame, width, height);
+    write_ppm(path, flat, width, height);
     std::printf("wrote %s\n", path.c_str());
     std::printf("compare against output/result.ppm from ray_triangle\n");
-    return 0;
+    return (differing == 0) ? 0 : 1;
 }
