@@ -1325,3 +1325,71 @@ TEST(Pipeline, EveryRouteDrawsTheSameCube)
     }
     EXPECT_TRUE(lit) << "the cube did not reach the frame";
 }
+
+TEST(Pipeline, ReorderingForAVertexCacheBuysNothingHere)
+{
+    // Ordering a mesh for a vertex cache is worth a factor of three or four on
+    // fixed-function hardware. Pass 1 here materialises each unique vertex once
+    // whatever order the triangles arrive in, so the issued work barely notices
+    // — and that is what materialising cost a buffer and a pass for.
+    const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
+    const Mesh mixed = shuffled(sphere, 12345);
+    const Mesh fixed = optimised_for_cache(mixed, 32);
+
+    // The counterfactual moves a long way.
+    EXPECT_LT(simulated_cache_misses(fixed, 32) * 3, simulated_cache_misses(mixed, 32));
+
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime mixed_rt(1u << 26);
+    const std::vector<Float3> mixed_frame = draw_tiled(mixed_rt, mixed, target);
+
+    MyGPURuntime fixed_rt(1u << 26);
+    const std::vector<Float3> fixed_frame = draw_tiled(fixed_rt, fixed, target);
+
+    // Within a tenth of a percent, not to the byte. The residue is the next
+    // test: nearest-wins is a data-dependent branch, and which triangle reaches
+    // a pixel first decides how often it fires.
+    const double mixed_ops = static_cast<double>(mixed_rt.stats().weighted_lane_ops);
+    const double fixed_ops = static_cast<double>(fixed_rt.stats().weighted_lane_ops);
+    EXPECT_LT(std::abs(fixed_ops - mixed_ops) / mixed_ops, 0.001);
+
+    // The picture does not move at all: only the order changed.
+    ASSERT_EQ(fixed_frame.size(), mixed_frame.size());
+    for (size_t i = 0; i < mixed_frame.size(); ++i) {
+        EXPECT_FLOAT_EQ(fixed_frame[i].x, mixed_frame[i].x) << "pixel " << i;
+        EXPECT_FLOAT_EQ(fixed_frame[i].y, mixed_frame[i].y) << "pixel " << i;
+        EXPECT_FLOAT_EQ(fixed_frame[i].z, mixed_frame[i].z) << "pixel " << i;
+    }
+}
+
+TEST(Pipeline, TriangleOrderReachesTheCountersOnlyThroughDepth)
+{
+    // Why the tolerance above is not zero, and it is not the vertex cache.
+    //
+    // A flat grid covers each pixel with exactly one triangle, so nearest-wins
+    // succeeds once however the triangles are ordered and every counter comes
+    // out identical. A sphere covers each pixel twice, front and back, and
+    // whether the near one arrives first decides whether the branch fires once
+    // or twice — which lanes of a warp then disagree about.
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    const Mesh grid = load_obj(std::string(GPURT_ASSETS_DIR) + "/grid.obj");
+    MyGPURuntime flat_a(1u << 26);
+    MyGPURuntime flat_b(1u << 26);
+    draw_tiled(flat_a, grid, target);
+    draw_tiled(flat_b, shuffled(grid, 4242), target);
+
+    EXPECT_EQ(flat_a.stats().weighted_lane_ops, flat_b.stats().weighted_lane_ops);
+    EXPECT_EQ(flat_a.stats().warp_steps, flat_b.stats().warp_steps);
+
+    const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
+    MyGPURuntime round_a(1u << 26);
+    MyGPURuntime round_b(1u << 26);
+    draw_tiled(round_a, sphere, target);
+    draw_tiled(round_b, shuffled(sphere, 4242), target);
+
+    // Ordinary work is unchanged; what the shuffle costs is agreement.
+    EXPECT_GT(round_b.stats().warp_steps, round_a.stats().warp_steps);
+    EXPECT_GT(round_b.divergence_rate(), round_a.divergence_rate());
+}

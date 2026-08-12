@@ -245,3 +245,75 @@ TEST(Mesh, EveryCommittedAssetLoads)
         EXPECT_LE(mesh.vertex_count(), mesh.triangle_count()) << want.file;
     }
 }
+
+TEST(Mesh, ACacheLargerThanTheMeshMissesOncePerVertex)
+{
+    // The floor, and what our pipeline achieves unconditionally: materialise
+    // every unique vertex and no order can make you transform one twice.
+    const Mesh cube = cube_mesh();
+    EXPECT_EQ(simulated_cache_misses(cube, 1024), cube.vertex_count());
+    EXPECT_EQ(simulated_cache_misses(shuffled(cube, 7), 1024), cube.vertex_count());
+}
+
+TEST(Mesh, ACacheOfOneMissesAlmostEveryIndex)
+{
+    // The ceiling. One entry only spares an index that repeats immediately, so
+    // this lands just under three per triangle rather than exactly on it.
+    const Mesh sphere = load_obj(ASSETS + "/sphere.obj");
+    const uint32_t misses = simulated_cache_misses(sphere, 1);
+
+    EXPECT_GT(misses, sphere.triangle_count() * 2);
+    EXPECT_LE(misses, sphere.indices.size());
+}
+
+TEST(Mesh, ShufflingKeepsTheTrianglesAndLosesTheOrder)
+{
+    const Mesh sphere = load_obj(ASSETS + "/sphere.obj");
+    const Mesh mixed = shuffled(sphere, 12345);
+
+    // Same geometry: every renderer draws the identical frame.
+    EXPECT_EQ(mixed.vertices.size(), sphere.vertices.size());
+    EXPECT_EQ(sorted_triangles(mixed), sorted_triangles(sphere));
+
+    // And the counterfactual moves, which is the whole point of having it.
+    EXPECT_GT(simulated_cache_misses(mixed, 32), simulated_cache_misses(sphere, 32));
+
+    // Deterministic: a benchmark that shuffled differently per run would
+    // measure the seed rather than the mesh.
+    EXPECT_EQ(shuffled(sphere, 12345).indices, mixed.indices);
+    EXPECT_NE(shuffled(sphere, 999).indices, mixed.indices);
+}
+
+TEST(Mesh, ReorderingRecoversMostOfWhatShufflingCost)
+{
+    const Mesh sphere = load_obj(ASSETS + "/sphere.obj");
+    const Mesh mixed = shuffled(sphere, 12345);
+    const Mesh fixed = optimised_for_cache(mixed, 32);
+
+    EXPECT_EQ(sorted_triangles(fixed), sorted_triangles(mixed));
+    EXPECT_EQ(fixed.vertices.size(), sphere.vertices.size());
+
+    const uint32_t before = simulated_cache_misses(mixed, 32);
+    const uint32_t after = simulated_cache_misses(fixed, 32);
+
+    // Three times better, not merely better: a greedy that only tidied the
+    // edges would still satisfy a bare EXPECT_LT.
+    EXPECT_LT(after * 3, before);
+
+    // And it cannot beat the floor, which is one transform per vertex.
+    EXPECT_GE(after, sphere.vertex_count());
+}
+
+TEST(Mesh, ACMRStaysWithinItsBounds)
+{
+    // Between one per vertex and three per triangle, for every asset and every
+    // ordering. Outside that range the counter is wrong rather than the mesh.
+    for (const char* file : {"tetrahedron.obj", "cube.obj", "grid.obj", "sphere.obj"}) {
+        const Mesh mesh = load_obj(ASSETS + "/" + file);
+        for (const Mesh& variant : {mesh, shuffled(mesh, 3), optimised_for_cache(mesh)}) {
+            const uint32_t misses = simulated_cache_misses(variant, 32);
+            EXPECT_GE(misses, mesh.vertex_count()) << file;
+            EXPECT_LE(misses, mesh.triangle_count() * 3) << file;
+        }
+    }
+}
