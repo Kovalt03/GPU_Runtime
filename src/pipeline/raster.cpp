@@ -291,6 +291,138 @@ void run_indexed_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
     rt.myrt_launch(build_indexed_raster_program, grid, block, raw);
 }
 
+Program build_predicated_raster_program(void** args)
+{
+    const RasterStageArgs& a = *static_cast<const RasterStageArgs*>(args[0]);
+    IRBuilder k;
+
+    // The bounds check stays a branch. Predicating it would leave every lane
+    // computing a pixel it must not write, and the store at the end has no flag
+    // to suppress — this ISA has no predicated store.
+    const Reg<Scalar> px = k.thread_x();
+    const Reg<Scalar> py = k.thread_y();
+    const Reg<Scalar> in_image =
+        k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+              k.lt(py, k.constant(static_cast<float>(a.height))));
+
+    k.if_(in_image, [&] {
+        const Reg<Scalar> zero = k.constant(0.0f);
+        const Reg<Scalar> one = k.constant(1.0f);
+        const Reg<Scalar> half = k.constant(0.5f);
+
+        const Reg<Scalar> cx = k.add(px, half);
+        const Reg<Scalar> cy = k.add(py, half);
+
+        const Reg<Scalar> best_z = k.constant(2.0f);
+        const Reg<Vec3> best = k.vec3();
+        k.set(best.component(0), 0.0f);
+        k.set(best.component(1), 0.0f);
+        k.set(best.component(2), 0.0f);
+
+        const Reg<Scalar> tri_addr = k.constant(static_cast<float>(a.screen_offset));
+        const Reg<Scalar> stride =
+            k.constant(static_cast<float>(3 * SCREEN_VERTEX_BYTES));
+        const Reg<Scalar> i = k.constant(0.0f);
+        const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
+
+        const Label top = k.label();
+        k.place(top);
+
+        // Everything down to `take` is build_raster_program line for line, and
+        // its comments are not repeated here. The two kernels decide coverage
+        // identically and differ only in what they do with the answer.
+        const Reg<Scalar> x0 = k.load(tri_addr, 0.0f);
+        const Reg<Scalar> y0 = k.load(tri_addr, 4.0f);
+        const Reg<Scalar> z0 = k.load(tri_addr, 8.0f);
+        const Reg<Scalar> iw0 = k.load(tri_addr, 12.0f);
+        const Reg<Scalar> x1 = k.load(tri_addr, 16.0f);
+        const Reg<Scalar> y1 = k.load(tri_addr, 20.0f);
+        const Reg<Scalar> z1 = k.load(tri_addr, 24.0f);
+        const Reg<Scalar> iw1 = k.load(tri_addr, 28.0f);
+        const Reg<Scalar> x2 = k.load(tri_addr, 32.0f);
+        const Reg<Scalar> y2 = k.load(tri_addr, 36.0f);
+        const Reg<Scalar> z2 = k.load(tri_addr, 40.0f);
+        const Reg<Scalar> iw2 = k.load(tri_addr, 44.0f);
+
+        const Reg<Scalar> e0 = emit_edge(k, x1, y1, x2, y2, cx, cy);
+        const Reg<Scalar> e1 = emit_edge(k, x2, y2, x0, y0, cx, cy);
+        const Reg<Scalar> e2 = emit_edge(k, x0, y0, x1, y1, cx, cy);
+
+        const Reg<Scalar> area = k.add(k.add(e0, e1), e2);
+        const Reg<Scalar> inv_area = k.rcp(area);
+        const Reg<Scalar> w0 = k.mul(e0, inv_area);
+        const Reg<Scalar> w1 = k.mul(e1, inv_area);
+        const Reg<Scalar> w2 = k.mul(e2, inv_area);
+
+        const Reg<Scalar> inside =
+            k.min(k.min(k.ge(w0, zero), k.ge(w1, zero)), k.ge(w2, zero));
+
+        const Reg<Scalar> depth = k.mul(w0, z0);
+        k.fma(depth, w1, z1);
+        k.fma(depth, w2, z2);
+
+        const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+
+        // Shaded for every lane, and into a scratch range rather than into
+        // best: emit_shade overwrites what it is handed, and the blend below
+        // still needs the old value.
+        //
+        // This is the cost. A lane the triangle does not cover runs the whole
+        // shade and then multiplies it away.
+        const Reg<Vec3> shaded = k.vec3();
+        emit_shade(k, shaded, w0, w1, w2, iw0, iw1, iw2);
+
+        // old + take * (new - old) is the same select an instruction cheaper,
+        // and is not exact: subtracting old and adding it back rounds, so a
+        // taken blend lands near new rather than on it. Sixty-four triangles of
+        // that drift changed the image.
+        const Reg<Scalar> keep = k.sub(one, take);
+        const auto blend = [&](Reg<Scalar> dst, Reg<Scalar> src) {
+            k.copy_into(dst, k.mul(dst, keep));
+            k.fma(dst, take, src);
+        };
+        blend(best_z, depth);
+        blend(best.component(0), shaded.component(0));
+        blend(best.component(1), shaded.component(1));
+        blend(best.component(2), shaded.component(2));
+
+        k.fma(tri_addr, stride, one);
+        k.fma(i, one, one);
+        k.branch_to(top, k.lt(i, count));
+
+        const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
+        const Reg<Scalar> index = k.add(row, px);
+        const Reg<Scalar> addr =
+            k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
+
+        const float frame_base = static_cast<float>(a.framebuffer_offset);
+        k.store(addr, best.component(0), frame_base + 0.0f);
+        k.store(addr, best.component(1), frame_base + 4.0f);
+        k.store(addr, best.component(2), frame_base + 8.0f);
+    });
+
+    return k.build();
+}
+
+// Same launch geometry as run_raster_stage: 32 lanes on 32 adjacent pixels of
+// one row is what puts a triangle edge inside a warp, and this variant exists
+// to be measured against that.
+void run_predicated_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
+{
+    if (args.width == 0 || args.height == 0) {
+        throw std::runtime_error("run_predicated_raster_stage: an image with no pixels");
+    }
+    if (args.triangle_count == 0) {
+        throw std::runtime_error("run_predicated_raster_stage: nothing to draw");
+    }
+
+    const dim3 block{WARP_SIZE, 1, 1};
+    const dim3 grid{(args.width + WARP_SIZE - 1) / WARP_SIZE, args.height, 1};
+
+    void* raw[] = {const_cast<RasterStageArgs*>(&args)};
+    rt.myrt_launch(build_predicated_raster_program, grid, block, raw);
+}
+
 void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
 {
     if (args.width == 0 || args.height == 0) {

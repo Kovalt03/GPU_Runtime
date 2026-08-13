@@ -65,3 +65,28 @@ void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);
 Program build_indexed_raster_program(void** args);
 
 void run_indexed_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);
+
+// The same pass 2 with no branch in it — the second of the two ways a SIMT
+// machine can handle lanes that disagree.
+//
+// build_raster_program decides coverage and then jumps, so a warp split across
+// a triangle's edge issues both sides and masks half its lanes on each. This
+// kernel shades for every lane and keeps the result arithmetically:
+//
+//   kept = covered * new + (1 - covered) * old
+//
+// covered is 1.0 or 0.0, so one term survives and the other is multiplied away.
+// Every lane runs the same instructions, and divergence measures exactly zero.
+//
+// What that costs is a shade for lanes the triangle never covered. On the
+// scenes in render_bench the branch wins by about 2% throughout, because it
+// skips the shade outright whenever no lane of a warp is covered — which is
+// most warps, for triangles that do not fill the frame.
+//
+// Predication pays where warps straddle edges often, and the route it is
+// attached to straddles them least: the walk runs 1.3% diverged where the tiled
+// route runs 7.4%. Only the flattened walk has a predicated form today, so that
+// comparison is the one available, not the one that settles the question.
+Program build_predicated_raster_program(void** args);
+
+void run_predicated_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);

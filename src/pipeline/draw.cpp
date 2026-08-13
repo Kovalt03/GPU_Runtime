@@ -289,6 +289,26 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world
     return download(rt, b);
 }
 
+std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                    const DrawTarget& target)
+{
+    // draw_walk with one line changed, which is the point: the two differ in
+    // the kernel and in nothing else, so what the measurement compares is the
+    // branch against the blend.
+    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
+    run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
+
+    RasterStageArgs args;
+    args.screen_offset = rt.myrt_device_offset(b.screen);
+    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = static_cast<uint32_t>(world.size() / 3);
+    run_predicated_raster_stage(rt, args);
+
+    return download(rt, b);
+}
+
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& world,
                                const DrawTarget& target)
 {
@@ -350,6 +370,16 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
     args.triangle_count = mesh.triangle_count();
     run_indexed_raster_stage(rt, args);
     return download(rt, b);
+}
+
+std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
+                                    const DrawTarget& target)
+{
+    // build_predicated_raster_program is a variant of the walk and reads three
+    // consecutive screen vertices, so the indexed screen buffer — one entry per
+    // unique vertex — is not a shape it can read. Flattening is what makes the
+    // overload possible at all until the fourth kernel exists.
+    return draw_predicated(rt, mesh.flattened(), target);
 }
 
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,

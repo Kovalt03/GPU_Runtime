@@ -96,6 +96,13 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& worl
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& world,
                                 const DrawTarget& target);
 
+// The naive walk again, with the coverage branch replaced by a blend. Same
+// frame, no divergence, and every lane paying for every triangle — which is the
+// trade the measurement is about.
+
+std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                    const DrawTarget& target);
+
 // The other renderer entirely: one thread per pixel, casting a ray at the world
 // triangles where they already are.
 //
@@ -118,6 +125,16 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& w
 // attached to it.
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
                               const DrawTarget& target);
+
+// Flattens, where draw_walk and the tiled pair take the indexed path — the
+// predicated kernel exists only as a variant of the flattened walk, one of the
+// six places {none, tiled, tiled+shared} x {flattened, indexed} offers it.
+//
+// So draw_walk(mesh) against draw_predicated(mesh) moves two axes at once and
+// answers neither question. Compare a branch against a blend by handing both
+// the same vertex list; use this overload to draw a mesh, not to measure one.
+std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
+                                    const DrawTarget& target);
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
                                const DrawTarget& target);
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
