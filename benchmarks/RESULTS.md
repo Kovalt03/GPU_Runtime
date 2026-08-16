@@ -241,35 +241,51 @@ No lane disagrees, and the coverage test stops contributing to divergence
 altogether. The frames are bit-identical to the branch's — asserted with EQ,
 not NEAR, in `PredicationChangesTheCostAndNotThePixels`.
 
-| Scene | Triangles | walk | walk+pred | Change | tiled | tiled+pred | Change |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| small, spread over the frame | 4 | 10,885,760 | 11,089,920 | **1.9%** | 2,372,224 | 2,397,184 | **1.1%** |
-| small, spread over the frame | 16 | 41,534,048 | 42,350,592 | **2.0%** | 6,210,144 | 6,309,888 | **1.6%** |
-| small, spread over the frame | 64 | 164,126,592 | 167,393,280 | **2.0%** | 31,756,160 | 32,360,448 | **1.9%** |
-| medium, stacked at the centre | 16 | 41,532,192 | 42,350,592 | **2.0%** | 21,526,304 | 21,935,104 | **1.9%** |
-| full-frame, stacked | 16 | 41,550,336 | 42,350,592 | **1.9%** | 41,980,416 | 42,780,672 | **1.9%** |
+| Scene | Triangles | walk | tiled | raytrace | ray divergence |
+|---|---:|---:|---:|---:|---:|
+| small, spread over the frame | 4 | 1.9% | 1.1% | **4.1%** | 8.80% |
+| small, spread over the frame | 16 | 2.0% | 1.6% | **4.4%** | 12.49% |
+| small, spread over the frame | 64 | 2.0% | 1.9% | **4.5%** | 13.69% |
+| medium, stacked at the centre | 16 | 2.0% | 1.9% | **4.3%** | 17.59% |
+| full-frame, stacked | 16 | 1.9% | 1.9% | **2.5%** | 11.48% |
 
-**The branch wins every scene**, including the tiled route at 7.4% diverged —
-the highest rate any raster route reaches here. The plan predicted the opposite,
-that small triangles would favour the blend, and that prediction was written
-before anything was measured.
+Each figure is the blend against the branch on that route, so positive is worse.
 
-The blend column barely moves: 42,350,592 for every 16-triangle scene whatever
-its shape. That is what predication means — every lane shades every triangle, so
-the cost stops depending on what is covered. The branch column moves with the
-scene because it still skips.
+**The branch wins every scene and every route.** The plan predicted the
+opposite, that small triangles would favour the blend, and that prediction was
+written before anything was measured.
 
-What decides the trade is how much of the loop sits inside the branch. Here the
-three edge functions, the weights and the depth all sit outside it, and only the
-shade is inside; removing divergence from a small part of the loop cannot pay
-for running that part unconditionally. **Removing divergence and going faster
-are different things**, which is the result this table exists to record.
+The raster blend loses about 2% because most of its loop sits outside the
+branch: three edge functions, the weights and the depth all run whatever the
+coverage test says, and only the shade is skipped. Its cost stops depending on
+the scene — 42,350,592 for every 16-triangle scene whatever its shape — because
+every lane shades every triangle. That is what predication means.
 
-Two details worth keeping:
+**The ray tracer was the case that looked most likely to pay, and lost by
+twice as much.** Four early exits guard nearly the whole intersection, and this
+kernel diverges seven to forty times as much as the walk. Predicating it means
+every lane finishes an intersection it would have abandoned at the first test —
+and on a scene of small triangles, most rays leave at the first test. The one
+scene where it loses least, at 2.5%, is the full-frame one, where fewest rays
+leave early at all.
+
+So the trade is not decided by how much divergence there is to remove.
+**Removing divergence and going faster are different things**, and what decides
+it is how much work the branch was skipping. More of the loop inside the branch
+cuts both ways: more to gain by not splitting the warp, and more to pay for the
+lanes that would have left.
+
+Two details worth keeping:Two details worth keeping:
 
 - `old + take*(new-old)` is the same select an instruction cheaper and is *not*
   bit-exact — subtracting `old` and adding it back rounds. 69,715 pixels of
   200,000 drifted, and at 64 triangles it changed the image.
+- The ray tracer needs two guards the raster kernels never did, because its
+  exits protect arithmetic as well as control flow: the determinant reciprocal
+  divides by zero once nothing leaves early, and the running distance cannot
+  start at infinity when the blend multiplies it by a zero weight. Both are in
+  PredicatedRayTracerAgreesWithTheBranchItReplaces, each with the scene that
+  detects it — a cube detects neither.
 - The shared route does not reach zero divergence (0.02% at 128x128). Its
   cooperative fill is a second source, and the coverage flag has no bearing on
   it. An earlier test asserted a flat zero for all three routes and passed only

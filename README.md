@@ -209,7 +209,7 @@ on their own line, `int* ptr`.
 | Rasteriser, tile binning | **-85%** issued work |
 | Rasteriser, staged through shared memory | **-96%** against the naive walk |
 | Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
-| Predication against the branch it replaces | **+2%**, divergence to zero |
+| Predication against the branch (raster / ray) | **+2%** / **+4.4%**, divergence to zero |
 | Opcodes | 25 |
 | Tests | 225 |
 
@@ -317,13 +317,31 @@ route where warps straddle edges most:
 |---|---:|---:|---:|
 | every pixel walks every triangle | 41,534,048 | 42,350,592 | +2.0% |
 | binned into tiles (7.4% diverged) | 6,210,144 | 6,309,888 | +1.6% |
+| ray tracer (12.5% diverged) | 31,556,398 | — | **+4.4%** |
 
 The blend's cost barely moves between scenes — every lane shading every
 triangle is the same work whatever is on screen — while the branch's tracks
-what is actually covered. What decides the trade is how much of the loop sits
-inside the branch, and here the three edge functions, the weights and the depth
-all sit outside it. Predication would win where the divergent block dominates;
-this kernel is not that shape.
+what is actually covered.
+
+**The ray tracer was the case that looked most likely to pay, and lost by
+twice as much.** Four early exits guard nearly the whole of Möller-Trumbore
+there, where the rasteriser's branch guards only a shade. Predicating them
+means every lane finishes an intersection it would have abandoned at the first
+test, and on a scene of small triangles most rays leave at the first test. The
+scene where it loses least is the full-frame one, at 2.5%, where fewest rays
+leave early at all.
+
+So the trade is not decided by how much divergence there is to remove — the
+rasteriser's quietest route and the tracer's noisiest both lose. What decides
+it is how much work the branch was skipping, and more of the loop inside the
+branch cuts both ways.
+
+Folding the exits away also removes what they were guarding, which coverage
+never had to worry about: the determinant reciprocal divides by zero once
+nothing leaves early, and the running distance cannot start at infinity when
+the blend multiplies it by a zero weight. Neither shows up on a cube — one
+needs a degenerate triangle, the other two triangles ordered far-first — so
+both scenes are in the tests.
 
 The blend is written as `take*new + (1-take)*old` rather than the cheaper
 `old + take*(new-old)`, which rounds: 69,715 pixels of 200,000 drifted, and at

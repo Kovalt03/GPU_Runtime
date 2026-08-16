@@ -124,6 +124,7 @@ struct Row {
     Reading ray;
     Reading walk_pred;
     Reading tiled_pred;
+    Reading ray_pred;
 };
 
 double change(uint64_t from, uint64_t to)
@@ -184,6 +185,11 @@ int main(int argc, char** argv)
                         world);
         r.walk_pred = measure(route(draw_walk, true), world);
         r.tiled_pred = measure(route(draw_tiled, true), world);
+        r.ray_pred = measure(
+            [](MyGPURuntime& rt, const std::vector<Float3>& w, const DrawTarget& t) {
+                return draw_raytrace(rt, w, t, Shading{}, true);
+            },
+            world);
         rows.push_back(r);
     }
 
@@ -214,16 +220,14 @@ int main(int argc, char** argv)
     // next to each other. Divergence goes to zero either way, so the figure that
     // decides it is the work — a shade every lane runs against a shade only the
     // covering lanes run.
-    std::printf("\n  %-30s %5s %13s %13s %9s %13s %13s %9s\n", "predication", "tris",
-                "walk", "+pred", "change", "tiled", "+pred", "change");
+    std::printf("\n  %-30s %5s %9s %9s %9s %9s\n", "predication, vs its branch", "tris",
+                "walk", "tiled", "raytrace", "ray div");
     for (const Row& r : rows) {
-        std::printf("  %-30s %5u %13s %13s %8.1f%% %13s %13s %8.1f%%\n", r.scene.c_str(),
-                    r.triangles, with_commas(r.walk.weighted).c_str(),
-                    with_commas(r.walk_pred.weighted).c_str(),
-                    change(r.walk.weighted, r.walk_pred.weighted),
-                    with_commas(r.tiled.weighted).c_str(),
-                    with_commas(r.tiled_pred.weighted).c_str(),
-                    change(r.tiled.weighted, r.tiled_pred.weighted));
+        std::printf("  %-30s %5u %8.1f%% %8.1f%% %8.1f%% %8.2f%%\n", r.scene.c_str(),
+                    r.triangles, change(r.walk.weighted, r.walk_pred.weighted),
+                    change(r.tiled.weighted, r.tiled_pred.weighted),
+                    change(r.ray.weighted, r.ray_pred.weighted),
+                    100.0 * r.ray.divergence);
     }
 
     std::ofstream csv(prefix + ".csv");
@@ -284,18 +288,14 @@ int main(int argc, char** argv)
     }
 
     md << "\n## Branch against blend\n\n"
-       << "| Scene | Triangles | walk | walk+pred | Change "
-          "| tiled | tiled+pred | Change |\n"
-       << "|---|---:|---:|---:|---:|---:|---:|---:|\n";
+       << "| Scene | Triangles | walk | tiled | raytrace | ray divergence |\n"
+       << "|---|---:|---:|---:|---:|---:|\n";
     for (const Row& r : rows) {
-        std::snprintf(buf, sizeof(buf),
-                      "| %s | %u | %s | %s | **%.1f%%** | %s | %s | **%.1f%%** |\n",
-                      r.scene.c_str(), r.triangles, with_commas(r.walk.weighted).c_str(),
-                      with_commas(r.walk_pred.weighted).c_str(),
-                      change(r.walk.weighted, r.walk_pred.weighted),
-                      with_commas(r.tiled.weighted).c_str(),
-                      with_commas(r.tiled_pred.weighted).c_str(),
-                      change(r.tiled.weighted, r.tiled_pred.weighted));
+        std::snprintf(
+            buf, sizeof(buf), "| %s | %u | %.1f%% | %.1f%% | **%.1f%%** | %.2f%% |\n",
+            r.scene.c_str(), r.triangles, change(r.walk.weighted, r.walk_pred.weighted),
+            change(r.tiled.weighted, r.tiled_pred.weighted),
+            change(r.ray.weighted, r.ray_pred.weighted), 100.0 * r.ray.divergence);
         md << buf;
     }
 
