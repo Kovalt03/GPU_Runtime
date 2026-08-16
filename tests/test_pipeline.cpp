@@ -1290,8 +1290,62 @@ TEST(Pipeline, IndexingTransformsEachVertexOnce)
 
     // Under a third, not merely less. Eight vertices against thirty-six is a
     // ratio of 0.22, and a bare EXPECT_LT would still pass on a saving too
-    // small to have been worth building a second kernel for.
+    // small to have been worth an index buffer.
     EXPECT_LT(indexed * 3, flattened);
+}
+
+TEST(Pipeline, PredicationChangesTheCostAndNotThePixels)
+{
+    const Mesh cube = cube_mesh();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    // Every route the flag reaches, indexed and flattened both, against the
+    // branch it replaces. A blend is only a variant of a kernel if it draws the
+    // same thing, and it has to do so exactly: the frames go through EQ, not
+    // NEAR, because the arithmetic was written to keep one term whole and
+    // multiply the other away rather than to land close.
+    struct Case {
+        const char* name;
+        std::vector<Float3> (*route)(MyGPURuntime&, const Mesh&, const DrawTarget&, bool);
+        // Whether removing the coverage branch removes all of the route's
+        // divergence. The shared route stages its tile through a cooperative
+        // fill, and lanes there disagree about how many triangles they carry —
+        // a second source the coverage flag has no bearing on.
+        bool sole_source;
+    };
+    const Case cases[] = {{"walk", draw_walk, true},
+                          {"tiled", draw_tiled, true},
+                          {"shared", draw_shared, false}};
+
+    for (const Case& c : cases) {
+        MyGPURuntime branch_rt(1u << 24);
+        const std::vector<Float3> branched = c.route(branch_rt, cube, target, false);
+        const uint64_t branch_cost = branch_rt.stats().weighted_lane_ops;
+        const float branch_divergence = branch_rt.divergence_rate();
+
+        MyGPURuntime blend_rt(1u << 24);
+        const std::vector<Float3> blended = c.route(blend_rt, cube, target, true);
+
+        ASSERT_EQ(blended.size(), branched.size()) << c.name;
+        for (size_t i = 0; i < branched.size(); ++i) {
+            ASSERT_EQ(blended[i].x, branched[i].x) << c.name << " pixel " << i;
+            ASSERT_EQ(blended[i].y, branched[i].y) << c.name << " pixel " << i;
+            ASSERT_EQ(blended[i].z, branched[i].z) << c.name << " pixel " << i;
+        }
+
+        // What the variant was built to demonstrate: no lane disagrees over the
+        // coverage test, so the rate falls by everything that test contributed.
+        EXPECT_GT(branch_divergence, 0.0f) << c.name << " had nothing to remove";
+        EXPECT_LT(blend_rt.divergence_rate(), branch_divergence) << c.name;
+        if (c.sole_source) {
+            EXPECT_EQ(blend_rt.divergence_rate(), 0.0f) << c.name;
+        }
+
+        // And what it costs. Lanes the triangle never covered now shade anyway,
+        // and on this machine that is dearer than the masked issue it saves —
+        // for every scene measured, not only this one.
+        EXPECT_GT(blend_rt.stats().weighted_lane_ops, branch_cost) << c.name;
+    }
 }
 
 TEST(Pipeline, EveryRouteDrawsTheSameCube)
