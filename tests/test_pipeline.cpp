@@ -1294,6 +1294,101 @@ TEST(Pipeline, IndexingTransformsEachVertexOnce)
     EXPECT_LT(indexed * 3, flattened);
 }
 
+TEST(Pipeline, PredicatedRayTracerAgreesWithTheBranchItReplaces)
+{
+    // A cube proves less here than it looks. Folding the exits into a flag also
+    // removes what they guarded, and neither hazard that creates shows up on a
+    // closed mesh viewed from outside — the first draft of this test passed on
+    // one while both were still broken.
+    //
+    // So two scenes chosen for what they can detect, and the cube kept only to
+    // confirm the ordinary case still works.
+    struct Case {
+        const char* name;
+        std::vector<Float3> world;
+        Camera camera;
+    };
+    const Camera head_on{Float3{0.0f, 0.0f, 4.0f}, Float3{0, 0, 0}, Float3{0, 1, 0},
+                         60.0f};
+    std::vector<Case> cases;
+
+    cases.push_back({"cube", cube_mesh().flattened(), cube_camera()});
+
+    // A degenerate triangle: v0 == v1 leaves e1 zero, so the determinant is
+    // exactly zero and an unguarded reciprocal is infinity. That infinity
+    // reaches the blend, where multiplying it by a zero weight yields NaN — the
+    // whole frame, not the one triangle.
+    std::vector<Float3> degenerate = cube_mesh().flattened();
+    degenerate.push_back(Float3{0.4f, 0.4f, 0.4f});
+    degenerate.push_back(Float3{0.4f, 0.4f, 0.4f});
+    degenerate.push_back(Float3{-0.4f, -0.4f, 0.4f});
+    cases.push_back({"degenerate triangle", degenerate, cube_camera()});
+
+    // Two triangles over the same pixels with the far one FIRST. The blend needs
+    // a finite starting distance: infinity times a zero weight is NaN, every
+    // later depth test against NaN fails, and nearest-wins quietly becomes
+    // first-hit-wins. Nothing is NaN in the frame when that happens — the pixels
+    // simply show the wrong triangle, so a test that only looks for NaN misses
+    // it. Ordering the far one first is what makes the two rules disagree.
+    cases.push_back({"far triangle first",
+                     {Float3{-1.5f, -1.5f, -1.0f}, Float3{1.5f, -1.5f, -1.0f},
+                      Float3{0.0f, 1.5f, -1.0f}, Float3{-0.5f, -0.5f, 1.0f},
+                      Float3{0.5f, -0.5f, 1.0f}, Float3{0.0f, 0.5f, 1.0f}},
+                     head_on});
+
+    for (const Case& c : cases) {
+        const DrawTarget target{WIDTH, HEIGHT, c.camera};
+
+        MyGPURuntime branch_rt(1u << 24);
+        const std::vector<Float3> branched = draw_raytrace(branch_rt, c.world, target);
+        const uint64_t branch_cost = branch_rt.stats().weighted_lane_ops;
+        const float branch_divergence = branch_rt.divergence_rate();
+
+        MyGPURuntime blend_rt(1u << 24);
+        const std::vector<Float3> blended =
+            draw_raytrace(blend_rt, c.world, target, Shading{}, true);
+
+        ASSERT_EQ(blended.size(), branched.size()) << c.name;
+        for (size_t i = 0; i < branched.size(); ++i) {
+            ASSERT_EQ(blended[i].x, branched[i].x) << c.name << " pixel " << i;
+            ASSERT_EQ(blended[i].y, branched[i].y) << c.name << " pixel " << i;
+            ASSERT_EQ(blended[i].z, branched[i].z) << c.name << " pixel " << i;
+        }
+
+        EXPECT_GT(branch_divergence, 0.0f) << c.name << " had nothing to remove";
+        EXPECT_EQ(blend_rt.divergence_rate(), 0.0f) << c.name;
+        EXPECT_GT(blend_rt.stats().weighted_lane_ops, branch_cost) << c.name;
+    }
+}
+
+TEST(Pipeline, PredicatedRayTracerCostsMoreThanTheRasterBlendDoes)
+{
+    // The comparison the raster measurement could not make on its own. Its blend
+    // loses about 2% because most of the loop sits outside the branch; the ray
+    // tracer has far more inside one, and loses by more still. Having more of
+    // the loop under the branch cuts both ways — every lane now finishes an
+    // intersection it would have abandoned at the first of four exits.
+    const std::vector<Float3> world = cube_mesh().flattened();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    const auto overhead = [&](bool ray) {
+        MyGPURuntime branch_rt(1u << 24);
+        MyGPURuntime blend_rt(1u << 24);
+        if (ray) {
+            draw_raytrace(branch_rt, world, target);
+            draw_raytrace(blend_rt, world, target, Shading{}, true);
+        } else {
+            draw_walk(branch_rt, world, target, false);
+            draw_walk(blend_rt, world, target, true);
+        }
+        const double before = static_cast<double>(branch_rt.stats().weighted_lane_ops);
+        return (static_cast<double>(blend_rt.stats().weighted_lane_ops) - before) /
+               before;
+    };
+
+    EXPECT_GT(overhead(true), overhead(false));
+}
+
 TEST(Pipeline, PredicationChangesTheCostAndNotThePixels)
 {
     const Mesh cube = cube_mesh();
