@@ -88,6 +88,23 @@ struct RaytraceStageArgs {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t triangle_count = 0;
+
+    // The four early exits are folded into one flag rather than branched on, as
+    // RasterStageArgs::predicated does for coverage. Read on the host when the
+    // kernel is built, so the flag costs no lane anything.
+    //
+    // The route where the trade looked most likely to pay — the raster branch
+    // guards a shade and little else, while this one guards most of
+    // Möller-Trumbore — and it loses by more: about 4.4% against the raster
+    // blend's 2%, with divergence going from 12.5% to zero. Predicating an
+    // early exit means every lane finishes an intersection it would have
+    // abandoned, and on a scene of small triangles most rays leave at the first
+    // test of four.
+    //
+    // Folding the exits away also removes what they guarded, which coverage
+    // never had to worry about. Two of the three differences in the kernel
+    // follow from that rather than from predication itself.
+    bool predicated = false;
 };
 
 // Builds the ray tracer. args[0] must point at a RaytraceStageArgs.

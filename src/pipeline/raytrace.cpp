@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "ir_builder.hpp"
 #include "math3d.hpp"
@@ -66,7 +67,13 @@ Program build_raytrace_program(void** args)
         // The running best, as in the rasteriser. Infinity rather than the
         // rasteriser's 2.0f: that worked because NDC depth is bounded, and t is
         // a ray parameter with no ceiling.
-        const Reg<Scalar> best_t = k.constant(std::numeric_limits<float>::infinity());
+        // Infinity is the natural ceiling for a ray parameter, and the blend
+        // cannot use it: it multiplies the running best by (1 - take), and
+        // inf * 0 is NaN. FLT_MAX is above every real t, so nothing that would
+        // have won loses.
+        const Reg<Scalar> best_t =
+            k.constant(a.predicated ? std::numeric_limits<float>::max()
+                                    : std::numeric_limits<float>::infinity());
         const Reg<Vec3> best = k.vec3();
         k.set(best.component(0), 0.0f);
         k.set(best.component(1), 0.0f);
@@ -95,6 +102,9 @@ Program build_raytrace_program(void** args)
         // Every miss lands on next, and it is placed before the advance below:
         // a miss means "on to the next triangle", not "out of the loop", so the
         // cursor still has to move or the lane meets the same one for ever.
+        //
+        // Predicated, nothing branches to next and nothing places it, which
+        // build() allows — only a label branched to and never placed is an error.
         const Label top = k.label();
         const Label next = k.label();
         k.place(top);
@@ -118,62 +128,112 @@ Program build_raytrace_program(void** args)
         const Reg<Vec3> h = k.cross(dir, e2);
         const Reg<Scalar> a_dot = k.dot(e1, h);
 
+        // The four exits, each written twice — the condition to leave on, and
+        // the condition to have survived. Emitted through one call so the pair
+        // stays in view: they are not each other's negation once NaN is in play,
+        // and a flag that disagreed with its branch would make the two kernels
+        // incomparable rather than merely wrong.
+        std::vector<Reg<Scalar>> survived;
+        const auto gate = [&](auto passed, auto failed) {
+            if (a.predicated) {
+                survived.push_back(passed());
+            } else {
+                k.branch_to(next, failed());
+            }
+        };
+
         // a < eps rather than |a| < eps rejects a back face along with a
         // parallel ray, the ISA having no absolute value.
         //
         // First of the four exits. Six conditions, but any() folds each pair
-        // into one flag, so a warp splits four times rather than six.
-        k.branch_to(next, k.lt(a_dot, eps));
+        // into one flag, so a warp splits four times rather than six — and
+        // min() of two flags is their AND, which is that same fold predicated.
+        gate([&] { return k.ge(a_dot, eps); }, [&] { return k.lt(a_dot, eps); });
 
-        const Reg<Scalar> f = k.rcp(a_dot);
+        // Branching, the exit above is what makes this reciprocal safe: a ray
+        // parallel to the triangle has already left. Predicated nothing has, so
+        // every lane divides, and rcp(0) is infinity — which reaches u, v and t
+        // and then meets a blend that multiplies discarded terms by zero, where
+        // 0 * inf is NaN. A surviving lane has a_dot >= eps and max() hands it
+        // back untouched, which is what keeps the two forms bit-identical; a
+        // rejected one gets 1/eps, wrong but finite.
+        const Reg<Scalar> f = k.rcp(a.predicated ? k.max(a_dot, eps) : a_dot);
         const Reg<Vec3> s = k.sub(origin, v0);
 
         const Reg<Scalar> u = k.mul(f, k.dot(s, h));
-        k.branch_to(next, k.any(k.lt(u, zero), k.gt(u, one)));
+        gate([&] { return k.min(k.ge(u, zero), k.le(u, one)); },
+             [&] { return k.any(k.lt(u, zero), k.gt(u, one)); });
 
         const Reg<Vec3> q = k.cross(s, e1);
         const Reg<Scalar> v = k.mul(f, k.dot(dir, q));
-        k.branch_to(next, k.any(k.lt(v, zero), k.gt(k.add(u, v), one)));
+        gate([&] { return k.min(k.ge(v, zero), k.le(k.add(u, v), one)); },
+             [&] { return k.any(k.lt(v, zero), k.gt(k.add(u, v), one)); });
 
         const Reg<Scalar> t = k.mul(f, k.dot(e2, q));
-        k.branch_to(next, k.lt(t, eps));
+        gate([&] { return k.ge(t, eps); }, [&] { return k.lt(t, eps); });
 
         // Nearest wins. No depth buffer and no atomics: the thread owns its
         // pixel, so the running best is a register.
-        k.if_(k.lt(t, best_t), [&] {
-            k.copy_into(best_t, t);
-
-            // Read at build time, not by the device: a KernelFunc runs once per
-            // launch, so only one of these arms reaches the instruction stream.
+        //
+        // Read at build time, not by the device: a KernelFunc runs once per
+        // launch, so only one shading arm reaches the instruction stream.
+        //
+        // Shaded inside the loop, so a pixel that meets three triangles shades
+        // three times. Carrying a normal and a point out to the end would cost
+        // six registers to save work the twelve loads above already dominate.
+        //
+        // e1 and e2 are the intersection test's, not rebuilt from the vertices:
+        // a normal wound off different edges than a_dot was would cull one face
+        // and shade the other. dir is not normalised and does not need to be —
+        // t is measured in units of it, so the two cancel.
+        const auto shade = [&](Reg<Vec3> dst) {
             if (a.shading.mode == ShadingMode::Diffuse) {
-                // Shaded inside the loop, so a pixel that meets three triangles
-                // shades three times. Carrying a normal and a point out to the
-                // end would cost six registers to save work the twelve loads
-                // above already dominate.
-
-                // e1 and e2 are the intersection test's, not rebuilt from the
-                // vertices: a normal wound off different edges than a_dot was
-                // would cull one face and shade the other.
                 const Reg<Vec3> normal = k.normalize(k.cross(e1, e2));
-
-                // dir is not normalised and does not need to be — t is measured
-                // in units of it, so the two cancel.
                 const Reg<Vec3> point = k.add(origin, k.scale(dir, t));
                 const Reg<Vec3> to_light = k.normalize(k.sub(light, point));
                 const Reg<Scalar> diffuse = k.max(zero, k.dot(normal, to_light));
-                const Reg<Vec3> shaded = k.scale(base, diffuse);
-
-                k.copy_into(best.component(0), shaded.component(0));
-                k.copy_into(best.component(1), shaded.component(1));
-                k.copy_into(best.component(2), shaded.component(2));
+                const Reg<Vec3> lit = k.scale(base, diffuse);
+                k.copy_into(dst.component(0), lit.component(0));
+                k.copy_into(dst.component(1), lit.component(1));
+                k.copy_into(dst.component(2), lit.component(2));
             } else {
-                k.copy_into(best.component(0), u);
-                k.copy_into(best.component(1), v);
-                k.copy_into(best.component(2), k.sub(k.sub(one, u), v));
+                k.copy_into(dst.component(0), u);
+                k.copy_into(dst.component(1), v);
+                k.copy_into(dst.component(2), k.sub(k.sub(one, u), v));
             }
-        });
+        };
 
-        k.place(next);
+        if (!a.predicated) {
+            k.if_(k.lt(t, best_t), [&] {
+                k.copy_into(best_t, t);
+                shade(best);
+            });
+            k.place(next);
+        } else {
+            // Four exits and the depth test collapse to one number, min() of two
+            // flags being their AND. Nothing splits the warp.
+            const Reg<Scalar> hit =
+                k.min(k.min(survived[0], survived[1]), k.min(survived[2], survived[3]));
+            const Reg<Scalar> take = k.min(hit, k.lt(t, best_t));
+
+            // Into a scratch range rather than into best, the blend still
+            // needing the old value — emit_keep does the same for coverage.
+            const Reg<Vec3> shaded = k.vec3();
+            shade(shaded);
+
+            // take*new + (1 - take)*old, not the cheaper old + take*(new - old):
+            // that one rounds, and the raster variant drifted on 69,715 pixels
+            // of 200,000 before it was changed.
+            const Reg<Scalar> keep = k.sub(one, take);
+            const auto blend = [&](Reg<Scalar> dst, Reg<Scalar> src) {
+                k.copy_into(dst, k.mul(dst, keep));
+                k.fma(dst, take, src);
+            };
+            blend(best_t, t);
+            blend(best.component(0), shaded.component(0));
+            blend(best.component(1), shaded.component(1));
+            blend(best.component(2), shaded.component(2));
+        }
         k.fma(cursor, stride, one);
         k.fma(i, one, one);
         k.branch_to(top, k.lt(i, count));

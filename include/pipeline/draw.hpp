@@ -117,7 +117,8 @@ std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>&
 // Diffuse is the mode the rasteriser cannot follow it into.
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& world,
                                   const DrawTarget& target,
-                                  const Shading& shading = Shading{});
+                                  const Shading& shading = Shading{},
+                                  bool predicated = false);
 
 // The same four, taking a mesh. Each renders identically to the vertex list the
 // mesh expands to, which is what the tests assert.

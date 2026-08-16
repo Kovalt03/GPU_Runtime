@@ -321,7 +321,8 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& wor
 }
 
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& world,
-                                  const DrawTarget& target, const Shading& shading)
+                                  const DrawTarget& target, const Shading& shading,
+                                  bool predicated)
 {
     // screen_vertices stays zero: there is no vertex stage here, so nothing
     // ever projects and no buffer holds the result.
@@ -339,6 +340,7 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& w
     args.width = target.width;
     args.height = target.height;
     args.triangle_count = static_cast<uint32_t>(world.size() / 3);
+    args.predicated = predicated;
     run_raytrace_stage(rt, args);
 
     return download(rt, b);
