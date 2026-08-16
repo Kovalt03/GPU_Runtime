@@ -535,7 +535,18 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
     // One step per turn, not run-to-completion: that is what makes this
     // round-robin, and it is also how a real scheduler hides the latency of a
     // long-running instruction behind the other warps.
+    // Counted per turn rather than per warp, so the limit is on the block's
+    // total work and not on how the queue happened to interleave.
+    uint64_t steps = 0;
     while (!ready_queue_.empty()) {
+        if (++steps > step_budget_) {
+            throw std::runtime_error(
+                "WarpScheduler::run: block did not finish within " +
+                std::to_string(step_budget_) +
+                " warp steps — a lane is waiting on one this scheduler will "
+                "never issue, or the kernel does not terminate");
+        }
+
         Warp* warp = ready_queue_.front();
         ready_queue_.pop();
         if (step_warp(program, *warp, block, global)) {

@@ -743,3 +743,76 @@ TEST(Scheduler, BarrierDoesNotWaitForAWarpThatHasRetired)
     EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[2], 9.0f)
         << "warp 0 must not be stranded";
 }
+
+TEST(Scheduler, LowestPcFirstStrandsALaneWaitingOnAHigherOne)
+{
+    // The deadlock independent thread scheduling exists to fix, reachable from
+    // a kernel that reads as correct.
+    //
+    // Lane 0 spins on a flag in memory; every other lane jumps forward to the
+    // store that would set it. The spin sits at a lower pc than the store, and
+    // this scheduler always issues the lowest live pc, so the writer is never
+    // reached — the readiest lane starves the one it is waiting for.
+    //
+    // Volta gives each thread its own pc, which this machine already does, and
+    // then schedules them independently, which it does not. What is missing is
+    // a policy, not a data structure.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(0, 1.0f));                           // 0
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0, CmpOp::GE));  // 1: lane >= 1
+    p.push_back(make_bra_div(1, 6));                                // 2: to the writer
+    p.push_back(make_v_mov_f32(2, 0.0f));                           // 3: spin, addr 0
+    p.push_back(make_v_ld_global_f32(3, 2, 0.0f));                  // 4:   flag = mem[0]
+    p.push_back(make_v_cmp_f32(4, 3, 2, CmpOp::EQ));                // 5:   still zero?
+    p.push_back(make_bra_div(4, -3));                               // 6:   back to 4
+    p.push_back(make_ret());                                        // 7
+    p.push_back(make_v_mov_f32(5, 0.0f));                           // 8: writer, addr 0
+    p.push_back(make_v_mov_f32(6, 1.0f));                           // 9
+    p.push_back(make_v_st_global_f32(5, 6, 0.0f));                  // 10: mem[0] = 1
+    p.push_back(make_ret());                                        // 11
+
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+    }
+
+    WarpScheduler scheduler;
+    // Small enough that asserting the hang costs milliseconds. The spin issues
+    // one instruction a turn and would otherwise run to the default budget.
+    scheduler.set_step_budget(10000);
+
+    std::vector<uint8_t> memory(16, 0);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                 std::runtime_error);
+
+    // Which is the deadlock rather than merely something throwing: the spinning
+    // lane is still inside its loop, the writer has not issued its first
+    // instruction, and the flag it was waiting on was never set. A budget that
+    // fired for any other reason would not leave the block in this state.
+    EXPECT_EQ(block.warps[0].threads[0].pc, 4u) << "lane 0 left its spin";
+    EXPECT_EQ(block.warps[0].threads[1].pc, 8u) << "lane 1 ran past the store";
+    float flag = -1.0f;
+    std::memcpy(&flag, memory.data(), sizeof(float));
+    EXPECT_FLOAT_EQ(flag, 0.0f) << "the store ran, so nothing was starved";
+}
+
+TEST(Scheduler, TheStepBudgetDoesNotStandInTheWayOfAKernelThatFinishes)
+{
+    // The budget is worth nothing if a working kernel can meet it. A block that
+    // retires normally must not depend on how much room it was given, so the
+    // tightest budget that lets this one through is well under what any kernel
+    // here uses.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(0, 7.0f));
+    p.push_back(make_ret());
+
+    WarpScheduler scheduler;
+    scheduler.set_step_budget(8);
+
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[0], 7.0f);
+}

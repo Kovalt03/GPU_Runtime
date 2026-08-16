@@ -61,9 +61,26 @@ struct SchedulerStats {
 // keeps the ISA free of a post-dominator annotation it has no way to compute.
 class WarpScheduler {
 public:
+    // How many warp steps one block may take before run() gives up. Issuing the
+    // lowest live pc first means a lane can wait on one that will never be
+    // reached, so not every block that fails to retire is a mistaken kernel —
+    // see LowestPcFirstStrandsALaneWaitingOnAHigherOne.
+    //
+    // The heaviest kernel here takes 706 steps for a block at 256x256, so this
+    // leaves four orders of magnitude before anything that works could meet it.
+    static constexpr uint64_t DEFAULT_STEP_BUDGET = 1ull << 24;
+
+    // Lowered by tests that mean to reach the budget: at the default, doing so
+    // takes tens of seconds.
+    void set_step_budget(uint64_t steps)
+    {
+        step_budget_ = steps;
+    }
+
     // Runs until every thread has retired. Throws std::runtime_error on a bad
-    // register index, an unaligned or out-of-range address, or a pc that leaves
-    // the program. The block must outlive the call.
+    // register index, an unaligned or out-of-range address, a pc that leaves
+    // the program, or the step budget elapsing with the block unfinished. The
+    // block must outlive the call.
     void run(const Program& program, ThreadBlock& block, DeviceSpan global);
 
     const SchedulerStats& stats() const
@@ -81,6 +98,7 @@ public:
 private:
     std::queue<Warp*> ready_queue_;  // pointers: a Warp is ~32 KB
     SchedulerStats stats_;
+    uint64_t step_budget_ = DEFAULT_STEP_BUDGET;
 
     // Returns false when the warp will not take another turn — retired, or now
     // waiting at a barrier. run() tells the two apart by Warp::at_barrier.
