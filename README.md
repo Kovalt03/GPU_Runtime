@@ -33,9 +33,9 @@ grows only with the perimeter.
 ```
   ┌──────────────────────────────────────────────────┐
   │        Kernels  (validation workloads)           │
-  │   ray_triangle.cpp  ·  raster_triangle.cpp       │
+  │  ray_triangle · raster_triangle · mesh_render    │
   │   Möller–Trumbore   ·  edge functions            │
-  │        both render to PPM, and must agree        │
+  │       all render to PPM, and must agree          │
   └────────────────────┬─────────────────────────────┘
                        │  Mesh · Camera · two launches
   ┌────────────────────▼─────────────────────────────┐
@@ -68,7 +68,7 @@ grows only with the perimeter.
   │             include/thread.hpp                   │
   │   Thread[256 regs, pc, active]                   │
   │   Warp[32 threads, activeMask]                   │
-  │   ThreadBlock[warps, 4096B sharedMem]            │
+  │   ThreadBlock[warps, 4096 floats shared]         │
   └──────┬───────────────────────────────────────────┘
          │  instruction fetch & decode
   ┌──────▼───────────────────────────────────────────┐
@@ -133,6 +133,8 @@ opcodes are added.
 | 10 | Rasteriser | `pipeline/vertex.*` · `pipeline/raster.*` | ✅ |
 | 11 | Tile binning + shared memory | `pipeline/raster_tiled.*` · `BARRIER` | ✅ |
 | 12 | Ray tracer over the same scene | `pipeline/raytrace.*` | ✅ |
+| 13 | Mesh input, index buffer, vertex cache scoring | `include/mesh.hpp` · `src/mesh.cpp` | ✅ |
+| 14 | Predication against the branch | `pipeline/raster_emit.hpp` | ✅ |
 
 ---
 
@@ -166,15 +168,18 @@ leaving the stale binaries in place.
 ```bash
 # Render (PPM, no image library needed)
 ./build/kernels/ray_triangle 256 256
-sips -s format png output/result.ppm --out result.png   # macOS
-convert output/result.ppm result.png                    # ImageMagick
+sips -s format png benchmarks/result/result.ppm --out result.png   # macOS
+convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # Benchmarks
 ./build/benchmarks/divergence_bench
-./build/benchmarks/divergence_bench --csv   # output/divergence.csv
+./build/benchmarks/divergence_bench --csv   # benchmarks/result/divergence.csv
 
 # Four routes to one frame — walk, tiled, shared memory, ray tracer
-./build/benchmarks/render_bench             # output/render_bench.{md,csv}
+./build/benchmarks/render_bench             # benchmarks/result/render_bench.{md,csv}
+
+# An .obj down every route, compared pixel for pixel
+./build/kernels/mesh_render assets/sphere.obj
 ```
 
 ### Formatting
@@ -203,8 +208,10 @@ on their own line, `int* ptr`.
 | Issue overhead once a warp splits | 1.80x |
 | Rasteriser, tile binning | **-85%** issued work |
 | Rasteriser, staged through shared memory | **-96%** against the naive walk |
+| Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
+| Predication against the branch it replaces | **+2%**, divergence to zero |
 | Opcodes | 25 |
-| Tests | 200 |
+| Tests | 225 |
 
 ### What divergence costs
 
@@ -264,13 +271,161 @@ barrier sit outside the kernel's bounds check, because a thread whose pixel is
 off screen still has to arrive; reaching a barrier under divergence is refused
 rather than left to hang.
 
-Every figure above comes out of `./build/benchmarks/render_bench`, which
-defines its scenes in code and drives the same `draw_walk` / `draw_tiled` /
-`draw_shared` / `draw_raytrace` the tests call. Both renderers take their
-camera from one `DrawTarget`, so a comparison between them cannot be of two
-different views. `benchmarks/RESULTS.md` carries the full tables,
-the method, and a prediction about divergence that the measurements
+### An index buffer costs one pass what it saves the other
+
+A cube has eight corners and thirty-six flattened vertices. Transforming each
+corner once instead of once per triangle that uses it takes **76.4%** off pass
+1 — the most expensive instruction in the set, run four and a half times less
+often. The saving grows with how much a mesh shares: 83.1% on a 360-triangle
+sphere.
+
+Pass 2 then pays for it. A vertex's address is not known until its index has
+arrived, so each triangle makes fifteen dependent global loads where the
+flattened walk made twelve, and the pass costs **24.0%** more.
+
+| cube, 64x32 | flattened | indexed | |
+|---|---:|---:|---:|
+| pass 1 — vertex transforms | 27,868 | 6,584 | **-76.4%** |
+| pass 2 — coverage | 31,317,520 | 38,841,872 | +24.0% |
+
+Which way the total falls depends on the ratio of vertices to pixels, so both
+paths are kept and neither is the successor of the other. The tiled routes sit
+outside the trade entirely: binning de-indexes on the host, so they take pass
+1's saving and pay nothing in pass 2.
+
+`simulated_cache_misses` counts what a 32-entry post-transform FIFO would have
+missed, which is ACMR — the number the literature quotes. Reordering triangles
+by Forsyth's linear-speed heuristic moves a shuffled sphere from **2.60 to
+0.68** against a floor of 0.51. That is a real saving in a machine with such a
+cache, and this one has none: reordering changes the issued work here by
+0.004%, all of it from triangles arriving in a different depth order.
+
+### Removing divergence is not the same as going faster
+
+The masking comparison the project set out to make. `V_CMP_F32` yields exactly
+1.0 or 0.0, so coverage can select arithmetically instead of branching:
+
+```
+kept = take * new + (1 - take) * old
+```
+
+No lane disagrees, and the coverage test stops contributing to divergence
+entirely. It is also slower — on every scene measured, including the tiled
+route where warps straddle edges most:
+
+| 16 small triangles, 64x32 | branch | blend | |
+|---|---:|---:|---:|
+| every pixel walks every triangle | 41,534,048 | 42,350,592 | +2.0% |
+| binned into tiles (7.4% diverged) | 6,210,144 | 6,309,888 | +1.6% |
+
+The blend's cost barely moves between scenes — every lane shading every
+triangle is the same work whatever is on screen — while the branch's tracks
+what is actually covered. What decides the trade is how much of the loop sits
+inside the branch, and here the three edge functions, the weights and the depth
+all sit outside it. Predication would win where the divergent block dominates;
+this kernel is not that shape.
+
+The blend is written as `take*new + (1-take)*old` rather than the cheaper
+`old + take*(new-old)`, which rounds: 69,715 pixels of 200,000 drifted, and at
+64 triangles that reached the image. A variant built to be compared against the
+branch has to agree with it to the bit.
+
+Every figure above is reproducible from a committed scene, and each names the
+tool that produced it: the frame-level tables come from
+`./build/benchmarks/render_bench`, which defines its scenes in code and drives
+the same routes the tests call; the per-pass index-buffer figures come from
+`./build/kernels/mesh_render` reading `assets/`, because the draw routes clear
+the counters between passes and a caller otherwise reads pass 2 alone; the ACMR
+numbers come from `simulated_cache_misses`, which scores a mesh rather than
+running one.
+
+Both renderers take their camera from one `DrawTarget`, so a comparison between
+them cannot be of two different views. `benchmarks/RESULTS.md` carries the full
+tables, the method, and a prediction about divergence that the measurements
 contradicted.
+
+---
+
+## What this models, and what it does not
+
+A real GPU runs graphics through a chain of fixed-function blocks with two
+programmable stages wired into it. This simulator has no fixed-function blocks
+at all: rasterisation is a kernel like any other, written against the same 25
+opcodes. That makes it a **compute-based software renderer on a simulated SIMT
+machine** — the family Larrabee, CUDA rasterisation research and Nanite's
+software path belong to — rather than a model of a graphics ASIC.
+
+That is a deliberate position, not an omission. A simulated fixed-function
+rasteriser would have nothing to say about warp divergence, which is the thing
+this project exists to measure.
+
+### The graphics pipeline
+
+| Hardware block | Kind | Here |
+|---|---|---|
+| Input Assembler | fixed | **partly** — an index buffer is fetched and expanded, but by the raster kernel itself rather than a block ahead of it |
+| Post-transform vertex cache | fixed | **absent** — pass 1 transforms each unique vertex once, which is the saving the cache exists to make, but nothing reuses a result *within* a launch. `simulated_cache_misses` scores meshes against the cache the hardware would have |
+| Vertex shader | programmable | `build_vertex_program`, one thread per vertex |
+| Primitive assembly, clip, cull | fixed | back-face culling only, inside the kernel; **no clipping** |
+| Rasteriser (edge functions, quad generation) | fixed | `build_raster_program`, one thread per pixel |
+| Hi-Z / early-Z | fixed | **absent** — every pixel shades every triangle and keeps the nearest |
+| Fragment shader | programmable | folded into the raster kernel |
+| ROP (blend, depth write) | fixed | **absent** — the running nearest lives in a register |
+| Texture units, samplers | fixed | **absent** |
+
+### Ray tracing
+
+| Hardware | Here |
+|---|---|
+| BVH / acceleration structure | **absent** — every pixel walks every triangle, O(pixels x triangles) |
+| Traversal and intersection units | **absent** — intersection is a kernel, the same choice made for rasterisation |
+| Index buffer as BLAS input | **absent** — and note it is real hardware's too: DXR and Vulkan RT both name one. What differs is when it is read, the builder consuming it once where the raster side reads it every draw |
+| Instance transforms (TLAS) | **absent** |
+
+The rasteriser has binning and shared-memory staging to cut its walk; the
+tracer has only the walk. That asymmetry is why `render_bench` compares it
+against `walk` and nothing else, and a BVH is what would close it.
+
+### Memory
+
+| | Here |
+|---|---|
+| L1 / L2 / VRAM hierarchy | **absent** — a global load costs a flat 100 |
+| Coalescing | **absent** — the cost model charges per lane whatever the address pattern |
+| Shared memory + barrier | modelled: 4096 floats a block, `BARRIER`, a load costing 8 |
+| Register file | modelled: 256 per thread, and running out throws |
+
+### Scheduling
+
+| | Here |
+|---|---|
+| Warps of 32, `activeMask`, reconvergence | modelled — the centre of the project |
+| Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
+| Latency hiding | **absent** — the reason warps are batched at all, and invisible here |
+| Streams, async copy | **absent** — every launch is synchronous |
+
+### The three that matter most
+
+**Coalescing.** Whether 32 lanes read 32 adjacent floats or 32 scattered ones is
+the first question asked of any real kernel, and this cost model cannot tell
+them apart. It is why `V_LD_GLOBAL_VEC3_F32` is specified but unbuilt: there is
+nothing for it to demonstrate yet. It also means the 95% that shared-memory
+staging wins is arithmetic on a flat 100-vs-8, not a cache story.
+
+**Latency hiding.** Warps exist so that a stall on one can be covered by
+another. Blocks run to completion in sequence here and every instruction costs
+a fixed number, so occupancy — the number a real tuning session revolves
+around — has nowhere to appear.
+
+**Early-Z.** Rejecting a fragment before shading it is most of what makes a
+modern rasteriser fast on a scene with depth complexity. Every pixel here
+shades every triangle that covers it.
+
+Closing the first would mean the cost model reading a warp's 32 addresses
+rather than only its opcode, and every figure above being taken again. The
+second would mean instructions carrying a latency separate from their
+throughput, so that a warp waiting on a load could be stepped over rather than
+charged a flat number.
 
 ---
 
@@ -287,7 +442,13 @@ gpu-runtime-sim/
 │   ├── check.sh
 │   ├── format.sh
 │   └── test.sh
+├── assets/                  # meshes the benchmarks and tests render
+│   ├── cube.obj
+│   ├── grid.obj
+│   ├── sphere.obj
+│   └── tetrahedron.obj
 ├── include/
+│   ├── app_run.hpp         # --out and run directories, shared by the executables
 │   ├── isa.hpp
 │   ├── memory.hpp
 │   ├── thread.hpp
@@ -295,14 +456,16 @@ gpu-runtime-sim/
 │   ├── runtime.hpp
 │   ├── ir_builder.hpp
 │   ├── math3d.hpp
+│   ├── mesh.hpp            # Mesh, load_obj, ACMR scoring, Forsyth reorder
 │   └── pipeline/
 │       ├── types.hpp        # strides and ScreenTriangle, shared by the stages
 │       ├── vertex.hpp
 │       ├── raster.hpp
 │       ├── raster_tiled.hpp
 │       ├── raytrace.hpp
-│       └── draw.hpp          # draw_walk / draw_tiled / draw_shared / draw_raytrace
+│       └── draw.hpp          # the routes, each taking a mesh or a vertex list
 ├── src/
+│   ├── app_run.cpp
 │   ├── isa.cpp
 │   ├── memory.cpp
 │   ├── thread.cpp
@@ -310,9 +473,11 @@ gpu-runtime-sim/
 │   ├── runtime.cpp
 │   ├── ir_builder.cpp
 │   ├── math3d.cpp
+│   ├── mesh.cpp
 │   └── pipeline/
-│       ├── raster_emit.hpp   # private: the emitters the raster kernels share
-│       ├── draw.cpp          # the four routes end to end, shared with the tests
+│       ├── raster_emit.hpp   # private: the emitters the raster kernels share,
+│       │                     #   including the branch/blend the flag selects
+│       ├── draw.cpp          # the routes end to end, shared with the tests
 │       ├── vertex.cpp
 │       ├── raster.cpp
 │       ├── raster_tiled.cpp
@@ -320,7 +485,8 @@ gpu-runtime-sim/
 ├── kernels/
 │   ├── ppm.hpp
 │   ├── ray_triangle.cpp
-│   └── raster_triangle.cpp
+│   ├── raster_triangle.cpp
+│   └── mesh_render.cpp     # renders an .obj down every route and compares
 ├── tests/
 │   ├── CMakeLists.txt
 │   ├── test_isa.cpp
@@ -330,6 +496,7 @@ gpu-runtime-sim/
 │   ├── test_runtime.cpp
 │   ├── test_ir_builder.cpp
 │   ├── test_math3d.cpp
+│   ├── test_mesh.cpp
 │   ├── test_pipeline.cpp
 │   ├── reference.hpp        # host oracles, built into the test target only
 │   └── reference.cpp
@@ -337,7 +504,7 @@ gpu-runtime-sim/
 │   ├── CMakeLists.txt
 │   ├── RESULTS.md
 │   ├── divergence_bench.cpp
-│   └── render_bench.cpp     # generates the measurement tables in RESULTS.md
-└── output/
-    └── .gitkeep
+│   ├── render_bench.cpp     # generates the measurement tables in RESULTS.md
+│   └── result/              # every run writes here, one directory per run
+│       └── .gitkeep
 ```

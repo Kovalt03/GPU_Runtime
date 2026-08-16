@@ -11,9 +11,10 @@ cmake --build build -j8
 ./build/benchmarks/render_bench     # stdout, plus benchmarks/result/render_bench.{md,csv}
 ```
 
-The scenes are code in `benchmarks/render_bench.cpp`, and the four routes it
-measures are the same `draw_walk` / `draw_tiled` / `draw_shared` /
-`draw_raytrace` the tests call.
+The scenes are code in `benchmarks/render_bench.cpp`, and the routes it measures
+are the same `draw_walk` / `draw_tiled` / `draw_shared` / `draw_raytrace` the
+tests call — each raster route measured with its coverage branch and again with
+the branch blended away.
 That is the fix for how these figures went stale once already: they had been
 taken from scenes built by hand and never committed, so when 1/w joined the
 screen vertex — moving a binned triangle from nine floats to twelve — nothing
@@ -220,9 +221,59 @@ three edge functions and a normalisation for every triangle whatever the
 answer; the ray tracer stops at the first test that fails, which is most of
 them on a scene of small triangles.
 
-Removing the early exits would flatten the rate and issue more work. That trade
-is the shape of the whole problem, and it does not exist for the rasteriser at
-all.
+Removing the early exits would flatten the rate and issue more work. The
+rasteriser's version of that trade is the section below; the tracer's is still
+untried, and is the one worth doing next — its divergent region is four early
+exits rather than one shade, which is the shape predication needs.
+
+---
+
+## Branch against blend
+
+The masking comparison the project set out to make. `V_CMP_F32` yields exactly
+1.0 or 0.0, so coverage can select arithmetically instead of branching:
+
+```
+kept = take * new + (1 - take) * old
+```
+
+No lane disagrees, and the coverage test stops contributing to divergence
+altogether. The frames are bit-identical to the branch's — asserted with EQ,
+not NEAR, in `PredicationChangesTheCostAndNotThePixels`.
+
+| Scene | Triangles | walk | walk+pred | Change | tiled | tiled+pred | Change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| small, spread over the frame | 4 | 10,885,760 | 11,089,920 | **1.9%** | 2,372,224 | 2,397,184 | **1.1%** |
+| small, spread over the frame | 16 | 41,534,048 | 42,350,592 | **2.0%** | 6,210,144 | 6,309,888 | **1.6%** |
+| small, spread over the frame | 64 | 164,126,592 | 167,393,280 | **2.0%** | 31,756,160 | 32,360,448 | **1.9%** |
+| medium, stacked at the centre | 16 | 41,532,192 | 42,350,592 | **2.0%** | 21,526,304 | 21,935,104 | **1.9%** |
+| full-frame, stacked | 16 | 41,550,336 | 42,350,592 | **1.9%** | 41,980,416 | 42,780,672 | **1.9%** |
+
+**The branch wins every scene**, including the tiled route at 7.4% diverged —
+the highest rate any raster route reaches here. The plan predicted the opposite,
+that small triangles would favour the blend, and that prediction was written
+before anything was measured.
+
+The blend column barely moves: 42,350,592 for every 16-triangle scene whatever
+its shape. That is what predication means — every lane shades every triangle, so
+the cost stops depending on what is covered. The branch column moves with the
+scene because it still skips.
+
+What decides the trade is how much of the loop sits inside the branch. Here the
+three edge functions, the weights and the depth all sit outside it, and only the
+shade is inside; removing divergence from a small part of the loop cannot pay
+for running that part unconditionally. **Removing divergence and going faster
+are different things**, which is the result this table exists to record.
+
+Two details worth keeping:
+
+- `old + take*(new-old)` is the same select an instruction cheaper and is *not*
+  bit-exact — subtracting `old` and adding it back rounds. 69,715 pixels of
+  200,000 drifted, and at 64 triangles it changed the image.
+- The shared route does not reach zero divergence (0.02% at 128x128). Its
+  cooperative fill is a second source, and the coverage flag has no bearing on
+  it. An earlier test asserted a flat zero for all three routes and passed only
+  because its 64x32 frame had too few tiles to split the fill.
 
 ---
 
