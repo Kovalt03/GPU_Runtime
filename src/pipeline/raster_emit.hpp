@@ -32,3 +32,60 @@ inline void emit_shade(IRBuilder& k, Reg<Vec3> dst, Reg<Scalar> w0, Reg<Scalar> 
     k.copy_into(dst.component(1), k.mul(a2, inv_total));
     k.copy_into(dst.component(2), k.mul(a0, inv_total));
 }
+
+// Keeping a triangle that covered the pixel and beat the running best — the one
+// block every raster kernel ends its loop with, and the only place they differ
+// in how they treat a warp whose lanes disagree.
+//
+// Branching, the lanes a triangle covers run the shade while the rest wait.
+// Predicated, every lane shades and the result is kept arithmetically:
+//
+//   kept = take * new + (1 - take) * old
+//
+// take is exactly 1.0 or 0.0 out of V_CMP_F32, so one term survives whole and
+// the other is multiplied away. No lane disagrees, and the coverage test stops
+// contributing to the divergence rate — the shared kernel still reports a
+// little, from the cooperative fill this has no bearing on.
+//
+// old + take * (new - old) is the same select an instruction cheaper, and is
+// not exact: subtracting old and adding it back rounds, so a taken blend lands
+// near new rather than on it. Sixty-four triangles of that drift changed the
+// image, and a variant built to be compared against the branch has to agree
+// with it to the bit.
+//
+// The branch wins by about 2% on every scene in render_bench, tiled and untiled
+// alike, and predication's cost barely moves between them — every lane shading
+// every triangle is the same work whatever the scene contains. Removing
+// divergence and going faster turn out to be different things: what decides it
+// is how much of the loop sits inside the branch, and here most of the cost
+// (three edges, the weights, the depth) sits outside it.
+inline void emit_keep(IRBuilder& k, bool predicated, Reg<Scalar> take, Reg<Scalar> best_z,
+                      Reg<Vec3> best, Reg<Scalar> depth, Reg<Scalar> one, Reg<Scalar> w0,
+                      Reg<Scalar> w1, Reg<Scalar> w2, Reg<Scalar> iw0, Reg<Scalar> iw1,
+                      Reg<Scalar> iw2)
+{
+    if (!predicated) {
+        // Depth from the affine weights, colour from the corrected ones: NDC z
+        // is linear in screen space and an attribute is not.
+        k.if_(take, [&] {
+            k.copy_into(best_z, depth);
+            emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
+        });
+        return;
+    }
+
+    // Into a scratch range rather than into best: emit_shade overwrites what it
+    // is handed, and the blend below still needs the old value.
+    const Reg<Vec3> shaded = k.vec3();
+    emit_shade(k, shaded, w0, w1, w2, iw0, iw1, iw2);
+
+    const Reg<Scalar> keep = k.sub(one, take);
+    const auto blend = [&](Reg<Scalar> dst, Reg<Scalar> src) {
+        k.copy_into(dst, k.mul(dst, keep));
+        k.fma(dst, take, src);
+    };
+    blend(best_z, depth);
+    blend(best.component(0), shaded.component(0));
+    blend(best.component(1), shaded.component(1));
+    blend(best.component(2), shaded.component(2));
+}

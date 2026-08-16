@@ -30,13 +30,34 @@ struct RasterStageArgs {
     // them and keeps the nearest that covers it.
     uint32_t triangle_count = 0;
 
-    // Where the index buffer sits, for the indexed variant below. Three entries
-    // a triangle, each a vertex slot in the screen buffer.
+    // Where the index buffer sits, when indexed is set. Three entries a
+    // triangle, each a vertex slot in the screen buffer.
     //
     // Stored as floats: the ISA has no integer registers, and a float carries
     // whole numbers exactly to 2^24, which is more vertices than a scene here
     // will hold.
     size_t index_offset = 0;
+
+    // The two axes pass 2 varies along, both read on the host when the kernel
+    // is built. A KernelFunc runs once per launch, so choosing here costs no
+    // lane anything and only the chosen form reaches the instruction stream.
+    //
+    // They are flags rather than four separate builders because the axes are
+    // independent and each touches one block: indexed changes how a triangle's
+    // vertices are addressed, predicated changes what happens once coverage is
+    // known. Copies would have to be kept in step by hand, and a fix landing in
+    // three of four would leave the measurements quietly disagreeing — which is
+    // the failure separate copies were meant to prevent.
+
+    // Vertices come from the index buffer rather than three consecutive slots.
+    // Pass 1 then transforms each unique vertex once; this pass pays three
+    // dependent loads a triangle for it.
+    bool indexed = false;
+
+    // Coverage is blended rather than branched on: no lane is masked, and every
+    // lane pays for a shade it may discard. emit_keep holds both forms and what
+    // the trade measured out at.
+    bool predicated = false;
 };
 
 // Builds pass 2. args[0] must point at a RasterStageArgs that outlives the
@@ -51,42 +72,3 @@ Program build_raster_program(void** args);
 // wide along x so that one warp covers 32 horizontally adjacent pixels — which
 // is what makes a triangle edge split a warp rather than fall between them.
 void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);
-
-// The same pass 2, reading an index buffer rather than three consecutive
-// vertices per triangle.
-//
-// This is the half of indexing that costs something. Pass 1 saves a transform
-// for every triangle that shares a corner; here each triangle pays three
-// dependent loads — the index first, then the vertex it names — where the
-// flattened walk knew the address already.
-//
-// The two exist side by side because that trade is the measurement. Neither is
-// the successor of the other.
-Program build_indexed_raster_program(void** args);
-
-void run_indexed_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);
-
-// The same pass 2 with no branch in it — the second of the two ways a SIMT
-// machine can handle lanes that disagree.
-//
-// build_raster_program decides coverage and then jumps, so a warp split across
-// a triangle's edge issues both sides and masks half its lanes on each. This
-// kernel shades for every lane and keeps the result arithmetically:
-//
-//   kept = covered * new + (1 - covered) * old
-//
-// covered is 1.0 or 0.0, so one term survives and the other is multiplied away.
-// Every lane runs the same instructions, and divergence measures exactly zero.
-//
-// What that costs is a shade for lanes the triangle never covered. On the
-// scenes in render_bench the branch wins by about 2% throughout, because it
-// skips the shade outright whenever no lane of a warp is covered — which is
-// most warps, for triangles that do not fill the frame.
-//
-// Predication pays where warps straddle edges often, and the route it is
-// attached to straddles them least: the walk runs 1.3% diverged where the tiled
-// route runs 7.4%. Only the flattened walk has a predicated form today, so that
-// comparison is the one available, not the one that settles the question.
-Program build_predicated_raster_program(void** args);
-
-void run_predicated_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args);

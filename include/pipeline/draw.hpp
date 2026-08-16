@@ -80,12 +80,12 @@ struct DrawTarget {
 // Every pixel walks every triangle. The baseline the other two are measured
 // against, and O(pixels x triangles).
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world,
-                              const DrawTarget& target);
+                              const DrawTarget& target, bool predicated = false);
 
 // Triangles binned into screen tiles on the host, one block per tile, each
 // pixel walking only its own tile's list.
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& world,
-                               const DrawTarget& target);
+                               const DrawTarget& target, bool predicated = false);
 
 // As draw_tiled, with each tile's triangles staged through shared memory once
 // per block instead of read from global by every pixel.
@@ -94,12 +94,15 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& worl
 // is the same refusal run_shared_raster_stage makes — reported here so the
 // caller learns which scene it was.
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& world,
-                                const DrawTarget& target);
+                                const DrawTarget& target, bool predicated = false);
 
-// The naive walk again, with the coverage branch replaced by a blend. Same
-// frame, no divergence, and every lane paying for every triangle — which is the
-// trade the measurement is about.
-
+// draw_walk with the coverage branch blended instead. Kept as a name because
+// the branch against the blend is what the flag was added to measure; every
+// route here takes it, so the question can be put to any of them.
+//
+// Four distinct pass-2 programs answer it, not six: bin_triangles de-indexes on
+// the host, so the tiled and shared routes run the same kernel whether they
+// were handed a mesh or a vertex list, and only the walk has an indexed form.
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>& world,
                                     const DrawTarget& target);
 
@@ -116,29 +119,23 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& w
                                   const DrawTarget& target,
                                   const Shading& shading = Shading{});
 
-// The same four, taking a mesh.
+// The same four, taking a mesh. Each renders identically to the vertex list the
+// mesh expands to, which is what the tests assert.
 //
-// They flatten on the host and call the overloads above, so an indexed mesh
-// renders identically to the vertex list it expands to — which is what the
-// tests assert. Pass 1 still transforms one thread per flattened vertex; making
-// it transform each unique vertex once is a separate change, with a number
-// attached to it.
+// All four run pass 1 over the unique vertices, so a corner shared by six
+// triangles is transformed once. What they do with the index buffer afterwards
+// differs: the walk carries it into pass 2 and pays three dependent loads a
+// triangle, the tiled pair have already been de-indexed by bin_triangles, and
+// the ray tracer never had a vertex stage to save — see its overload.
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
-                              const DrawTarget& target);
+                              const DrawTarget& target, bool predicated = false);
 
-// Flattens, where draw_walk and the tiled pair take the indexed path — the
-// predicated kernel exists only as a variant of the flattened walk, one of the
-// six places {none, tiled, tiled+shared} x {flattened, indexed} offers it.
-//
-// So draw_walk(mesh) against draw_predicated(mesh) moves two axes at once and
-// answers neither question. Compare a branch against a blend by handing both
-// the same vertex list; use this overload to draw a mesh, not to measure one.
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
                                     const DrawTarget& target);
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
-                               const DrawTarget& target);
+                               const DrawTarget& target, bool predicated = false);
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
-                                const DrawTarget& target);
+                                const DrawTarget& target, bool predicated = false);
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
                                   const DrawTarget& target,
                                   const Shading& shading = Shading{});

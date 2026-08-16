@@ -273,7 +273,7 @@ size_t BufferPlan::binned_bytes(uint32_t width, uint32_t height, uint32_t triang
 }
 
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world,
-                              const DrawTarget& target)
+                              const DrawTarget& target, bool predicated)
 {
     const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
@@ -284,6 +284,7 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world
     args.width = target.width;
     args.height = target.height;
     args.triangle_count = static_cast<uint32_t>(world.size() / 3);
+    args.predicated = predicated;
     run_raster_stage(rt, args);
 
     return download(rt, b);
@@ -292,38 +293,30 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>& world,
                                     const DrawTarget& target)
 {
-    // draw_walk with one line changed, which is the point: the two differ in
-    // the kernel and in nothing else, so what the measurement compares is the
-    // branch against the blend.
-    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
-    run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-
-    RasterStageArgs args;
-    args.screen_offset = rt.myrt_device_offset(b.screen);
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
-    args.width = target.width;
-    args.height = target.height;
-    args.triangle_count = static_cast<uint32_t>(world.size() / 3);
-    run_predicated_raster_stage(rt, args);
-
-    return download(rt, b);
+    return draw_walk(rt, world, target, true);
 }
 
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& world,
-                               const DrawTarget& target)
+                               const DrawTarget& target, bool predicated)
 {
     const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-    run_tiled_raster_stage(rt, bin_and_upload(rt, world, target, b));
+
+    TiledRasterStageArgs args = bin_and_upload(rt, world, target, b);
+    args.predicated = predicated;
+    run_tiled_raster_stage(rt, args);
     return download(rt, b);
 }
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& world,
-                                const DrawTarget& target)
+                                const DrawTarget& target, bool predicated)
 {
     const Buffers b = upload(rt, world, raster_plan(world.size(), target));
     run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-    run_shared_raster_stage(rt, bin_and_upload(rt, world, target, b));
+
+    TiledRasterStageArgs args = bin_and_upload(rt, world, target, b);
+    args.predicated = predicated;
+    run_shared_raster_stage(rt, args);
     return download(rt, b);
 }
 
@@ -352,7 +345,7 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& w
 }
 
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
-                              const DrawTarget& target)
+                              const DrawTarget& target, bool predicated)
 {
     const Buffers b = upload(rt, mesh, target);
 
@@ -368,22 +361,20 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
     args.width = target.width;
     args.height = target.height;
     args.triangle_count = mesh.triangle_count();
-    run_indexed_raster_stage(rt, args);
+    args.indexed = true;
+    args.predicated = predicated;
+    run_raster_stage(rt, args);
     return download(rt, b);
 }
 
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
                                     const DrawTarget& target)
 {
-    // build_predicated_raster_program is a variant of the walk and reads three
-    // consecutive screen vertices, so the indexed screen buffer — one entry per
-    // unique vertex — is not a shape it can read. Flattening is what makes the
-    // overload possible at all until the fourth kernel exists.
-    return draw_predicated(rt, mesh.flattened(), target);
+    return draw_walk(rt, mesh, target, true);
 }
 
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
-                               const DrawTarget& target)
+                               const DrawTarget& target, bool predicated)
 {
     // Line for line the flattened route, and the kernel is the same program:
     // bin_triangles copies each triangle into every tile it reaches, so what
@@ -391,16 +382,21 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
     // nothing and saves it a transform per shared corner.
     const Buffers b = upload(rt, mesh, target);
     run_pass_one(rt, mesh.vertex_count(), target, b);
-    run_tiled_raster_stage(rt, bin_and_upload(rt, mesh, target, b));
+    TiledRasterStageArgs args = bin_and_upload(rt, mesh, target, b);
+    args.predicated = predicated;
+    run_tiled_raster_stage(rt, args);
     return download(rt, b);
 }
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
-                                const DrawTarget& target)
+                                const DrawTarget& target, bool predicated)
 {
     const Buffers b = upload(rt, mesh, target);
     run_pass_one(rt, mesh.vertex_count(), target, b);
-    run_shared_raster_stage(rt, bin_and_upload(rt, mesh, target, b));
+
+    TiledRasterStageArgs args = bin_and_upload(rt, mesh, target, b);
+    args.predicated = predicated;
+    run_shared_raster_stage(rt, args);
     return download(rt, b);
 }
 

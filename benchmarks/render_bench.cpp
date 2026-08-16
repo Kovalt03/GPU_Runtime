@@ -1,5 +1,6 @@
-// The four routes to one frame, over scenes chosen to make them disagree:
-// three rasteriser variants and the ray tracer.
+// The four routes to one frame, over scenes chosen to make them disagree: three
+// rasteriser variants and the ray tracer, plus the branch against the blend on
+// the two routes where that trade is worth reading.
 //
 // Both renderers run from one DrawTarget, so the camera cannot differ between
 // them — which is the whole basis of the comparison, and something the previous
@@ -18,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -89,18 +91,13 @@ struct Reading {
     std::string refused;
 };
 
-// draw_raytrace carries a defaulted argument the other three do not, so it
-// reaches measure through a wrapper of the shared shape rather than by widening
-// the signature for one caller.
-std::vector<Float3> trace(MyGPURuntime& rt, const std::vector<Float3>& world,
-                          const DrawTarget& t)
-{
-    return draw_raytrace(rt, world, t);
-}
+// A callable rather than a function pointer: the routes take defaulted
+// arguments that differ between them, and a caller naming one is what selects a
+// variant here.
+using Route = std::function<std::vector<Float3>(MyGPURuntime&, const std::vector<Float3>&,
+                                                const DrawTarget&)>;
 
-Reading measure(std::vector<Float3> (*route)(MyGPURuntime&, const std::vector<Float3>&,
-                                             const DrawTarget&),
-                const std::vector<Float3>& world)
+Reading measure(const Route& route, const std::vector<Float3>& world)
 {
     MyGPURuntime rt(1u << 26);
     Reading r;
@@ -125,6 +122,8 @@ struct Row {
     Reading tiled;
     Reading shared;
     Reading ray;
+    Reading walk_pred;
+    Reading tiled_pred;
 };
 
 double change(uint64_t from, uint64_t to)
@@ -163,15 +162,28 @@ int main(int argc, char** argv)
         {"full-frame, stacked", stacked(16, 4.0f)},
     };
 
+    // Spelling the pointer type out is what picks the vector overload of a route
+    // name that also has a Mesh one.
+    using Raster = std::vector<Float3> (*)(MyGPURuntime&, const std::vector<Float3>&,
+                                           const DrawTarget&, bool);
+    const auto route = [](Raster fn, bool predicated) {
+        return [fn, predicated](MyGPURuntime& rt, const std::vector<Float3>& w,
+                                const DrawTarget& t) { return fn(rt, w, t, predicated); };
+    };
+
     std::vector<Row> rows;
     for (const auto& [name, world] : scenes) {
         Row r;
         r.scene = name;
         r.triangles = static_cast<uint32_t>(world.size() / 3);
-        r.walk = measure(draw_walk, world);
-        r.tiled = measure(draw_tiled, world);
-        r.shared = measure(draw_shared, world);
-        r.ray = measure(trace, world);
+        r.walk = measure(route(draw_walk, false), world);
+        r.tiled = measure(route(draw_tiled, false), world);
+        r.shared = measure(route(draw_shared, false), world);
+        r.ray = measure([](MyGPURuntime& rt, const std::vector<Float3>& w,
+                           const DrawTarget& t) { return draw_raytrace(rt, w, t); },
+                        world);
+        r.walk_pred = measure(route(draw_walk, true), world);
+        r.tiled_pred = measure(route(draw_tiled, true), world);
         rows.push_back(r);
     }
 
@@ -197,6 +209,23 @@ int main(int argc, char** argv)
                     100.0 * r.shared.divergence, 100.0 * r.ray.divergence);
     }
 
+    // Its own table rather than two more columns above: the question is what a
+    // blend costs against the branch on the SAME route, so the pairs have to sit
+    // next to each other. Divergence goes to zero either way, so the figure that
+    // decides it is the work — a shade every lane runs against a shade only the
+    // covering lanes run.
+    std::printf("\n  %-30s %5s %13s %13s %9s %13s %13s %9s\n", "predication", "tris",
+                "walk", "+pred", "change", "tiled", "+pred", "change");
+    for (const Row& r : rows) {
+        std::printf("  %-30s %5u %13s %13s %8.1f%% %13s %13s %8.1f%%\n", r.scene.c_str(),
+                    r.triangles, with_commas(r.walk.weighted).c_str(),
+                    with_commas(r.walk_pred.weighted).c_str(),
+                    change(r.walk.weighted, r.walk_pred.weighted),
+                    with_commas(r.tiled.weighted).c_str(),
+                    with_commas(r.tiled_pred.weighted).c_str(),
+                    change(r.tiled.weighted, r.tiled_pred.weighted));
+    }
+
     std::ofstream csv(prefix + ".csv");
     if (!csv) {
         std::fprintf(stderr, "render_bench: cannot write %s.csv\n", prefix.c_str());
@@ -204,10 +233,10 @@ int main(int argc, char** argv)
     }
     csv << "scene,triangles,route,weighted_lane_ops,divergence_rate\n";
     for (const Row& r : rows) {
-        const std::pair<const char*, const Reading*> routes[] = {{"walk", &r.walk},
-                                                                 {"tiled", &r.tiled},
-                                                                 {"shared", &r.shared},
-                                                                 {"raytrace", &r.ray}};
+        const std::pair<const char*, const Reading*> routes[] = {
+            {"walk", &r.walk},           {"tiled", &r.tiled},
+            {"shared", &r.shared},       {"raytrace", &r.ray},
+            {"walk+pred", &r.walk_pred}, {"tiled+pred", &r.tiled_pred}};
         for (const auto& [name, reading] : routes) {
             csv << '"' << r.scene << "\"," << r.triangles << ',' << name << ','
                 << reading->weighted << ',' << reading->divergence << '\n';
@@ -251,6 +280,22 @@ int main(int argc, char** argv)
                       r.scene.c_str(), r.triangles, with_commas(r.walk.weighted).c_str(),
                       100.0 * r.walk.divergence, with_commas(r.ray.weighted).c_str(),
                       100.0 * r.ray.divergence);
+        md << buf;
+    }
+
+    md << "\n## Branch against blend\n\n"
+       << "| Scene | Triangles | walk | walk+pred | Change "
+          "| tiled | tiled+pred | Change |\n"
+       << "|---|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const Row& r : rows) {
+        std::snprintf(buf, sizeof(buf),
+                      "| %s | %u | %s | %s | **%.1f%%** | %s | %s | **%.1f%%** |\n",
+                      r.scene.c_str(), r.triangles, with_commas(r.walk.weighted).c_str(),
+                      with_commas(r.walk_pred.weighted).c_str(),
+                      change(r.walk.weighted, r.walk_pred.weighted),
+                      with_commas(r.tiled.weighted).c_str(),
+                      with_commas(r.tiled_pred.weighted).c_str(),
+                      change(r.tiled.weighted, r.tiled_pred.weighted));
         md << buf;
     }
 

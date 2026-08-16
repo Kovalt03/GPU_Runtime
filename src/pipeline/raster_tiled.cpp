@@ -176,12 +176,8 @@ Program build_tiled_raster_program(void** args)
             k.fma(depth, w2, z2);
 
             const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
-            // Depth from the affine weights, colour from the corrected ones:
-            // NDC z is linear in screen space and an attribute is not.
-            k.if_(take, [&] {
-                k.copy_into(best_z, depth);
-                emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
-            });
+            emit_keep(k, a.predicated, take, best_z, best, depth, one, w0, w1, w2, iw0,
+                      iw1, iw2);
 
             k.fma(tri_addr, stride, one);
             k.fma(i, one, one);
@@ -357,12 +353,8 @@ Program build_shared_raster_program(void** args)
             k.fma(depth, w2, z2);
 
             const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
-            // Depth from the affine weights, colour from the corrected ones:
-            // NDC z is linear in screen space and an attribute is not.
-            k.if_(take, [&] {
-                k.copy_into(best_z, depth);
-                emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
-            });
+            emit_keep(k, a.predicated, take, best_z, best, depth, one, w0, w1, w2, iw0,
+                      iw1, iw2);
 
             k.fma(shared_addr, shared_stride, one);
             k.fma(i, one, one);

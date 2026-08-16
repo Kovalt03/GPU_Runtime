@@ -81,6 +81,17 @@ struct TiledRasterStageArgs {
     // The fullest tile in the binning. Only the shared-memory variant needs
     // it, to refuse a tile it cannot hold; the global-memory one ignores it.
     uint32_t max_tile_triangles = 0;
+
+    // Coverage is blended rather than branched on, as in RasterStageArgs. Read
+    // on the host when the kernel is built, so the flag costs no lane anything
+    // and only the chosen form reaches the instruction stream.
+    //
+    // The route with the most divergence to remove: a tile's pixels see only
+    // the triangles that reach them, so warps straddle an edge far more often —
+    // 7.4% diverged against the walk's 1.3% on the same scene. It still comes
+    // out about 2% dearer than the branch, which is what makes the pair worth
+    // measuring rather than assuming.
+    bool predicated = false;
 };
 
 // Builds the tiled pass 2. Same picture as build_raster_program, reached by
