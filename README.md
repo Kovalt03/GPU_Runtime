@@ -166,6 +166,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # An .obj down every route, compared pixel for pixel
 ./build/kernels/mesh_render assets/sphere.obj
+
+# Summing a warp: shared memory against the lane exchange
+./build/benchmarks/reduction_bench          # benchmarks/result/reduction.{md,csv}
 ```
 
 ### Formatting
@@ -196,6 +199,7 @@ on their own line, `int* ptr`.
 | Rasteriser, staged through shared memory | **-96%** against the naive walk |
 | Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
 | Predication against the branch (raster / ray) | **+2%** / **+4.4%**, divergence to zero |
+| Warp reduction, exchange against shared memory | **33** instructions against 68 |
 | Opcodes | 30 |
 | Tests | 247 |
 
@@ -334,6 +338,29 @@ The blend is written as `take*new + (1-take)*old` rather than the cheaper
 64 triangles that reached the image. A variant built to be compared against the
 branch has to agree with it to the bit.
 
+### Lanes talking, rather than lanes disagreeing
+
+Everything above is about warps that split. The other half of a SIMT machine is
+warps that cooperate, and until `S_BALLOT` and `V_SHUFFLE_F32` the ISA could not
+express it — summing 32 lanes meant a round trip through shared memory.
+
+| Summing a warp | Instructions | Warp steps |
+|---|---:|---:|
+| through shared memory | 68 | 68 |
+| through the lane exchange | **33** | **33** |
+
+Five rounds either way, the live values halving each time. A round through
+shared memory is a store, a barrier, a load, a second barrier and the addressing
+for both ends; through the exchange it is one instruction.
+
+That measurement is also what priced the primitives. They sat at 1 while
+unmeasured, so weighting by them would only have reported the guess back —
+instead the weighting is turned around to ask how expensive a shuffle would have
+to be before the two came level. It is 22, so the 8 they now carry, the same as
+a shared load, is the conservative end. And the comparison understates shared
+memory rather than the exchange: this machine charges nothing for a barrier's
+stall, which on hardware is most of what a barrier is.
+
 Every figure above is reproducible from a committed scene, and each names the
 tool that produced it: the frame-level tables come from
 `./build/benchmarks/render_bench`, which defines its scenes in code and drives
@@ -341,7 +368,7 @@ the same routes the tests call; the per-pass index-buffer figures come from
 `./build/kernels/mesh_render` reading `assets/`, because the draw routes clear
 the counters between passes and a caller otherwise reads pass 2 alone; the ACMR
 numbers come from `simulated_cache_misses`, which scores a mesh rather than
-running one.
+running one; the reduction comes from `./build/benchmarks/reduction_bench`.
 
 Both renderers take their camera from one `DrawTarget`, so a comparison between
 them cannot be of two different views. `benchmarks/RESULTS.md` carries the full
