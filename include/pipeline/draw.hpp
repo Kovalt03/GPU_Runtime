@@ -202,6 +202,13 @@ DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh);
 // to the target rather than to the model.
 struct DeviceFrame {
     void* pixels = nullptr;
+
+    // One float a pixel, written by a depth prepass and read by the pass that
+    // follows it. Allocated with the frame rather than on demand: it is the same
+    // size as a quarter of the colour buffer and a route that wants one wants it
+    // for the frame's whole life.
+    void* depth = nullptr;
+
     uint32_t width = 0;
     uint32_t height = 0;
 };
@@ -249,6 +256,21 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geomet
                                   const DeviceFrame& frame, const DrawTarget& target,
                                   const Shading& shading = Shading{},
                                   bool predicated = false);
+
+// The walk again, with a depth prepass in front of it.
+//
+// Two launches over the same geometry: the first keeps the nearest depth a pixel
+// and colours nothing, the second colours only the triangle that depth names. A
+// pixel is therefore shaded once however many triangles cover it, which is what
+// makes it worth having on a scene with depth complexity — and it walks every
+// triangle twice, which is what makes it a trade rather than a saving.
+//
+// Unlike the routes above this does not sync between its passes, so the counters
+// a caller reads hold both. Against draw_walk's single pass, which is the
+// comparison the trade is about.
+std::vector<Float3> draw_early_z(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                 const DeviceFrame& frame, const DrawTarget& target,
+                                 const Shading& shading = Shading{});
 
 // What pass 1 costs on its own.
 //

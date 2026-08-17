@@ -67,11 +67,21 @@ Program build_raster_program(void** args)
         //
         // Started beyond the far plane so the first covering triangle takes it.
         const Reg<Scalar> best_z = k.constant(2.0f);
+
+        // Where this pixel's depth lives, and — under EarlyZ — what the prepass
+        // decided. One load before the loop rather than one a triangle: the
+        // answer does not change while the walk runs.
+        const Reg<Scalar> pixel =
+            k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
+        const Reg<Scalar> depth_addr =
+            k.add(k.constant(static_cast<float>(a.depth_offset)),
+                  k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
+        const Reg<Scalar> visible_z =
+            a.depth == DepthUse::EarlyZ ? k.load(depth_addr) : k.constant(2.0f);
         const Reg<Vec3> best = k.vec3();
         k.set(best.component(0), 0.0f);
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
-
 
         // The cursor walks the buffer, the counter ends the loop. Both advance
         // through fma, the only opcode that accumulates in place.
@@ -208,7 +218,18 @@ Program build_raster_program(void** args)
 
         // Both conditions folded into one flag: covered, and nearer than
         // anything kept so far.
-        const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
+        //
+        // Under EarlyZ the second half is a different question — not "nearer
+        // than what I have seen" but "as near as the prepass says anything gets"
+        // — and only the triangle that owns the pixel passes it. Which is the
+        // whole point: the shade below runs once instead of once a triangle.
+        //
+        // Less-or-equal rather than equal. The prepass computes this depth with
+        // these instructions in this order, so the winner's value is the one
+        // stored, bit for bit; LE says the same thing without resting on that.
+        const Reg<Scalar> take = a.depth == DepthUse::EarlyZ
+                                     ? k.min(inside, k.le(depth, visible_z))
+                                     : k.min(inside, k.lt(depth, best_z));
 
         // What a kept pixel is coloured with. Barycentric reads nothing beyond
         // the weights; Diffuse reads the world vertices pass 1 projected and the
@@ -269,7 +290,14 @@ Program build_raster_program(void** args)
             k.copy_into(dst.component(2), lit.component(2));
         };
 
-        emit_keep(k, a.predicated, take, best_z, best, depth, one, shade);
+        // The prepass keeps the depth and colours nothing, which is the half of
+        // the work early-Z exists to do twice rather than shade twice.
+        const auto keep_depth_only = [&](Reg<Vec3>) {};
+        if (a.depth == DepthUse::Prepass) {
+            emit_keep(k, a.predicated, take, best_z, best, depth, one, keep_depth_only);
+        } else {
+            emit_keep(k, a.predicated, take, best_z, best, depth, one, shade);
+        }
 
         k.fma(cursor, stride, one);
         k.fma(i, one, one);
@@ -278,15 +306,17 @@ Program build_raster_program(void** args)
         // One store after the whole walk, rather than one per triangle. Every
         // in-image lane runs it together: the divergence above is the cost of
         // deciding a colour, not of writing one.
-        const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
-        const Reg<Scalar> index = k.add(row, px);
-        const Reg<Scalar> addr =
-            k.mul(index, k.constant(static_cast<float>(PIXEL_BYTES)));
+        if (a.depth == DepthUse::Prepass) {
+            k.store(depth_addr, best_z, 0.0f);
+        } else {
+            const Reg<Scalar> addr =
+                k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
 
-        const float frame_base = static_cast<float>(a.framebuffer_offset);
-        k.store(addr, best.component(0), frame_base + 0.0f);
-        k.store(addr, best.component(1), frame_base + 4.0f);
-        k.store(addr, best.component(2), frame_base + 8.0f);
+            const float frame_base = static_cast<float>(a.framebuffer_offset);
+            k.store(addr, best.component(0), frame_base + 0.0f);
+            k.store(addr, best.component(1), frame_base + 4.0f);
+            k.store(addr, best.component(2), frame_base + 8.0f);
+        }
     });
 
     // No matrix, which is the other half of why the pipeline is split: pass 1

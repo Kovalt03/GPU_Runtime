@@ -92,3 +92,27 @@ struct Shading {
 inline constexpr uint32_t FACE_NORMAL_FLOATS = 3;
 inline constexpr uint32_t FACE_NORMAL_BYTES = FACE_NORMAL_FLOATS * sizeof(float);
 
+// --- depth -------------------------------------------------------------------
+// What a raster launch does with the depth buffer.
+//
+// A depth prepass is two launches over the same geometry: the first keeps the
+// nearest depth a pixel and colours nothing, the second colours only the
+// triangle that depth names. What it buys is that a pixel is shaded once instead
+// of once per covering triangle; what it costs is a second walk of every
+// triangle, which is not cheap here — coverage is most of the loop.
+enum class DepthUse {
+    // No depth buffer. The running best in a register is all a single-pass walk
+    // needs, one thread owning one pixel outright.
+    None,
+
+    // Write the nearest depth and shade nothing.
+    Prepass,
+
+    // Read it, and shade only the triangle that owns the pixel.
+    EarlyZ,
+};
+
+// One float a pixel. Separate from the colour buffer rather than a fourth
+// channel of it, because the prepass writes only this and the frame is read back
+// as RGB.
+inline constexpr uint32_t DEPTH_BYTES = sizeof(float);

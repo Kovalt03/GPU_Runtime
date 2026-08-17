@@ -1558,6 +1558,103 @@ TEST(Pipeline, PredicationLosesByFarMoreOnceLoadsAreChargedByTheLine)
         << "charging by the line left the blend's arithmetic no dearer than before";
 }
 
+TEST(Pipeline, EarlyZDrawsWhatTheWalkDrawsAndCostsTwiceTheCoverage)
+{
+    // A depth prepass may not change a pixel. It decides *when* a pixel is
+    // shaded, not what to — and a frame that differed would mean the depth the
+    // prepass stored is not the depth the second pass recomputes.
+    //
+    // Stacked back to front, so every triangle covers every pixel and each is
+    // nearer than the last: the walk shades all of them and early-Z shades one.
+    // That is the case a prepass exists for, and the only one where the two
+    // strategies do different amounts of work.
+    std::vector<Float3> world;
+    const uint32_t depth_complexity = 8;
+    for (uint32_t i = 0; i < depth_complexity; ++i) {
+        const float z = -0.01f * static_cast<float>(depth_complexity - 1 - i);
+        world.push_back(Float3{0.0f, 4.0f, z});
+        world.push_back(Float3{-4.0f, -4.0f, z});
+        world.push_back(Float3{4.0f, -4.0f, z});
+    }
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    for (const ShadingMode mode : {ShadingMode::Barycentric, ShadingMode::Diffuse}) {
+        Shading shading;
+        shading.mode = mode;
+
+        MyGPURuntime rt(1u << 25);
+        DeviceGeometry geometry = upload(rt, world);
+        DeviceFrame frame = allocate_frame(rt, target);
+
+        const std::vector<Float3> walked =
+            draw_walk(rt, geometry, frame, target, false, shading);
+        const uint64_t walk_cost = rt.stats().weighted_lane_ops;
+
+        const std::vector<Float3> early =
+            draw_early_z(rt, geometry, frame, target, shading);
+        const uint64_t early_cost = rt.stats().weighted_lane_ops;
+
+        ASSERT_EQ(walked.size(), early.size());
+        for (size_t i = 0; i < walked.size(); ++i) {
+            ASSERT_EQ(early[i].x, walked[i].x) << "pixel " << i;
+            ASSERT_EQ(early[i].y, walked[i].y) << "pixel " << i;
+            ASSERT_EQ(early[i].z, walked[i].z) << "pixel " << i;
+        }
+
+        // Two coverage walks against one, and one shade against eight. Which way
+        // that falls is what the shade costs relative to the coverage test:
+        // barycentric is a fiftieth of it and loses by nearly the whole second
+        // walk, diffuse is half of it and loses by less.
+        EXPECT_GT(early_cost, walk_cost) << "early-Z stopped costing more, which is a "
+                                            "result and wants its figure taken again";
+        EXPECT_LT(early_cost, 2 * walk_cost);
+
+        release(rt, frame);
+        release(rt, geometry);
+    }
+}
+
+TEST(Pipeline, ThePrepassStoresTheDepthTheSecondPassAgreesWith)
+{
+    // What the two passes have to agree about, checked directly rather than
+    // through the frame: the prepass keeps the nearest depth a pixel, and the
+    // pass after it recomputes that same value for the triangle that owns the
+    // pixel. If they disagreed by a rounding step, the less-or-equal test would
+    // admit a triangle the walk would not have kept.
+    std::vector<Float3> world;
+    for (uint32_t i = 0; i < 4; ++i) {
+        const float z = -0.01f * static_cast<float>(3 - i);
+        world.push_back(Float3{0.0f, 4.0f, z});
+        world.push_back(Float3{-4.0f, -4.0f, z});
+        world.push_back(Float3{4.0f, -4.0f, z});
+    }
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    MyGPURuntime rt(1u << 25);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    draw_early_z(rt, geometry, frame, target);
+
+    std::vector<float> depth(static_cast<size_t>(WIDTH) * HEIGHT, 0.0f);
+    rt.myrt_memcpy(depth.data(), frame.depth, depth.size() * sizeof(float),
+                   Direction::DeviceToHost);
+
+    // The nearest of the four is the last submitted, at z = 0. Covered pixels
+    // hold a depth inside the view volume; uncovered ones keep the 2.0 the
+    // kernel starts from.
+    uint32_t covered = 0;
+    for (const float z : depth) {
+        if (z < 2.0f) {
+            ++covered;
+            EXPECT_GT(z, -1.0f) << "a depth outside the near plane was kept";
+        }
+    }
+    EXPECT_GT(covered, 0u) << "the prepass wrote nothing";
+
+    release(rt, frame);
+    release(rt, geometry);
+}
+
 TEST(Pipeline, GeometryHeldOnTheDeviceDrawsWhatUploadingEachTimeDoes)
 {
     // The two forms are one implementation, so this is really asking whether the

@@ -287,8 +287,9 @@ DeviceFrame allocate_frame(MyGPURuntime& rt, const DrawTarget& target)
     DeviceFrame frame;
     frame.width = target.width;
     frame.height = target.height;
-    frame.pixels =
-        rt.myrt_malloc(static_cast<size_t>(target.width) * target.height * PIXEL_BYTES);
+    const size_t pixels = static_cast<size_t>(target.width) * target.height;
+    frame.pixels = rt.myrt_malloc(pixels * PIXEL_BYTES);
+    frame.depth = rt.myrt_malloc(pixels * DEPTH_BYTES);
     return frame;
 }
 
@@ -311,6 +312,7 @@ void release(MyGPURuntime& rt, DeviceGeometry& geometry)
 void release(MyGPURuntime& rt, DeviceFrame& frame)
 {
     rt.myrt_free(frame.pixels);
+    rt.myrt_free(frame.depth);
     frame = DeviceFrame{};
 }
 
@@ -345,6 +347,45 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
         args.indexed = true;
         args.index_offset = rt.myrt_device_offset(geometry.index);
     }
+    run_raster_stage(rt, args);
+    return download(rt, frame);
+}
+
+std::vector<Float3> draw_early_z(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                 const DeviceFrame& frame, const DrawTarget& target,
+                                 const Shading& shading)
+{
+    if (shading.mode == ShadingMode::Diffuse && geometry.normals == nullptr) {
+        throw std::runtime_error(
+            "draw_early_z: lighting needs the face normals, and this geometry was "
+            "uploaded without a vertex stage");
+    }
+
+    run_pass_one(rt, geometry, target);
+
+    RasterStageArgs args;
+    args.screen_offset = rt.myrt_device_offset(geometry.screen);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.depth_offset = rt.myrt_device_offset(frame.depth);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = geometry.triangle_count;
+    args.shading = shading;
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.normal_offset =
+        geometry.normals == nullptr ? 0 : rt.myrt_device_offset(geometry.normals);
+    if (geometry.indexed()) {
+        args.indexed = true;
+        args.index_offset = rt.myrt_device_offset(geometry.index);
+    }
+
+    // No sync between them: what a caller reads is both passes, which is the
+    // figure the trade is about. The prepass's stores are what the second launch
+    // loads, and myrt_launch returning is what orders them.
+    args.depth = DepthUse::Prepass;
+    run_raster_stage(rt, args);
+
+    args.depth = DepthUse::EarlyZ;
     run_raster_stage(rt, args);
     return download(rt, frame);
 }

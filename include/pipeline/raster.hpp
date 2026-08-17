@@ -72,6 +72,15 @@ struct RasterStageArgs {
     Shading shading;
     size_t world_offset = 0;
     size_t normal_offset = 0;
+
+    // What this launch does with the depth buffer, which is how a depth prepass
+    // is expressed: two launches of one kernel builder rather than two builders.
+    //
+    // The buffer itself is one float a pixel and is the same buffer both times —
+    // Prepass fills it, EarlyZ reads it. None never touches it, and is what
+    // every route did before this existed.
+    DepthUse depth = DepthUse::None;
+    size_t depth_offset = 0;
 };
 
 // Builds pass 2. args[0] must point at a RasterStageArgs that outlives the
