@@ -1472,6 +1472,117 @@ TEST(Pipeline, PredicationLosesByFarMoreOnceLoadsAreChargedByTheLine)
         << "charging by the line left the blend's arithmetic no dearer than before";
 }
 
+TEST(Pipeline, GeometryHeldOnTheDeviceDrawsWhatUploadingEachTimeDoes)
+{
+    // The two forms are one implementation, so this is really asking whether the
+    // one-shot wrappers still hand their buffers to the same routes. A pixel is
+    // the strictest thing to compare and the cheapest to get wrong.
+    const Mesh cube = cube_mesh();
+    const std::vector<Float3> flat = cube.flattened();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime rt(1u << 24);
+    DeviceGeometry indexed = upload(rt, cube);
+    DeviceGeometry flattened = upload(rt, flat);
+    DeviceGeometry world_only = upload(rt, flat, VertexStage::None);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    MyGPURuntime once(1u << 24);
+    const auto same = [](const std::vector<Float3>& a, const std::vector<Float3>& b,
+                         const char* what) {
+        ASSERT_EQ(a.size(), b.size()) << what;
+        for (size_t i = 0; i < a.size(); ++i) {
+            ASSERT_EQ(a[i].x, b[i].x) << what << " pixel " << i;
+            ASSERT_EQ(a[i].y, b[i].y) << what << " pixel " << i;
+            ASSERT_EQ(a[i].z, b[i].z) << what << " pixel " << i;
+        }
+    };
+
+    same(draw_walk(rt, indexed, frame, target), draw_walk(once, cube, target),
+         "walk, indexed");
+    same(draw_walk(rt, flattened, frame, target), draw_walk(once, flat, target),
+         "walk, flattened");
+    same(draw_tiled(rt, indexed, frame, target), draw_tiled(once, cube, target), "tiled");
+    same(draw_shared(rt, flattened, frame, target), draw_shared(once, flat, target),
+         "shared");
+    same(draw_raytrace(rt, world_only, frame, target), draw_raytrace(once, flat, target),
+         "raytrace");
+
+    // The route with no vertex stage cannot take an index buffer, and says so
+    // rather than resolving one: an index list exists to feed the transform this
+    // route does not have.
+    EXPECT_THROW(draw_raytrace(rt, indexed, frame, target), std::runtime_error);
+
+    release(rt, frame);
+    release(rt, world_only);
+    release(rt, flattened);
+    release(rt, indexed);
+}
+
+TEST(Pipeline, ASecondDrawOfResidentGeometryFindsItAlreadyThere)
+{
+    // What uploading once is for. Every miss this project has measured was
+    // compulsory, because a draw abandoned its buffers and the next one asked
+    // about a fresh address; holding the geometry, the second draw reads the
+    // lines the first one fetched.
+    const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime rt(1u << 26);
+    rt.myrt_set_memory_model(MemoryModel::Cached);
+    DeviceGeometry geometry = upload(rt, sphere);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    // Read after the draw rather than differenced across it: the sync between
+    // the passes clears the counters, so what stands afterwards is pass 2 alone.
+    const auto misses = [&rt, &geometry, &frame, &target] {
+        draw_walk(rt, geometry, frame, target);
+        return rt.stats().cache_misses;
+    };
+
+    const uint64_t first = misses();
+    const uint64_t second = misses();
+    EXPECT_GT(first, 0u);
+    EXPECT_EQ(second, 0u) << "the second draw refetched what the first had left";
+
+    // And the other half of the claim: uploading again replaces the bytes under
+    // those lines, so the draw after it has to fetch them again. Only the
+    // buffers uploaded — pass 1 rewrites the screen buffer through the kernel,
+    // which the cache does see.
+    DeviceGeometry again = upload(rt, sphere);
+    release(rt, geometry);
+    geometry = again;
+    EXPECT_GT(misses(), second) << "an upload was mistaken for the data already there";
+
+    release(rt, frame);
+    release(rt, geometry);
+}
+
+TEST(Pipeline, ReleasedGeometryIsHandedBackToTheAllocator)
+{
+    // myrt_free's first use outside the tests, and the reason a benchmark can
+    // draw a scene a hundred times: an arena this small holds two copies of the
+    // sphere at once and nothing like a hundred.
+    const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    MyGPURuntime rt(1u << 18);
+    const size_t free_at_rest = rt.myrt_device_free_bytes();
+
+    for (int i = 0; i < 100; ++i) {
+        DeviceGeometry geometry = upload(rt, sphere);
+        DeviceFrame frame = allocate_frame(rt, target);
+        ASSERT_LT(rt.myrt_device_free_bytes(), free_at_rest);
+        release(rt, frame);
+        release(rt, geometry);
+    }
+
+    // Byte for byte, not merely enough to go round again: a free list that gave
+    // back slightly less each time would pass a hundred rounds and fail a
+    // thousand.
+    EXPECT_EQ(rt.myrt_device_free_bytes(), free_at_rest);
+}
+
 TEST(Pipeline, EveryRouteDrawsTheSameCube)
 {
     const Mesh cube = cube_mesh();

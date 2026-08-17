@@ -50,6 +50,11 @@ size_t MyGPURuntime::myrt_device_offset(const void* ptr) const
     return mem_->device_offset(ptr);
 }
 
+size_t MyGPURuntime::myrt_device_free_bytes() const
+{
+    return mem_->device_free_bytes();
+}
+
 void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** args)
 {
     if (grid.volume() == 0 || block.volume() == 0) {

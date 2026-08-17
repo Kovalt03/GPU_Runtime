@@ -70,6 +70,12 @@ public:
     // a host pointer, so this is how a buffer's address reaches a register.
     size_t myrt_device_offset(const void* ptr) const;
 
+    // How much of the device arena is unallocated. cudaMemGetInfo's half of the
+    // pair, and what says whether releasing a buffer actually returned it —
+    // MemoryManager coalesces on free, so a run that hands everything back ends
+    // exactly where it started rather than merely close to it.
+    size_t myrt_device_free_bytes() const;
+
     // --- execution ----------------------------------------------------------
     // Runs kernel(args) over grid x block threads. Execution is synchronous:
     // the call returns once every thread has retired. Throws

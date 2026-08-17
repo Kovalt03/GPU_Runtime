@@ -11,99 +11,31 @@
 
 namespace {
 
-// One device buffer per thing the passes address by offset. Held together so
-// the three routes cannot disagree about which one is which.
-struct Buffers {
-    void* world = nullptr;
-    void* screen = nullptr;
-    void* frame = nullptr;
-    size_t frame_bytes = 0;
+// Releases whatever it was handed when the scope ends, so that the convenience
+// overloads leak nothing even when a route refuses — draw_shared throws on a
+// tile it cannot stage, and that is a supported answer rather than a failure.
+template <typename Handle>
+struct Owned {
+    MyGPURuntime& rt;
+    Handle& handle;
 
-    // Null for the routes that take a flattened vertex list, which name their
-    // triangles by position rather than by index.
-    void* index = nullptr;
+    ~Owned()
+    {
+        release(rt, handle);
+    }
 };
-
-// Allocates exactly what the plan names, and nothing it does not. A zero
-// count means the buffer is not bound at all, and its pointer stays null.
-Buffers upload(MyGPURuntime& rt, const std::vector<Float3>& world, const BufferPlan& plan)
-{
-    Buffers b;
-    const size_t world_bytes =
-        static_cast<size_t>(plan.world_vertices) * WORLD_VERTEX_BYTES;
-    b.frame_bytes = static_cast<size_t>(plan.width) * plan.height * PIXEL_BYTES;
-
-    b.world = rt.myrt_malloc(world_bytes);
-    if (plan.screen_vertices > 0) {
-        b.screen = rt.myrt_malloc(static_cast<size_t>(plan.screen_vertices) *
-                                  SCREEN_VERTEX_BYTES);
-    }
-    if (b.frame_bytes > 0) {
-        b.frame = rt.myrt_malloc(b.frame_bytes);
-    }
-
-    std::vector<float> flat;
-    flat.reserve(world.size() * WORLD_VERTEX_FLOATS);
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(b.world, flat.data(), world_bytes, Direction::HostToDevice);
-    return b;
-}
-
-// A plan for the routes that project first: one screen vertex per world vertex,
-// and a framebuffer the size of the target.
-BufferPlan raster_plan(size_t vertices, const DrawTarget& target)
-{
-    BufferPlan plan;
-    plan.world_vertices = static_cast<uint32_t>(vertices);
-    plan.screen_vertices = static_cast<uint32_t>(vertices);
-    plan.width = target.width;
-    plan.height = target.height;
-    return plan;
-}
-
-// The same, for an indexed mesh.
-//
-// The vertex half delegates, and handing over mesh.vertices rather than
-// mesh.flattened() is what sizes both the world buffer and the screen buffer by
-// the unique count — a cube reserves eight screen slots where the flattened
-// list needed thirty-six.
-Buffers upload(MyGPURuntime& rt, const Mesh& mesh, const DrawTarget& target)
-{
-    BufferPlan plan = raster_plan(mesh.vertex_count(), target);
-    plan.indices = static_cast<uint32_t>(mesh.indices.size());
-    Buffers b = upload(rt, mesh.vertices, plan);
-
-    // Indices reach the device as floats: the ISA has no integer registers, and
-    // the kernel multiplies an index by a vertex stride to get an address, so
-    // it wants a float there anyway. Whole numbers are exact to 2^24, which is
-    // more vertices than a scene here will hold.
-    std::vector<float> as_floats;
-    as_floats.reserve(mesh.indices.size());
-    for (uint32_t i : mesh.indices) {
-        as_floats.push_back(static_cast<float>(i));
-    }
-
-    const size_t index_bytes = as_floats.size() * sizeof(float);
-    b.index = rt.myrt_malloc(index_bytes);
-    rt.myrt_memcpy(b.index, as_floats.data(), index_bytes, Direction::HostToDevice);
-    return b;
-}
 
 // vertex_count rather than the vertices themselves, because that is all pass 1
 // depends on: build_vertex_program transforms slot i into slot i and never asks
 // whether i is shared.
-void run_pass_one(MyGPURuntime& rt, uint32_t vertex_count, const DrawTarget& target,
-                  const Buffers& b)
+void run_pass_one(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                  const DrawTarget& target)
 {
     VertexStageArgs args;
     args.view_projection = target.camera.view_projection(target.aspect());
-    args.world_offset = rt.myrt_device_offset(b.world);
-    args.screen_offset = rt.myrt_device_offset(b.screen);
-    args.vertex_count = vertex_count;
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.screen_offset = rt.myrt_device_offset(geometry.screen);
+    args.vertex_count = geometry.vertex_count;
     args.width = target.width;
     args.height = target.height;
     run_vertex_stage(rt, args);
@@ -117,12 +49,12 @@ void run_pass_one(MyGPURuntime& rt, uint32_t vertex_count, const DrawTarget& tar
 // Binning reads the projected vertices, so it happens after pass 1 — on the
 // host, which means reading them back first. Real hardware bins in a geometry
 // stage without the round trip.
-std::vector<ScreenTriangle> read_back_triangles(MyGPURuntime& rt,
-                                                const std::vector<Float3>& world,
-                                                const Buffers& b)
+std::vector<ScreenTriangle> read_back_flattened(MyGPURuntime& rt,
+                                                const DeviceGeometry& geometry)
 {
-    std::vector<float> screen(world.size() * SCREEN_VERTEX_FLOATS, 0.0f);
-    rt.myrt_memcpy(screen.data(), b.screen, screen.size() * sizeof(float),
+    std::vector<float> screen(
+        static_cast<size_t>(geometry.vertex_count) * SCREEN_VERTEX_FLOATS, 0.0f);
+    rt.myrt_memcpy(screen.data(), geometry.screen, screen.size() * sizeof(float),
                    Direction::DeviceToHost);
 
     std::vector<ScreenTriangle> triangles;
@@ -147,11 +79,12 @@ std::vector<ScreenTriangle> read_back_triangles(MyGPURuntime& rt,
 //
 // This is the only place the two forms differ. bin_triangles and everything
 // below it sees a list of ScreenTriangle and never learns an index existed.
-std::vector<ScreenTriangle> read_back_triangles(MyGPURuntime& rt, const Mesh& mesh,
-                                                const Buffers& b)
+std::vector<ScreenTriangle> read_back_indexed(MyGPURuntime& rt,
+                                              const DeviceGeometry& geometry)
 {
-    std::vector<float> screen(mesh.vertex_count() * SCREEN_VERTEX_FLOATS, 0.0f);
-    rt.myrt_memcpy(screen.data(), b.screen, screen.size() * sizeof(float),
+    std::vector<float> screen(
+        static_cast<size_t>(geometry.vertex_count) * SCREEN_VERTEX_FLOATS, 0.0f);
+    rt.myrt_memcpy(screen.data(), geometry.screen, screen.size() * sizeof(float),
                    Direction::DeviceToHost);
 
     const auto at = [&screen](uint32_t i) {
@@ -161,19 +94,29 @@ std::vector<ScreenTriangle> read_back_triangles(MyGPURuntime& rt, const Mesh& me
     };
 
     std::vector<ScreenTriangle> triangles;
-    for (size_t t = 0; t < mesh.triangle_count(); ++t) {
-        const auto [v0, iw0] = at(mesh.indices[t * 3 + 0]);
-        const auto [v1, iw1] = at(mesh.indices[t * 3 + 1]);
-        const auto [v2, iw2] = at(mesh.indices[t * 3 + 2]);
+    for (size_t t = 0; t < geometry.triangle_count; ++t) {
+        const auto [v0, iw0] = at(geometry.indices[t * 3 + 0]);
+        const auto [v1, iw1] = at(geometry.indices[t * 3 + 1]);
+        const auto [v2, iw2] = at(geometry.indices[t * 3 + 2]);
         triangles.push_back(ScreenTriangle{v0, v1, v2, iw0, iw1, iw2});
     }
     return triangles;
 }
 
-std::vector<Float3> download(MyGPURuntime& rt, const Buffers& b)
+// Which of the two the handle wants, so that no route has to ask.
+std::vector<ScreenTriangle> read_back_triangles(MyGPURuntime& rt,
+                                                const DeviceGeometry& geometry)
 {
-    std::vector<float> out(b.frame_bytes / sizeof(float), 0.0f);
-    rt.myrt_memcpy(out.data(), b.frame, b.frame_bytes, Direction::DeviceToHost);
+    return geometry.indexed() ? read_back_indexed(rt, geometry)
+                              : read_back_flattened(rt, geometry);
+}
+
+std::vector<Float3> download(MyGPURuntime& rt, const DeviceFrame& frame_buffer)
+{
+    const size_t bytes =
+        static_cast<size_t>(frame_buffer.width) * frame_buffer.height * PIXEL_BYTES;
+    std::vector<float> out(bytes / sizeof(float), 0.0f);
+    rt.myrt_memcpy(out.data(), frame_buffer.pixels, bytes, Direction::DeviceToHost);
 
     std::vector<Float3> frame;
     frame.reserve(out.size() / PIXEL_FLOATS);
@@ -186,11 +129,15 @@ std::vector<Float3> download(MyGPURuntime& rt, const Buffers& b)
 // The half the two tiled routes share: bin, upload the runs, fill in the
 // offsets. max_tile_triangles is filled whether or not the caller needs it —
 // the global-memory kernel ignores it.
-TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const std::vector<Float3>& world,
-                                    const DrawTarget& target, const Buffers& b)
+//
+// Allocated per draw and not held in the handle, because a tile list is a
+// function of the camera as well as of the geometry: the same buffers seen from
+// somewhere else bin differently.
+TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                    const DeviceFrame& frame, const DrawTarget& target)
 {
     const TileBinning binning =
-        bin_triangles(read_back_triangles(rt, world, b), target.width, target.height);
+        bin_triangles(read_back_triangles(rt, geometry), target.width, target.height);
 
     void* verts = rt.myrt_malloc(binning.vertices.size() * sizeof(float));
     void* table = rt.myrt_malloc(binning.table.size() * sizeof(float));
@@ -210,39 +157,7 @@ TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const std::vector<Float3>&
     TiledRasterStageArgs args;
     args.tile_vertices_offset = rt.myrt_device_offset(verts);
     args.tile_table_offset = rt.myrt_device_offset(table);
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
-    args.width = target.width;
-    args.height = target.height;
-    args.tiles_x = binning.tiles_x;
-    args.max_tile_triangles = fullest;
-    return args;
-}
-
-TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const Mesh& mesh,
-                                    const DrawTarget& target, const Buffers& b)
-{
-    const TileBinning binning =
-        bin_triangles(read_back_triangles(rt, mesh, b), target.width, target.height);
-
-    void* verts = rt.myrt_malloc(binning.vertices.size() * sizeof(float));
-    void* table = rt.myrt_malloc(binning.table.size() * sizeof(float));
-    rt.myrt_memcpy(verts, binning.vertices.data(),
-                   binning.vertices.size() * sizeof(float), Direction::HostToDevice);
-    rt.myrt_memcpy(table, binning.table.data(), binning.table.size() * sizeof(float),
-                   Direction::HostToDevice);
-
-    uint32_t fullest = 0;
-    for (uint32_t t = 0; t < binning.tile_count(); ++t) {
-        const uint32_t count = static_cast<uint32_t>(binning.table[t * 2 + 1]);
-        if (count > fullest) {
-            fullest = count;
-        }
-    }
-
-    TiledRasterStageArgs args;
-    args.tile_vertices_offset = rt.myrt_device_offset(verts);
-    args.tile_table_offset = rt.myrt_device_offset(table);
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
     args.width = target.width;
     args.height = target.height;
     args.tiles_x = binning.tiles_x;
@@ -251,6 +166,164 @@ TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const Mesh& mesh,
 }
 
 }  // namespace
+
+// --- what stays on the device ------------------------------------------------
+
+DeviceGeometry upload(MyGPURuntime& rt, const std::vector<Float3>& world,
+                      VertexStage stage)
+{
+    DeviceGeometry geometry;
+    geometry.vertex_count = static_cast<uint32_t>(world.size());
+    geometry.triangle_count = static_cast<uint32_t>(world.size() / 3);
+
+    const size_t world_bytes =
+        static_cast<size_t>(geometry.vertex_count) * WORLD_VERTEX_BYTES;
+    geometry.world = rt.myrt_malloc(world_bytes);
+    if (stage == VertexStage::Projects) {
+        geometry.screen = rt.myrt_malloc(static_cast<size_t>(geometry.vertex_count) *
+                                         SCREEN_VERTEX_BYTES);
+    }
+
+    std::vector<float> flat;
+    flat.reserve(world.size() * WORLD_VERTEX_FLOATS);
+    for (const Float3& v : world) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    rt.myrt_memcpy(geometry.world, flat.data(), world_bytes, Direction::HostToDevice);
+    return geometry;
+}
+
+DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)
+{
+    // mesh.vertices rather than mesh.flattened(): that is what sizes both the
+    // world buffer and pass 1's output by the unique count, and a cube reserves
+    // eight screen slots where the flattened list needed thirty-six.
+    DeviceGeometry geometry = upload(rt, mesh.vertices, VertexStage::Projects);
+    geometry.triangle_count = mesh.triangle_count();
+    geometry.indices = mesh.indices;
+
+    // Indices reach the device as floats: the ISA has no integer registers, and
+    // the kernel multiplies an index by a vertex stride to get an address, so it
+    // wants a float there anyway. Whole numbers are exact to 2^24, which is more
+    // vertices than a scene here will hold.
+    std::vector<float> as_floats;
+    as_floats.reserve(mesh.indices.size());
+    for (const uint32_t i : mesh.indices) {
+        as_floats.push_back(static_cast<float>(i));
+    }
+
+    const size_t index_bytes = as_floats.size() * sizeof(float);
+    geometry.index = rt.myrt_malloc(index_bytes);
+    rt.myrt_memcpy(geometry.index, as_floats.data(), index_bytes,
+                   Direction::HostToDevice);
+    return geometry;
+}
+
+DeviceFrame allocate_frame(MyGPURuntime& rt, const DrawTarget& target)
+{
+    DeviceFrame frame;
+    frame.width = target.width;
+    frame.height = target.height;
+    frame.pixels =
+        rt.myrt_malloc(static_cast<size_t>(target.width) * target.height * PIXEL_BYTES);
+    return frame;
+}
+
+std::vector<Float3> read_back(MyGPURuntime& rt, const DeviceFrame& frame)
+{
+    return download(rt, frame);
+}
+
+void release(MyGPURuntime& rt, DeviceGeometry& geometry)
+{
+    // myrt_free takes a null pointer the way C's free does, so the routes that
+    // reserve no screen buffer need no special case here.
+    rt.myrt_free(geometry.world);
+    rt.myrt_free(geometry.screen);
+    rt.myrt_free(geometry.index);
+    geometry = DeviceGeometry{};
+}
+
+void release(MyGPURuntime& rt, DeviceFrame& frame)
+{
+    rt.myrt_free(frame.pixels);
+    frame = DeviceFrame{};
+}
+
+// --- the routes over what is already there -----------------------------------
+
+std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                              const DeviceFrame& frame, const DrawTarget& target,
+                              bool predicated)
+{
+    run_pass_one(rt, geometry, target);
+
+    RasterStageArgs args;
+    args.screen_offset = rt.myrt_device_offset(geometry.screen);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = geometry.triangle_count;
+    args.predicated = predicated;
+    if (geometry.indexed()) {
+        // The whole of what indexing costs pass 2 is this pair: three dependent
+        // loads a triangle, in exchange for the transforms pass 1 did not make.
+        args.indexed = true;
+        args.index_offset = rt.myrt_device_offset(geometry.index);
+    }
+    run_raster_stage(rt, args);
+    return download(rt, frame);
+}
+
+std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                               const DeviceFrame& frame, const DrawTarget& target,
+                               bool predicated)
+{
+    // The kernel is the same program whichever form the geometry arrived in:
+    // bin_triangles copies each triangle into every tile it reaches, so what
+    // reaches the device is already de-indexed.
+    run_pass_one(rt, geometry, target);
+    TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
+    args.predicated = predicated;
+    run_tiled_raster_stage(rt, args);
+    return download(rt, frame);
+}
+
+std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                const DeviceFrame& frame, const DrawTarget& target,
+                                bool predicated)
+{
+    run_pass_one(rt, geometry, target);
+    TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
+    args.predicated = predicated;
+    run_shared_raster_stage(rt, args);
+    return download(rt, frame);
+}
+
+std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                  const DeviceFrame& frame, const DrawTarget& target,
+                                  const Shading& shading, bool predicated)
+{
+    if (geometry.indexed()) {
+        throw std::runtime_error(
+            "draw_raytrace: the geometry is indexed, and this route has no vertex "
+            "stage for an index buffer to feed — upload it flattened");
+    }
+
+    RaytraceStageArgs args;
+    args.basis = ray_basis(target.camera, target.aspect());
+    args.shading = shading;
+    args.triangles_offset = rt.myrt_device_offset(geometry.world);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = geometry.triangle_count;
+    args.predicated = predicated;
+    run_raytrace_stage(rt, args);
+    return download(rt, frame);
+}
 
 size_t BufferPlan::device_bytes() const
 {
@@ -272,22 +345,20 @@ size_t BufferPlan::binned_bytes(uint32_t width, uint32_t height, uint32_t triang
            tiles * 2 * sizeof(float);
 }
 
+// --- upload, draw, release ---------------------------------------------------
+// The one-shot forms, which is what a test or a benchmark measuring a single
+// frame wants. Each is the persistent pair with the buffers' lifetime narrowed
+// to the call, so both forms run one implementation and the figures they produce
+// describe the same code.
+
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const std::vector<Float3>& world,
                               const DrawTarget& target, bool predicated)
 {
-    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
-    run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-
-    RasterStageArgs args;
-    args.screen_offset = rt.myrt_device_offset(b.screen);
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
-    args.width = target.width;
-    args.height = target.height;
-    args.triangle_count = static_cast<uint32_t>(world.size() / 3);
-    args.predicated = predicated;
-    run_raster_stage(rt, args);
-
-    return download(rt, b);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_walk(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>& world,
@@ -299,74 +370,47 @@ std::vector<Float3> draw_predicated(MyGPURuntime& rt, const std::vector<Float3>&
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const std::vector<Float3>& world,
                                const DrawTarget& target, bool predicated)
 {
-    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
-    run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-
-    TiledRasterStageArgs args = bin_and_upload(rt, world, target, b);
-    args.predicated = predicated;
-    run_tiled_raster_stage(rt, args);
-    return download(rt, b);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_tiled(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const std::vector<Float3>& world,
                                 const DrawTarget& target, bool predicated)
 {
-    const Buffers b = upload(rt, world, raster_plan(world.size(), target));
-    run_pass_one(rt, static_cast<uint32_t>(world.size()), target, b);
-
-    TiledRasterStageArgs args = bin_and_upload(rt, world, target, b);
-    args.predicated = predicated;
-    run_shared_raster_stage(rt, args);
-    return download(rt, b);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_shared(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const std::vector<Float3>& world,
                                   const DrawTarget& target, const Shading& shading,
                                   bool predicated)
 {
-    // screen_vertices stays zero: there is no vertex stage here, so nothing
-    // ever projects and no buffer holds the result.
-    BufferPlan plan;
-    plan.world_vertices = static_cast<uint32_t>(world.size());
-    plan.width = target.width;
-    plan.height = target.height;
-    const Buffers b = upload(rt, world, plan);
-
-    RaytraceStageArgs args;
-    args.basis = ray_basis(target.camera, target.aspect());
-    args.shading = shading;
-    args.triangles_offset = rt.myrt_device_offset(b.world);
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
-    args.width = target.width;
-    args.height = target.height;
-    args.triangle_count = static_cast<uint32_t>(world.size() / 3);
-    args.predicated = predicated;
-    run_raytrace_stage(rt, args);
-
-    return download(rt, b);
+    // VertexStage::None: nothing here projects, so pass 1's output buffer would
+    // be reserved and never written.
+    DeviceGeometry geometry = upload(rt, world, VertexStage::None);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_raytrace(rt, geometry, frame, target, shading, predicated);
 }
 
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const Mesh& mesh,
                               const DrawTarget& target, bool predicated)
 {
-    const Buffers b = upload(rt, mesh, target);
-
-    // The whole of what indexing buys is this one argument: a cube runs eight
-    // threads here where the flattened list ran thirty-six, and a transform is
-    // the most expensive instruction in the set.
-    run_pass_one(rt, mesh.vertex_count(), target, b);
-
-    RasterStageArgs args;
-    args.framebuffer_offset = rt.myrt_device_offset(b.frame);
-    args.index_offset = rt.myrt_device_offset(b.index);
-    args.screen_offset = rt.myrt_device_offset(b.screen);
-    args.width = target.width;
-    args.height = target.height;
-    args.triangle_count = mesh.triangle_count();
-    args.indexed = true;
-    args.predicated = predicated;
-    run_raster_stage(rt, args);
-    return download(rt, b);
+    // The whole of what indexing buys is in upload(): a cube runs eight threads
+    // in pass 1 where the flattened list ran thirty-six, and a transform is the
+    // most expensive instruction in the set.
+    DeviceGeometry geometry = upload(rt, mesh);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_walk(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
@@ -378,28 +422,21 @@ std::vector<Float3> draw_predicated(MyGPURuntime& rt, const Mesh& mesh,
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const Mesh& mesh,
                                const DrawTarget& target, bool predicated)
 {
-    // Line for line the flattened route, and the kernel is the same program:
-    // bin_triangles copies each triangle into every tile it reaches, so what
-    // reaches the device is already de-indexed. Indexing costs this route
-    // nothing and saves it a transform per shared corner.
-    const Buffers b = upload(rt, mesh, target);
-    run_pass_one(rt, mesh.vertex_count(), target, b);
-    TiledRasterStageArgs args = bin_and_upload(rt, mesh, target, b);
-    args.predicated = predicated;
-    run_tiled_raster_stage(rt, args);
-    return download(rt, b);
+    DeviceGeometry geometry = upload(rt, mesh);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_tiled(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const Mesh& mesh,
                                 const DrawTarget& target, bool predicated)
 {
-    const Buffers b = upload(rt, mesh, target);
-    run_pass_one(rt, mesh.vertex_count(), target, b);
-
-    TiledRasterStageArgs args = bin_and_upload(rt, mesh, target, b);
-    args.predicated = predicated;
-    run_shared_raster_stage(rt, args);
-    return download(rt, b);
+    DeviceGeometry geometry = upload(rt, mesh);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    const Owned<DeviceFrame> own_frame{rt, frame};
+    return draw_shared(rt, geometry, frame, target, predicated);
 }
 
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
@@ -439,15 +476,16 @@ SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
     plan.screen_vertices = plan.world_vertices;
 
     // Its own runtime, so the reading is a total rather than a difference, and
-    // run_pass_one's sync is what leaves the counters holding this pass alone.
+    // no frame is allocated at all — the plan is here to size the arena.
     MyGPURuntime rt(plan.device_bytes() + (1u << 16));
-    const Buffers b = upload(rt, vertices, plan);
+    DeviceGeometry geometry = upload(rt, vertices);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
 
     VertexStageArgs args;
     args.view_projection = target.camera.view_projection(target.aspect());
-    args.world_offset = rt.myrt_device_offset(b.world);
-    args.screen_offset = rt.myrt_device_offset(b.screen);
-    args.vertex_count = plan.world_vertices;
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.screen_offset = rt.myrt_device_offset(geometry.screen);
+    args.vertex_count = geometry.vertex_count;
     args.width = target.width;
     args.height = target.height;
     run_vertex_stage(rt, args);

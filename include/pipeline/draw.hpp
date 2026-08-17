@@ -141,6 +141,97 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
                                   const DrawTarget& target,
                                   const Shading& shading = Shading{});
 
+// --- geometry that outlives a draw ------------------------------------------
+// Every overload above uploads, draws and releases. That is what one rendered
+// frame wants and what no real program does: a vertex buffer is uploaded once
+// and drawn from every frame after.
+//
+// Two things follow from the difference. The same mesh drawn twice through the
+// overloads above is two uploads at two addresses, so each draw asks the cache a
+// question nobody has asked before and every miss it reports is compulsory. And
+// a depth prepass cannot be written at all, its two passes having to read one
+// copy of the geometry.
+
+// What a route needs of the geometry beyond the vertices themselves.
+enum class VertexStage {
+    // The rasteriser routes: pass 1 projects each vertex and needs somewhere to
+    // put the result.
+    Projects,
+
+    // The ray tracer, which reads world triangles where they lie. Naming it
+    // keeps a path that never projects from reserving a buffer it never writes.
+    None,
+};
+
+// Vertices on the device, and where pass 1 will leave them. Buffers a draw
+// writes but does not own — the framebuffer — are in DeviceFrame instead, so
+// that one geometry can be drawn into two frames and from two cameras.
+struct DeviceGeometry {
+    void* world = nullptr;   // world-space vertices; the unique ones if indexed
+    void* screen = nullptr;  // pass 1's output, one slot a world vertex
+    void* index = nullptr;   // null when the geometry arrived flattened
+
+    uint32_t vertex_count = 0;
+    uint32_t triangle_count = 0;
+
+    // The index list stays on the host too, because binning runs here: the
+    // tiled routes resolve indices while building their tile lists. Hardware
+    // bins on the device and needs no second copy.
+    std::vector<uint32_t> indices;
+
+    bool indexed() const
+    {
+        return index != nullptr;
+    }
+};
+
+DeviceGeometry upload(MyGPURuntime& rt, const std::vector<Float3>& world,
+                      VertexStage stage = VertexStage::Projects);
+
+// An indexed upload, which is what makes pass 1 transform a shared corner once.
+// The ray tracer cannot draw one — see its overload below.
+DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh);
+
+// Where a draw puts its pixels, kept apart from the geometry because it belongs
+// to the target rather than to the model.
+struct DeviceFrame {
+    void* pixels = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+DeviceFrame allocate_frame(MyGPURuntime& rt, const DrawTarget& target);
+std::vector<Float3> read_back(MyGPURuntime& rt, const DeviceFrame& frame);
+
+// Hands the buffers back and leaves the handle empty, so releasing twice is
+// harmless. The first callers of myrt_free outside the tests and ray_triangle.
+void release(MyGPURuntime& rt, DeviceGeometry& geometry);
+void release(MyGPURuntime& rt, DeviceFrame& frame);
+
+// The routes over what is already resident. The camera stays in the target: the
+// same buffers drawn from two viewpoints is the point of holding them.
+//
+// The tiled pair still allocate per draw, their tile lists being a function of
+// the camera as well as the geometry, and that is where binning belongs.
+std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                              const DeviceFrame& frame, const DrawTarget& target,
+                              bool predicated = false);
+std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                               const DeviceFrame& frame, const DrawTarget& target,
+                               bool predicated = false);
+std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                const DeviceFrame& frame, const DrawTarget& target,
+                                bool predicated = false);
+
+// Throws on indexed geometry rather than resolving it. The index buffer exists
+// to feed a vertex stage and this route has none, so an indexed upload is not a
+// form of the geometry it can read — upload(rt, mesh.flattened(), VertexStage::None)
+// is what it wants.
+std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                  const DeviceFrame& frame, const DrawTarget& target,
+                                  const Shading& shading = Shading{},
+                                  bool predicated = false);
+
 // What pass 1 costs on its own.
 //
 // The draw routes clear the counters between their passes so a caller reads
