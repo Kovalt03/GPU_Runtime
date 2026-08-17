@@ -75,9 +75,9 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   30 opcodes, 8 bytes each                       │
+  │   31 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
-  │   V_LD_GLOBAL_F32 / V_LD_SHARED_F32              │
+  │   V_LD_GLOBAL_F32 / V_LD_GLOBAL_VEC3_F32         │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
   │   V_CMP_F32 / BRA_DIV / BARRIER / RET            │
   └──────┬───────────────────────────────────────────┘
@@ -99,7 +99,7 @@ than force a rename:
 
 ```
 ALU        V_<OP>[_<SHAPE>]_<TYPE>          V_ADD_F32, V_CROSS_VEC3_F32
-Memory     V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>   V_LD_GLOBAL_F32
+Memory     V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>   V_LD_GLOBAL_VEC3_F32
 Warp       S_<OP>                           S_BALLOT, S_ANY, S_ALL
 Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
 ```
@@ -113,8 +113,11 @@ Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
   `V_SHUFFLE_F32` and not `S_SHUFFLE` — the rule decides it rather than
   intuition about which instructions feel collective.
 - **`<SHAPE>`** is omitted for scalars. `VEC3` and `MAT4` are built —
-  `V_MATVEC_MAT4_F32` arrived for the vertex stage and filled the slot the
-  scheme had reserved for it, without renaming anything. `MAT3` is still open.
+  `V_MATVEC_MAT4_F32` arrived for the vertex stage and `V_LD_GLOBAL_VEC3_F32`
+  once there was a memory model to show what a wide load saves, each filling a
+  slot the scheme had reserved without renaming anything. `MAT3` is still open,
+  and `VEC4` is what the raster routes would want: their screen vertex is four
+  floats, so a VEC3 load leaves 1/w behind.
 - **`<TYPE>`** always comes last, leaving room for `F64` / `F16`.
 
 `F32` rather than `FP32` because that is the mnemonic standard — PTX `add.f32`,
@@ -207,8 +210,9 @@ on their own line, `int* ptr`.
 | A cache over the same scenes | **-40%**, flat — L2 is never outgrown here |
 | Latency covered by 16 warps against 1 | **30 → 6** cycles a warp |
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
-| Opcodes | 30 |
-| Tests | 259 |
+| A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
+| Opcodes | 31 |
+| Tests | 264 |
 
 ### What divergence costs
 
@@ -323,7 +327,7 @@ route where warps straddle edges most:
 |---|---:|---:|---:|
 | every pixel walks every triangle | 41,534,048 | 42,350,592 | +2.0% |
 | binned into tiles (7.4% diverged) | 6,210,144 | 6,309,888 | +1.6% |
-| ray tracer (12.5% diverged) | 31,556,398 | — | **+4.4%** |
+| ray tracer (15.0% diverged) | 31,556,398 | — | **+4.4%** |
 
 The blend's cost barely moves between scenes — every lane shading every
 triangle is the same work whatever is on screen — while the branch's tracks

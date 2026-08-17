@@ -15,7 +15,7 @@ cmake --build build -j8
 
 **Which cost model.** Every figure here is taken with a global access charged per
 lane and no instruction waiting on another — `MemoryModel::Flat` and
-`LatencyModel::Ignored`, the defaults. The four sections from *Charging memory by
+`LatencyModel::Ignored`, the defaults. The five sections from *Charging memory by
 the line* to *ordering a mesh* measure what the other models change, and are the
 only ones that do.
 
@@ -198,13 +198,13 @@ binning to compare against.
 
 | Scene | Triangles | raster ops | raster divergence | ray ops | ray divergence |
 |---|---:|---:|---:|---:|---:|
-| small, spread over the frame | 4 | 10,885,760 | 1.2% | 8,446,072 | **8.8%** |
-| small, spread over the frame | 16 | 41,534,048 | 1.3% | 31,556,398 | **12.5%** |
-| small, spread over the frame | 64 | 164,126,592 | 1.4% | 124,000,212 | **13.7%** |
-| medium, stacked at the centre | 16 | 41,532,192 | 0.4% | 31,602,380 | **17.6%** |
-| full-frame, stacked | 16 | 41,550,336 | 0.6% | 32,165,408 | **11.5%** |
+| small, spread over the frame | 4 | 10,885,760 | 1.2% | 8,446,072 | **10.1%** |
+| small, spread over the frame | 16 | 41,534,048 | 1.3% | 31,556,398 | **15.0%** |
+| small, spread over the frame | 64 | 164,126,592 | 1.4% | 124,000,212 | **16.7%** |
+| medium, stacked at the centre | 16 | 41,532,192 | 0.4% | 31,602,380 | **20.8%** |
+| full-frame, stacked | 16 | 41,550,336 | 0.6% | 32,165,408 | **13.2%** |
 
-The ray tracer issues 22-24% *less* work while diverging seven to forty times
+The ray tracer issues 22-24% *less* work while diverging eight to fifty times
 as much. An earlier reading of this table had the two within 3% of each other,
 which was wrong in the direction that mattered: it made the trade look free.
 
@@ -251,11 +251,11 @@ not NEAR, in `PredicationChangesTheCostAndNotThePixels`.
 
 | Scene | Triangles | walk | tiled | raytrace | ray divergence |
 |---|---:|---:|---:|---:|---:|
-| small, spread over the frame | 4 | 1.9% | 1.1% | **4.1%** | 8.80% |
-| small, spread over the frame | 16 | 2.0% | 1.6% | **4.4%** | 12.49% |
-| small, spread over the frame | 64 | 2.0% | 1.9% | **4.5%** | 13.69% |
-| medium, stacked at the centre | 16 | 2.0% | 1.9% | **4.3%** | 17.59% |
-| full-frame, stacked | 16 | 1.9% | 1.9% | **2.5%** | 11.48% |
+| small, spread over the frame | 4 | 1.9% | 1.1% | **4.1%** | 10.11% |
+| small, spread over the frame | 16 | 2.0% | 1.6% | **4.4%** | 15.01% |
+| small, spread over the frame | 64 | 2.0% | 1.9% | **4.5%** | 16.72% |
+| medium, stacked at the centre | 16 | 2.0% | 1.9% | **4.3%** | 20.81% |
+| full-frame, stacked | 16 | 1.9% | 1.9% | **2.5%** | 13.16% |
 
 Each figure is the blend against the branch on that route, so positive is worse.
 
@@ -271,7 +271,7 @@ every lane shades every triangle. That is what predication means.
 
 **The ray tracer was the case that looked most likely to pay, and lost by
 twice as much.** Four early exits guard nearly the whole intersection, and this
-kernel diverges seven to forty times as much as the walk. Predicating it means
+kernel diverges eight to fifty times as much as the walk. Predicating it means
 every lane finishes an intersection it would have abandoned at the first test —
 and on a scene of small triangles, most rays leave at the first test. The one
 scene where it loses least, at 2.5%, is the full-frame one, where fewest rays
@@ -335,6 +335,50 @@ line is the unit.
 
 `shared` drops only 41% for the same reason — its share of global traffic was
 already small, so there was less being overcharged.
+
+---
+
+## A wide load, now that transactions can be counted
+
+`V_LD_GLOBAL_VEC3_F32` was specified and left unbuilt because a flat charge per
+lane had nothing to show for it. The ray tracer reads three vertices a triangle
+and every lane of a warp is on the same triangle, so its nine scalar loads became
+three wide ones. The frames are identical.
+
+| | Three scalar loads | One wide load | |
+|---|---:|---:|---:|
+| Flat | 31,517,216 | 31,517,216 | **0.0%** |
+| Coalesced | 2,410,016 | 1,814,816 | **-24.7%** |
+| Cached | 1,517,928 | 1,470,312 | -3.1% |
+| Cycles, cached and latency | 430,092 | 245,772 | **-42.9%** |
+| Warp steps | 33,436 | 27,292 | -18.4% |
+
+64x32, 16 triangles. The rows are the same kernel under different cost models, so
+only the last two are times rather than issue capacity.
+
+**The flat row does not move by one lane-op**, which is the whole reason the
+opcode waited: three floats cost three floats however many instructions ask for
+them. Charged by the line, twelve bytes at one address are one transaction where
+three loads are three.
+
+**A cache had already absorbed most of the issue saving.** 24.7% against 3.1% —
+the second and third scalar loads were finding their line in L1 at a cost of 8
+rather than missing at 100. The transactions still fall, L1 hits going 9,409 to
+3,457, but what a wide load saves in capacity a cache mostly saves first.
+
+**What the cache does not absorb is the waiting.** Issue is in-order with no
+scoreboard: a warp that has issued a load cannot issue again until the result
+arrives, so three loads are three waits whatever each one cost. Cycles fall 42.9%
+with the cache and 64.9% without it.
+
+**The divergence rate rises, 12.5% to 15.0%, and nothing diverged.** The removed
+instructions were warp-uniform, leaving the coverage tests a larger share of what
+is issued. Tiling produced the same reading from the other direction: a rate is
+not a cost.
+
+The raster routes keep their scalar loads. Their screen vertex is x, y, z and
+1/w, so a VEC3 load would leave the fourth behind — `VEC4` is the slot the naming
+scheme reserves for that, and it is not built.
 
 ---
 
