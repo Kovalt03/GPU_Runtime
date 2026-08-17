@@ -623,6 +623,60 @@ quoted to support has to be read against the model that produced it.
 
 ---
 
+## A depth prepass, and the ratio that decides it
+
+Early-Z is two launches over one upload: the first keeps the nearest depth a
+pixel and colours nothing, the second colours only the triangle that depth names.
+A pixel is shaded once however many cover it — and every triangle is walked
+twice.
+
+Measured on a full-frame stack submitted farthest first, which is the walk's
+worst case and the prepass's best: every triangle covers every pixel and each is
+nearer than the last, so the walk shades all of them.
+
+| Scene | Depth complexity | flat | coalesced | cached | cycles |
+|---|---:|---:|---:|---:|---:|
+| stacked, barycentric | 4 | +96.9% | +80.4% | +75.2% | +91.6% |
+| stacked, barycentric | 32 | +98.4% | +81.6% | +71.9% | +82.8% |
+| stacked, lit | 4 | +36.9% | +39.8% | +33.8% | +52.4% |
+| stacked, lit | 32 | **+29.9%** | +30.3% | **+20.5%** | +32.1% |
+
+Positive means the prepass costs more. It loses everywhere, and the frames are
+identical to the walk's — asserted with EQ in
+`EarlyZDrawsWhatTheWalkDrawsAndCostsTwiceTheCoverage`.
+
+**Depth complexity is not what decides it.** That is the surprise: it is the one
+thing early-Z exists to exploit, and past about eight the figure stops moving.
+Doubling the geometry doubles both sides.
+
+**What decides it is the shade against the coverage test that finds it.** Write
+`c` for what one triangle's coverage costs a frame and `s` for what one shade
+costs; the walk pays `Nc + Ns` and the prepass pays `2Nc + s`, so as depth
+complexity grows the ratio goes to
+
+```
+2 / (1 + s/c)
+```
+
+The two shading modes are one measurement of `c` and `s` apart. Barycentric at 32
+gives `Nc` = 83,000,320, and lighting the same scene adds 44,895,872 — so `c` is
+2,593,760 a triangle and the diffuse shade `s` is 1,402,996, a ratio of **0.54**.
+The formula then predicts 1.980 and 1.298 against measured 1.984 and 1.299.
+
+**So the crossover is a shader 1.85x this one.** `s/c > 1` is what it takes, and
+a diffuse point light with one normalize is a little over half way there. That is
+a falsifiable number rather than an intuition: a shader with a texture fetch and
+a shadow term would pass it, and this one does not.
+
+**Where the other half of the answer is.** `c` is what a prepass repeats, and the
+tiled routes have already cut it — binning removes the triangles a pixel never
+sees. Lighting them means growing the tile lists by a world position a vertex and
+a normal a triangle, which is why the walk is the only route that can be lit
+today, and why the more interesting version of this measurement is not yet
+available.
+
+---
+
 ## Summing a warp
 
 The reduction is five rounds either way — the live values halve each time, and

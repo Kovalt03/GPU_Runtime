@@ -214,9 +214,10 @@ on their own line, `int* ptr`.
 | Latency covered by 16 warps against 1 | **30 → 6** cycles a warp |
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
 | A second draw of resident geometry | **192 → 0** misses, and 0.04% of the bill |
+| Depth prepass against a single pass | **+30%** lit, **+98%** unlit — it needs a shader 1.85x dearer |
 | A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
 | Opcodes | 31 |
-| Tests | 271 |
+| Tests | 275 |
 
 ### What divergence costs
 
@@ -483,6 +484,8 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Latency hiding | modelled **within a block** — a result arrives some cycles after it is issued and other warps cover the wait. Hardware puts several blocks on an SM and lets all their warps cover each other; here a block runs to completion first |
 | Instruction-level parallelism | **absent** — issue is in-order with no scoreboard, so a warp waits out every instruction whether or not the next one wanted the result. A dependent chain and independent accesses cost the same; occupancy is what covers a wait here, never the warp's own next instruction |
 | Persistent buffers | modelled — `upload` / `release` hold geometry between draws, and a repeated draw of what fits refetches nothing. Capacity and compulsory misses are told apart by whether a second draw pays again |
+| Early-Z / depth prepass | modelled — `draw_early_z` runs a depth pass and then shades only the triangle it names. It loses here, by a ratio the shade and the coverage test decide |
+| Fragment shading | flat lighting: a point light, a face normal a triangle, one normalize a pixel. No textures, no shadows |
 | Streams, async copy | **absent** — every launch is synchronous |
 
 ### The three that matter most
@@ -492,11 +495,11 @@ lines are charged independently, so nothing here saturates: no shared resource, 
 DRAM row buffer, no ceiling. Counting how many transactions a kernel makes is a
 different question from how long they take together, and only the first is answered.
 
-**Early-Z.** Rejecting a fragment before shading it is most of what makes a modern
-rasteriser fast on a scene with depth complexity. Every pixel here shades every
-triangle that covers it. The persistent buffers it needs — one copy of the geometry
-read by a depth pass and then by a colour pass — are now there; the depth pass
-itself is not.
+**A shader worth skipping.** Early-Z is built and loses by 30% on the scene it
+exists for, because what decides that trade is the shade against the coverage test
+that finds it — and flat lighting costs about half a coverage test here. Textures
+and shadows are what would carry it past the crossover, and the fragment stage has
+neither.
 
 **Occupancy across blocks.** Latency is covered within a block, which is where this
 machine can see it: `myrt_launch` runs blocks one after another, so the warps of
