@@ -65,3 +65,20 @@ inline std::vector<Float3> stacked(uint32_t count, float half)
     }
     return world;
 }
+
+// Full-frame triangles piled at the centre, submitted farthest first, so that
+// every pixel is covered by all of them and each one is nearer than the last.
+//
+// The worst case for a single-pass walk and the best for a depth prepass: the
+// running-best test admits every triangle in turn, so a pixel is shaded once per
+// triangle rather than once. Sorted the other way a walk shades once already and
+// there is nothing for a prepass to save.
+inline std::vector<Float3> stacked_back_to_front(uint32_t count)
+{
+    std::vector<Float3> world;
+    for (uint32_t i = 0; i < count; ++i) {
+        push_triangle(
+            world, Float3{0.0f, 0.0f, -0.01f * static_cast<float>(count - 1 - i)}, 4.0f);
+    }
+    return world;
+}
