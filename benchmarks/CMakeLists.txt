@@ -15,3 +15,6 @@ target_link_libraries(render_bench PRIVATE gpurt project_warnings)
 
 add_executable(reduction_bench reduction_bench.cpp)
 target_link_libraries(reduction_bench PRIVATE gpurt project_warnings)
+
+add_executable(cache_bench cache_bench.cpp)
+target_link_libraries(cache_bench PRIVATE gpurt project_warnings)
