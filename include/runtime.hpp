@@ -113,6 +113,14 @@ public:
     // what every figure in benchmarks/ was taken under.
     void myrt_set_memory_model(MemoryModel model);
 
+    // Whether a result waits. Defaults to LatencyModel::Ignored, likewise.
+    void myrt_set_latency_model(LatencyModel model);
+
+    // Cache capacities in lines, for a caller that means to reach one. The
+    // hardware sizes are far larger than any scene here fills, so a benchmark
+    // wanting to show what happens at capacity has to scale them down and say so.
+    void myrt_set_cache_lines(size_t l1, size_t l2);
+
     double elapsed_seconds() const
     {
         return elapsed_seconds_;

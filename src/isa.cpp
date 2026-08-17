@@ -337,15 +337,63 @@ uint32_t instruction_cost(Opcode op)
     return 1;
 }
 
-uint32_t instruction_latency(Opcode)
+uint32_t instruction_latency(Opcode op)
 {
-    // Uniformly zero: no instruction makes another wait, so a warp never stalls
-    // and having more of them resident buys nothing.
-    //
-    // Filling this in is a modelling choice rather than a measurement — there is
-    // no hardware here to time — and it wants the same provenance the costs
-    // above have: ratios picked to be plausible, stated as picked. What matters
-    // is a global load against an add and a shared load against both, and the
-    // scheduler has to learn to wait before any of them means anything.
-    return 0;
+    // Chosen ratios, not measurements — there is no hardware here to time, so this
+    // has the provenance instruction_cost has: hardware's orders of magnitude,
+    // stated as picked.
+    switch (op) {
+    // A reciprocal or a square root goes through a special function unit, which
+    // real hardware runs at a fraction of the rate and several times the depth.
+    case Opcode::V_RCP_F32:
+    case Opcode::V_SQRT_F32:
+    case Opcode::V_NORM_VEC3_F32: return 16;
+
+    // Shared memory is on-chip and an order below a cache hit.
+    case Opcode::V_LD_SHARED_F32: return 30;
+
+    // Not answered here. What a global load costs in time depends on where the
+    // line was found, which is a question for the memory model — the scheduler
+    // takes it from global_access_cost instead.
+    case Opcode::V_LD_GLOBAL_F32: return 0;
+
+    // A store is fire-and-forget: the warp hands it to memory and carries on, so
+    // nothing downstream waits on it. Modelling a full write buffer would be a
+    // different thing again.
+    case Opcode::V_ST_GLOBAL_F32:
+    case Opcode::V_ST_SHARED_F32: return 0;
+
+    // Warp state rather than a result, and the waiting they cause is the
+    // scheduler's own — a barrier is not an instruction whose answer arrives late.
+    case Opcode::BRA:
+    case Opcode::BRA_DIV:
+    case Opcode::BARRIER:
+    case Opcode::S_SYNCWARP:
+    case Opcode::RET: return 0;
+
+    // A crossbar across the warp, priced like the shared-memory traffic it
+    // replaces and no deeper than the arithmetic around it.
+    case Opcode::S_BALLOT:
+    case Opcode::S_ANY:
+    case Opcode::S_ALL:
+    case Opcode::V_SHUFFLE_F32: return 8;
+
+    // Ordinary arithmetic, a few cycles deep and fully pipelined.
+    case Opcode::V_MUL_F32:
+    case Opcode::V_ADD_F32:
+    case Opcode::V_SUB_F32:
+    case Opcode::V_FMA_F32:
+    case Opcode::V_MIN_F32:
+    case Opcode::V_MAX_F32:
+    case Opcode::V_MOV_F32:
+    case Opcode::V_CMP_F32:
+    case Opcode::V_ADD_VEC3_F32:
+    case Opcode::V_SUB_VEC3_F32:
+    case Opcode::V_SCALE_VEC3_F32:
+    case Opcode::V_DOT_VEC3_F32:
+    case Opcode::V_CROSS_VEC3_F32:
+    case Opcode::V_MATVEC_MAT4_F32: return 4;
+    }
+
+    return 4;
 }

@@ -112,6 +112,11 @@ void MyGPURuntime::myrt_sync(bool report)
     // Nothing to wait for: execution is synchronous. Reporting and clearing is
     // what makes this the natural end of a kernel run. Both fields reset
     // together, or the next launch would divide its work by carried-over time.
+    //
+    // Counters only. The scheduler's caches survive, as L2 does across kernel
+    // launches on hardware — draw_walk and its neighbours call this between their
+    // two passes, and clearing here would stop pass 2 from finding anything pass 1
+    // had read.
     if (report) {
         print_stats();
     }
@@ -129,6 +134,16 @@ void MyGPURuntime::myrt_set_warp_policy(WarpPolicy policy)
 void MyGPURuntime::myrt_set_memory_model(MemoryModel model)
 {
     scheduler_->set_memory_model(model);
+}
+
+void MyGPURuntime::myrt_set_latency_model(LatencyModel model)
+{
+    scheduler_->set_latency_model(model);
+}
+
+void MyGPURuntime::myrt_set_cache_lines(size_t l1, size_t l2)
+{
+    scheduler_->set_cache_lines(l1, l2);
 }
 
 double MyGPURuntime::divergence_rate() const

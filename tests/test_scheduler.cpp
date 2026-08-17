@@ -19,9 +19,6 @@ constexpr size_t GLOBAL_BYTES = 1024;
 constexpr uint32_t ALL_LANES = 0xFFFFFFFFu;
 constexpr uint32_t LOW_HALF = 0x0000FFFFu;
 
-// RET is last, which the exhaustive tests in test_isa.cpp also rest on.
-constexpr int OPCODE_COUNT_FOR_LATENCY = static_cast<int>(Opcode::RET) + 1;
-
 // A one-warp block plus a scratch device buffer, which is what most of these
 // tests need. The buffer is a member so its address stays valid for the span.
 struct Fixture {
@@ -805,7 +802,7 @@ TEST(Scheduler, LowestPcFirstStrandsALaneWaitingOnAHigherOne)
     WarpScheduler scheduler;
     // Small enough that asserting the hang costs milliseconds. The spin issues
     // one instruction a turn and would otherwise run to the default budget.
-    scheduler.set_step_budget(10000);
+    scheduler.set_cycle_budget(10000);
 
     std::vector<uint8_t> memory(16, 0);
     EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
@@ -835,7 +832,7 @@ TEST(Scheduler, TheStepBudgetDoesNotStandInTheWayOfAKernelThatFinishes)
     p.push_back(make_ret());
 
     WarpScheduler scheduler;
-    scheduler.set_step_budget(8);
+    scheduler.set_cycle_budget(8);
 
     std::vector<uint8_t> memory(16, 0);
     scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
@@ -863,7 +860,7 @@ TEST(Scheduler, IndependentSchedulingIsFairWithinEachWarpSeparately)
 
     WarpScheduler scheduler;
     scheduler.set_policy(WarpPolicy::Independent);
-    scheduler.set_step_budget(10000);
+    scheduler.set_cycle_budget(10000);
 
     std::vector<uint8_t> memory(16, 0);
     scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
@@ -881,7 +878,7 @@ TEST(Scheduler, IndependentSchedulingRunsWhatLowestPcStrands)
 
     WarpScheduler scheduler;
     scheduler.set_policy(WarpPolicy::Independent);
-    scheduler.set_step_budget(10000);
+    scheduler.set_cycle_budget(10000);
 
     std::vector<uint8_t> memory(16, 0);
     scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
@@ -1187,7 +1184,7 @@ TEST(Scheduler, SyncwarpRefusesToWaitForALaneAlreadyPastIt)
     seed_lane_ids(block);
 
     WarpScheduler scheduler;
-    scheduler.set_step_budget(10000);
+    scheduler.set_cycle_budget(10000);
     std::vector<uint8_t> memory(16, 0);
 
     // Checked by message, not merely by type: without the look-ahead this waits
@@ -1394,21 +1391,14 @@ TEST(Scheduler, EveryLaneReadingOneAddressIsOneLine)
               weighted_for(4.0f, MemoryModel::Coalesced, 1 << 14));
 }
 
-TEST(Scheduler, NothingStallsWhileEveryLatencyIsZero)
-
+TEST(Scheduler, IgnoringLatencyIsWhatMakesOccupancyWorthless)
 {
-    // The model in force: a result is usable the instant it is issued, so no
-    // warp ever waits and having more of them resident buys nothing. This is
-    // what makes latency hiding invisible here, and the counter that would show
-    // it stays at zero until instruction_latency returns something.
-    for (int i = 0; i < OPCODE_COUNT_FOR_LATENCY; ++i) {
-        EXPECT_EQ(instruction_latency(static_cast<Opcode>(i)), 0u)
-            << opcode_name(static_cast<Opcode>(i));
-    }
-
+    // The model every figure in benchmarks/ was taken under. instruction_latency
+    // has numbers in it now, and Ignored is where they are not read: no warp
+    // waits, so nothing stalls and resident warps neither help nor hinder.
     ThreadBlock block = make_block(4);
     Program p;
-    p.push_back(make_v_mov_f32(0, 0.0f));  // address 0
+    p.push_back(make_v_mov_f32(0, 0.0f));
     p.push_back(make_v_ld_global_f32(1, 0, 0.0f));
     p.push_back(make_v_add_f32(2, 1, 1));  // depends on the load
     p.push_back(make_ret());
@@ -1418,4 +1408,225 @@ TEST(Scheduler, NothingStallsWhileEveryLatencyIsZero)
     scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
 
     EXPECT_EQ(scheduler.stats().stall_steps, 0u);
+    EXPECT_EQ(scheduler.stats().cycles, scheduler.stats().warp_steps);
+}
+
+TEST(Scheduler, AnInstructionWithNoResultMakesNothingWait)
+{
+    // Which instructions carry a latency is a modelling choice, and these are the
+    // ones it says nothing waits on: a store hands off and carries on, and a
+    // branch or a barrier produces no value at all.
+    for (const Opcode op :
+         {Opcode::V_ST_GLOBAL_F32, Opcode::V_ST_SHARED_F32, Opcode::BRA, Opcode::BRA_DIV,
+          Opcode::BARRIER, Opcode::S_SYNCWARP, Opcode::RET}) {
+        EXPECT_EQ(instruction_latency(op), 0u) << opcode_name(op);
+    }
+
+    // And a global load, whose answer depends on where the line was found — the
+    // memory model reports it, not this table.
+    EXPECT_EQ(instruction_latency(Opcode::V_LD_GLOBAL_F32), 0u);
+
+    // While arithmetic does, or a dependent instruction could never wait.
+    EXPECT_GT(instruction_latency(Opcode::V_ADD_F32), 0u);
+    EXPECT_GT(instruction_latency(Opcode::V_RCP_F32),
+              instruction_latency(Opcode::V_ADD_F32))
+        << "a special function unit is no faster than an adder";
+    EXPECT_GT(instruction_latency(Opcode::V_LD_SHARED_F32),
+              instruction_latency(Opcode::V_RCP_F32))
+        << "on-chip memory is no faster than arithmetic";
+}
+
+TEST(Scheduler, ModelledSchedulingIssuesTheSameWorkAsIgnored)
+{
+    // The cycle loop has to reproduce the one every figure in benchmarks/ came
+    // from, not merely resemble it. Issued work is the part that carries over: the
+    // same instructions reach the same lanes whatever order the warps take their
+    // turns in.
+    //
+    // Cycles and stalls are what the new model adds, and they are checked
+    // separately — a warp waiting on a load is the point, not a discrepancy.
+    Program p;
+    p.push_back(make_v_mov_f32(2, 16.0f));
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));
+    p.push_back(make_bra_div(1, 2));  // divergent, so the masks differ per warp
+    p.push_back(make_v_mov_f32(3, 1.0f));
+    p.push_back(make_v_mov_f32(0, 0.0f));
+    p.push_back(make_v_ld_global_f32(4, 0, 0.0f));
+    p.push_back(make_barrier());
+    p.push_back(make_v_add_f32(5, 4, 3));
+    p.push_back(make_ret());
+
+    for (const uint32_t warps : {1u, 2u, 4u}) {
+        SchedulerStats readings[2];
+        int i = 0;
+        for (const LatencyModel model : {LatencyModel::Ignored, LatencyModel::Modelled}) {
+            ThreadBlock block = make_block(warps);
+            for (uint32_t w = 0; w < warps; ++w) {
+                for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                    block.warps[w].threads[lane].regs[REG_GLOBAL_ID_X] =
+                        static_cast<float>(lane);
+                }
+            }
+            WarpScheduler scheduler;
+            scheduler.set_latency_model(model);
+            std::vector<uint8_t> memory(64, 0);
+            scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+            readings[i++] = scheduler.stats();
+        }
+
+        EXPECT_EQ(readings[0].warp_steps, readings[1].warp_steps) << warps << " warps";
+        EXPECT_EQ(readings[0].active_lane_ops, readings[1].active_lane_ops)
+            << warps << " warps";
+        EXPECT_EQ(readings[0].weighted_lane_ops, readings[1].weighted_lane_ops)
+            << warps << " warps";
+
+        // Ignored keeps cycles and issues equal by construction. Modelled cannot
+        // fall below — time does not run backwards — but it need not exceed
+        // either: enough warps and the waiting disappears, which is what
+        // MoreWarpsCoverMoreOfTheWaiting is for.
+        EXPECT_EQ(readings[0].cycles, readings[0].warp_steps) << warps << " warps";
+        EXPECT_GE(readings[1].cycles, readings[1].warp_steps) << warps << " warps";
+    }
+}
+
+TEST(Scheduler, MoreWarpsCoverMoreOfTheWaiting)
+{
+    // The reason warps are batched at all, and the first thing this simulator
+    // could not say. One warp waits out every latency alone; enough of them and
+    // the waiting disappears into each other's work.
+    //
+    // Arithmetic only, so the latencies are the tens rather than the hundreds and
+    // a block can cover them completely. A chain, so each instruction waits on the
+    // one before.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 2.0f));
+    p.push_back(make_v_add_f32(1, 0, 0));
+    p.push_back(make_v_rcp_f32(2, 1));
+    p.push_back(make_v_add_f32(3, 2, 2));
+    p.push_back(make_v_rcp_f32(4, 3));
+    p.push_back(make_ret());
+
+    double previous_per_warp = 0.0;
+    uint64_t previous_stalls = UINT64_MAX;
+    for (const uint32_t warps : {1u, 2u, 4u, 8u, 16u}) {
+        ThreadBlock block = make_block(warps);
+        WarpScheduler scheduler;
+        scheduler.set_latency_model(LatencyModel::Modelled);
+        std::vector<uint8_t> memory(64, 0);
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+        const double per_warp = static_cast<double>(scheduler.stats().cycles) / warps;
+        if (previous_per_warp > 0.0) {
+            EXPECT_LT(per_warp, previous_per_warp)
+                << warps << " warps did not cover more than " << (warps / 2);
+        }
+        EXPECT_LT(scheduler.stats().stall_steps, previous_stalls) << warps << " warps";
+
+        previous_per_warp = per_warp;
+        previous_stalls = scheduler.stats().stall_steps;
+    }
+
+    // And enough of them cover it entirely, which is what occupancy asks for.
+    EXPECT_EQ(previous_stalls, 0u) << "sixteen warps still left the machine idle";
+}
+
+TEST(Scheduler, AGlobalLoadIsDeeperThanABlockCanCover)
+{
+    // The other half of occupancy: whether it is enough depends on what is being
+    // hidden. A trip to memory is hundreds of cycles against a block's thirty-two
+    // warps of a few each, so filling the block does not make it disappear — it
+    // only spreads it.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 0.0f));
+    p.push_back(make_v_ld_global_f32(1, 0, 0.0f));
+    p.push_back(make_v_add_f32(2, 1, 1));  // waits on the load
+    p.push_back(make_ret());
+
+    ThreadBlock block = make_block(32);
+    WarpScheduler scheduler;
+    scheduler.set_latency_model(LatencyModel::Modelled);
+    std::vector<uint8_t> memory(1 << 14, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_GT(scheduler.stats().stall_steps, 0u)
+        << "a memory latency was covered by one block, which it should not be";
+}
+
+TEST(Scheduler, ACachedLoadWaitsLessThanAnUncachedOne)
+{
+    // What connecting the two models buys. Every warp reads the same line, so the
+    // first pays a trip to memory and the rest find it in L1 — which is a
+    // difference in time as well as in issue capacity, and the flat model has
+    // neither.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 0.0f));
+    p.push_back(make_v_ld_global_f32(1, 0, 0.0f));
+    p.push_back(make_v_add_f32(2, 1, 1));
+    p.push_back(make_ret());
+
+    uint64_t cycles[2];
+    int i = 0;
+    for (const MemoryModel model : {MemoryModel::Flat, MemoryModel::Cached}) {
+        ThreadBlock block = make_block(16);
+        WarpScheduler scheduler;
+        scheduler.set_latency_model(LatencyModel::Modelled);
+        scheduler.set_memory_model(model);
+        std::vector<uint8_t> memory(1 << 14, 0);
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+        cycles[i++] = scheduler.stats().cycles;
+    }
+
+    EXPECT_LT(cycles[1], cycles[0])
+        << "the cache saved nothing in time, only in issue capacity";
+}
+
+TEST(Scheduler, LinesFetchedTogetherCostTheWorstOfThemNotTheSumOfThem)
+{
+    // A warp asking for several lines waits for the slowest, not for all of them in
+    // turn — they are fetched together. Cost adds across lines because capacity is
+    // spent on each; latency does not.
+    //
+    // Needs a scattered access to say anything. Every other scene here is a
+    // broadcast, one line, where the sum and the worst are the same number.
+    Program p;
+    p.push_back(make_v_mov_f32(1, static_cast<float>(CACHE_LINE_BYTES)));
+    p.push_back(make_v_mul_f32(2, REG_GLOBAL_ID_X, 1));  // lane i -> line i
+    p.push_back(make_v_ld_global_f32(3, 2, 0.0f));
+    p.push_back(make_v_add_f32(4, 3, 3));  // waits on the load
+    p.push_back(make_ret());
+
+    ThreadBlock block = make_block(1);
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    scheduler.set_latency_model(LatencyModel::Modelled);
+    scheduler.set_memory_model(MemoryModel::Cached);
+    std::vector<uint8_t> memory((WARP_SIZE + 1) * CACHE_LINE_BYTES, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    // Thirty-two lines, every one a miss, and one warp with nothing to hide behind.
+    // Summing their latencies would put the total past thirty-two trips to memory;
+    // taking the worst leaves it near one.
+    EXPECT_EQ(scheduler.stats().cache_misses, WARP_SIZE);
+    EXPECT_LT(scheduler.stats().cycles, 2 * MEMORY_LATENCY)
+        << "the warp waited for its lines one after another";
+}
+
+TEST(Scheduler, TheCycleBudgetCoversTimeSpentWaiting)
+{
+    // The budget counts cycles rather than issues, so a block that only ever waits
+    // still reaches it. Bounding issues alone would leave such a block spinning
+    // with the counter untouched — and the deadlock test above depends on the
+    // bound being reachable.
+    ThreadBlock block = make_block(1);
+    const Program p = producer_consumer_program();
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    scheduler.set_latency_model(LatencyModel::Modelled);
+    scheduler.set_cycle_budget(10000);
+
+    std::vector<uint8_t> memory(16, 0);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                 std::runtime_error);
 }

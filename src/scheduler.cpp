@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/types.h>
+#include <vector>
 #include "isa.hpp"
 #include "thread.hpp"
 
@@ -536,13 +537,67 @@ uint32_t WarpScheduler::select_independent_pc(Warp& warp) const
     return chosen;
 }
 
-// What a warp's global load or store costs, given where its lanes are pointing.
-uint64_t WarpScheduler::global_access_cost(const Warp& warp,
-                                           const Instruction& instr) const
+bool LineCache::touch(size_t line)
 {
+    const auto found = resident_.find(line);
+    if (found != resident_.end()) {
+        // splice moves it to the most-recently-used end and keeps the iterator
+        // valid, so the map needs no update.
+        order_.splice(order_.end(), order_, found->second);
+        return true;
+    }
+
+    if (resident_.size() == capacity_) {
+        resident_.erase(order_.front());
+        order_.pop_front();
+    }
+    order_.push_back(line);
+    resident_.emplace(line, std::prev(order_.end()));
+    return false;
+}
+
+void LineCache::clear()
+{
+    order_.clear();
+    resident_.clear();
+}
+
+// What one line costs, given where it was found.
+//
+// Called once per distinct line by global_access_cost, so a warp whose 32 lanes
+// share a line looks it up once. Hits here therefore measure reuse *between*
+// warps — reuse within one is what coalescing already accounted for.
+GlobalAccess WarpScheduler::cache_lookup(size_t line, const Instruction& instr)
+{
+    if (l1_.touch(line)) {
+        ++stats_.l1_hits;
+        return {L1_HIT_COST, L1_HIT_LATENCY};
+    }
+
+    // touch() installed the line in L1 on the way past, and does the same here,
+    // so a line ends up in both levels — inclusive, as NVIDIA's are.
+    if (l2_.touch(line)) {
+        ++stats_.l2_hits;
+        return {L2_HIT_COST, L2_HIT_LATENCY};
+    }
+
+    ++stats_.cache_misses;
+
+    // Cost from instr rather than a constant, so that pricing a store differently
+    // is a change here and nowhere else. Both cost the same today.
+    return {instruction_cost(instr.op), MEMORY_LATENCY};
+}
+
+// What a warp's global load or store costs, given where its lanes are pointing.
+GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& instr)
+{
+    // A store is fire-and-forget, so nothing waits on it whatever it cost.
+    const uint32_t store_latency =
+        instr.op == Opcode::V_ST_GLOBAL_F32 ? 0u : MEMORY_LATENCY;
+
     const uint64_t lanes = active_lane_count(warp);
     if (memory_ == MemoryModel::Flat) {
-        return lanes * instruction_cost(instr.op);
+        return {lanes * instruction_cost(instr.op), store_latency};
     }
 
     // One line per lane at worst, so a sorted array counts them without a set.
@@ -563,11 +618,28 @@ uint64_t WarpScheduler::global_access_cost(const Warp& warp,
     const auto distinct = static_cast<uint64_t>(
         std::unique(lines.begin(), lines.begin() + n) - lines.begin());
 
-    // A store is charged like a load. Hardware need not read a line a write
-    // fills completely and must read one it only partly covers, so the two are
-    // not alike — but telling them apart means tracking which lanes cover which
+    if (memory_ == MemoryModel::Cached) {
+        GlobalAccess total;
+        for (uint64_t i = 0; i < distinct; ++i) {
+            const GlobalAccess line = cache_lookup(lines[i], instr);
+            total.cost += line.cost;
+            total.latency = std::max(total.latency, line.latency);
+        }
+        if (instr.op == Opcode::V_ST_GLOBAL_F32) {
+            total.latency = 0;
+        }
+        return total;
+    }
+
+    // Per line rather than per lane, which is the whole difference: 32 adjacent
+    // floats fit one line and cost what a single lane used to, while 32 scattered
+    // ones cost what all 32 used to.
+    //
+    // A store is charged like a load. Hardware need not read a line a write fills
+    // completely and must read one it only partly covers, so the two are not
+    // alike — but telling them apart means tracking which lanes cover which
     // bytes, and nothing here asks that yet.
-    return distinct * instruction_cost(instr.op);
+    return {distinct * instruction_cost(instr.op), store_latency};
 }
 
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
@@ -866,10 +938,14 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     // access costs depends on where the lanes point, once the memory model
     // looks. Everything else is charged by opcode alone.
     const Instruction& issued = program[warp.pc];
-    const bool touches_global =
-        issued.op == Opcode::V_LD_GLOBAL_F32 || issued.op == Opcode::V_ST_GLOBAL_F32;
-    stats_.weighted_lane_ops += touches_global ? global_access_cost(warp, issued)
-                                               : lanes * instruction_cost(issued.op);
+    if (issued.op == Opcode::V_LD_GLOBAL_F32 || issued.op == Opcode::V_ST_GLOBAL_F32) {
+        const GlobalAccess access = global_access(warp, issued);
+        stats_.weighted_lane_ops += access.cost;
+        issued_latency_ = access.latency;
+    } else {
+        stats_.weighted_lane_ops += lanes * instruction_cost(issued.op);
+        issued_latency_ = instruction_latency(issued.op);
+    }
     return true;
 }
 
@@ -886,6 +962,110 @@ void WarpScheduler::release_barrier(ThreadBlock& block)
         }
     }
 }
+// Round-robin among the warps that are ready, which is what makes this reproduce
+// run() exactly when every latency is zero: nothing waits, so the same warp comes
+// up in the same order. That equality is the test — see
+// ModelledSchedulingMatchesIgnoredWhenNothingWaits.
+//
+// When nobody can issue, time moves to the soonest a warp will be ready and the
+// gap is charged to stall_steps. Cycles skipped rather than stalls counted, so a
+// hundred-cycle wait is not the same reading as a hundred one-cycle waits.
+//
+// A barrier is looked at only once no live warp is merely waiting. Releasing on
+// "nobody ready" alone would open it while warps were still on their way — the
+// arrival test has to be that no live warp can issue again without the release,
+// and a warp with a pending result can.
+void WarpScheduler::run_modelled(const Program& program, ThreadBlock& block,
+                                 DeviceSpan global)
+{
+    const size_t warps = block.warps.size();
+
+    // Retired is not the same as unavailable now, which is the distinction run()
+    // does not need: its queue holds exactly the warps that can still run.
+    std::vector<bool> live(warps, true);
+    size_t remaining = warps;
+
+    uint64_t now = 0;
+    size_t cursor = 0;
+
+    while (remaining > 0) {
+        if (now > cycle_budget_) {
+            throw std::runtime_error(
+                "WarpScheduler::run: block did not finish within " +
+                std::to_string(cycle_budget_) +
+                " cycles — a lane is waiting on one this scheduler will never "
+                "issue, or the kernel does not terminate");
+        }
+
+        // Ready: live, not waiting at a barrier, and its result has landed.
+        size_t chosen = warps;
+        for (size_t n = 0; n < warps; ++n) {
+            const size_t i = (cursor + n) % warps;
+            const Warp& w = block.warps[i];
+            if (live[i] && !w.at_barrier && w.ready_at <= now) {
+                chosen = i;
+                break;
+            }
+        }
+
+        if (chosen != warps) {
+            Warp& warp = block.warps[chosen];
+            cursor = (chosen + 1) % warps;
+
+            // Whether an instruction actually went out, which is not the same as
+            // whether the warp takes another turn: a warp discovered to have
+            // retired issued nothing and costs no time, while one arriving at a
+            // barrier issued the BARRIER and does.
+            const uint64_t before = stats_.warp_steps;
+            if (!step_warp(program, warp, block, global)) {
+                // Retired, or now waiting at a barrier. at_barrier tells them
+                // apart, and only the first is done for good.
+                if (!warp.at_barrier) {
+                    live[chosen] = false;
+                    --remaining;
+                }
+            } else {
+                // step_warp reports the latency of what it issued, which for a
+                // global access comes from the memory model rather than from the
+                // opcode alone.
+                warp.ready_at = now + issued_latency_;
+            }
+            if (stats_.warp_steps != before) {
+                ++now;
+            }
+            continue;
+        }
+
+        // Nobody ready. If any live warp is merely waiting, move time to it.
+        uint64_t soonest = UINT64_MAX;
+        for (size_t i = 0; i < warps; ++i) {
+            const Warp& w = block.warps[i];
+            if (live[i] && !w.at_barrier) {
+                soonest = std::min(soonest, w.ready_at);
+            }
+        }
+        if (soonest != UINT64_MAX) {
+            stats_.stall_steps += soonest - now;
+            now = soonest;
+            continue;
+        }
+
+        // Every live warp is at a barrier, so all of them have arrived: nothing
+        // can issue again without the release.
+        bool released = false;
+        for (Warp& warp : block.warps) {
+            if (warp.at_barrier) {
+                warp.at_barrier = false;
+                released = true;
+            }
+        }
+        if (!released) {
+            break;
+        }
+    }
+
+    stats_.cycles = now;
+}
 
 void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan global)
 {
@@ -893,24 +1073,34 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
     // belong to a destroyed block.
     ready_queue_ = {};
 
+    // One block's private cache. L2 is the device's and stays.
+    l1_.clear();
+
     for (Warp& warp : block.warps) {
         warp.at_barrier = false;
         ready_queue_.push(&warp);
     }
 
-    // One step per turn, not run-to-completion: that is what makes this
-    // round-robin, and it is also how a real scheduler hides the latency of a
-    // long-running instruction behind the other warps.
-    // Counted per turn rather than per warp, so the limit is on the block's
-    // total work and not on how the queue happened to interleave.
+    for (Warp& warp : block.warps) {
+        warp.ready_at = 0;
+    }
+
+    if (latency_ == LatencyModel::Modelled) {
+        run_modelled(program, block, global);
+        return;
+    }
+
+    // A turn is a cycle here, nothing ever waiting. Counted per turn rather than
+    // per warp, so the limit is on the block's total work and not on how the queue
+    // happened to interleave.
     uint64_t steps = 0;
     while (!ready_queue_.empty()) {
-        if (++steps > step_budget_) {
+        if (++steps > cycle_budget_) {
             throw std::runtime_error(
                 "WarpScheduler::run: block did not finish within " +
-                std::to_string(step_budget_) +
-                " warp steps — a lane is waiting on one this scheduler will "
-                "never issue, or the kernel does not terminate");
+                std::to_string(cycle_budget_) +
+                " cycles — a lane is waiting on one this scheduler will never "
+                "issue, or the kernel does not terminate");
         }
 
         Warp* warp = ready_queue_.front();
@@ -918,6 +1108,10 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
         if (step_warp(program, *warp, block, global)) {
             ready_queue_.push(warp);
         }
+
+        // Equal to warp_steps while nothing waits, and its own counter so the two
+        // can part without a rate quietly changing meaning.
+        stats_.cycles = stats_.warp_steps;
 
         // A warp that retires before reaching the barrier stops being waited
         // for. Waiting for it instead would hang, and a simulator that hangs is
@@ -932,5 +1126,9 @@ void WarpScheduler::reset_stats()
 {
     // Assigning a fresh value rather than zeroing each member, so that a counter
     // added later cannot be forgotten here.
+    //
+    // The caches are deliberately untouched. This runs between blocks, and
+    // emptying L2 here would leave it holding nothing at any point a kernel could
+    // observe — the level exists to outlive a block.
     stats_ = SchedulerStats{};
 }

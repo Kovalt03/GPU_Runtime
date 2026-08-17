@@ -239,7 +239,11 @@ uint32_t instruction_cost(Opcode op);
 // warps ready can step over one waiting on a load; a scheduler without them
 // cannot, and occupancy is the number that decides which case a kernel is in.
 //
-// Returns 0 throughout for now, which is the model every figure in benchmarks/
-// was taken under: a result is available the instant it is issued and nothing
-// ever waits.
+// Zero where an instruction produces no result to wait on — a store, a branch, a
+// barrier — and zero for a global load too, whose answer depends on where the
+// line was found and so comes from the memory model rather than from here.
+//
+// Consulted only under LatencyModel::Modelled. Every figure in benchmarks/ was
+// taken with latency ignored, which is the model where a result is available the
+// instant it is issued.
 uint32_t instruction_latency(Opcode op);

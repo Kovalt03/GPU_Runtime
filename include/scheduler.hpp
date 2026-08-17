@@ -2,7 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <queue>
+#include <unordered_map>
 
 #include "isa.hpp"
 #include "thread.hpp"
@@ -22,9 +24,21 @@ struct SchedulerStats {
     uint64_t active_lane_ops = 0;  // lane-instructions that actually ran
 
     // Turns spent with no warp able to issue, every resident one waiting on a
-    // result. The number occupancy exists to drive down, and zero while
-    // instruction_latency returns zero.
+    // result. The number occupancy exists to drive down, and zero under
+    // LatencyModel::Ignored.
     uint64_t stall_steps = 0;
+
+    // Elapsed time, as against instructions issued — equal while nothing waits.
+    // divergence_rate stays on warp_steps once they part: stalling and divergence
+    // are different waste, and one rate for both would say which to fix about
+    // neither.
+    uint64_t cycles = 0;
+
+    // Where the lines a warp asked for were found. Kept apart because the levels
+    // cost different amounts, and because an L2 hit is what says L1 evicted.
+    uint64_t l1_hits = 0;
+    uint64_t l2_hits = 0;
+    uint64_t cache_misses = 0;
 
     // active_lane_ops weighted by instruction_cost, so that throughput readings
     // distinguish a kernel full of global loads from one full of adds.
@@ -51,6 +65,10 @@ struct SchedulerStats {
         active_lane_ops += other.active_lane_ops;
         weighted_lane_ops += other.weighted_lane_ops;
         stall_steps += other.stall_steps;
+        cycles += other.cycles;
+        l1_hits += other.l1_hits;
+        l2_hits += other.l2_hits;
+        cache_misses += other.cache_misses;
         return *this;
     }
 };
@@ -100,28 +118,113 @@ enum class MemoryModel {
     // staging, which existed to stop 32 lanes issuing the same load and turns
     // out to have been saving something that cost one line anyway.
     Coalesced,
+
+    // As Coalesced, and then asking whether each line had to be fetched at all.
+    // Counting transactions says nothing about repetition: every warp of the
+    // naive walk re-reads the same triangle, and Coalesced charges each of them
+    // full price for a line the one before it just touched.
+    Cached,
+};
+
+// Whether a result is available at once or after a delay. Independent of
+// MemoryModel, which decides what an access costs in issue capacity rather than
+// how long the warp waits to use the answer.
+enum class LatencyModel {
+    // Ready the instant it is issued, so no warp waits and resident warps neither
+    // help nor hinder each other.
+    Ignored,
+
+    // instruction_latency decides when a warp may issue again, so warps cover one
+    // another's waiting — the reason they are batched, and what occupancy
+    // measures.
+    Modelled,
+};
+
+// A set of resident cache lines with least-recently-used eviction.
+//
+// Tags only, no data: a load reads device memory either way, so copies would hand
+// back the same numbers. What a cache changes is the price, and for that it need
+// only know what is resident. Nor is there dirty state — nothing reads through
+// the cache, so no write can be seen before it reaches memory.
+//
+// A map into a list rather than a scan, because L2 holds tens of thousands of
+// lines and a warp-heavy kernel looks up millions of times.
+class LineCache {
+public:
+    explicit LineCache(size_t capacity) : capacity_(capacity) {}
+
+    // Marks the line as most recently used, and says whether it was already
+    // resident. Lookup and install in one call, because a caller that did them
+    // separately could do them in the wrong order.
+    bool touch(size_t line);
+
+    // Emptied when a block starts, for a cache that belongs to one block.
+    void clear();
+
+private:
+    size_t capacity_;
+    std::list<size_t> order_;  // least recently used first
+    std::unordered_map<size_t, std::list<size_t>::iterator> resident_;
 };
 
 // Bytes fetched together. 128 is what NVIDIA moves for a warp-wide access, and
 // at four bytes a float that is a warp's 32 lanes exactly.
 inline constexpr uint32_t CACHE_LINE_BYTES = 128;
 
+// Sizes from hardware rather than scaled to these scenes, so a scene has to grow
+// past L1 before eviction happens at all.
+//
+// L1 is exact: 128 KB per SM from Volta onwards. L2 is device-wide and has grown
+// by generation — 6 MB on V100, 40 MB on A100 — and 8 MB is the low end of that.
+// Nothing here fills L2, so what it demonstrably does is catch what L1 drops.
+inline constexpr size_t L1_LINES = 1024;
+inline constexpr size_t L2_LINES = 65536;
+
+// What a line costs depending on where it was found, and how long it takes.
+//
+// Two independent scales. Cost is issue capacity, which is this project's own
+// measure; latency is cycles, following hardware in putting L1 in the tens, L2 in
+// the low hundreds and a trip to memory beyond. Both are chosen ratios with the
+// provenance instruction_cost has.
+inline constexpr uint32_t L1_HIT_COST = 8;
+inline constexpr uint32_t L2_HIT_COST = 30;
+
+inline constexpr uint32_t L1_HIT_LATENCY = 30;
+inline constexpr uint32_t L2_HIT_LATENCY = 200;
+inline constexpr uint32_t MEMORY_LATENCY = 400;
+
+// What a warp's access to global memory came to.
+//
+// Cost adds across the lines, capacity being spent on each. Latency takes the
+// worst of them, the lines being fetched together — a warp waits for the slowest,
+// not for the sum.
+struct GlobalAccess {
+    uint64_t cost = 0;
+    uint32_t latency = 0;
+};
+
 class WarpScheduler {
 public:
-    // How many warp steps one block may take before run() gives up. Issuing the
-    // lowest live pc first means a lane can wait on one that will never be
-    // reached, so not every block that fails to retire is a mistaken kernel —
-    // see LowestPcFirstStrandsALaneWaitingOnAHigherOne.
+    // How many cycles one block may take before run() gives up.
     //
-    // The heaviest kernel here takes 706 steps for a block at 256x256, so this
+    // Cycles rather than issued instructions, because the two part under
+    // LatencyModel::Modelled and a block can then burn time without issuing
+    // anything — a bound on issues alone would never be reached by a block that
+    // only ever waits.
+    //
+    // Not every block that fails to retire is a mistaken kernel: issuing the
+    // lowest live pc first means a lane can wait on one that will never be
+    // reached. See LowestPcFirstStrandsALaneWaitingOnAHigherOne.
+    //
+    // The heaviest kernel here takes 706 cycles for a block at 256x256, so this
     // leaves four orders of magnitude before anything that works could meet it.
-    static constexpr uint64_t DEFAULT_STEP_BUDGET = 1ull << 24;
+    static constexpr uint64_t DEFAULT_CYCLE_BUDGET = 1ull << 24;
 
     // Lowered by tests that mean to reach the budget: at the default, doing so
     // takes tens of seconds.
-    void set_step_budget(uint64_t steps)
+    void set_cycle_budget(uint64_t cycles)
     {
-        step_budget_ = steps;
+        cycle_budget_ = cycles;
     }
 
     // Defaults to LowestPc, which is what every measurement in benchmarks/ was
@@ -137,9 +240,25 @@ public:
         memory_ = model;
     }
 
+    // Defaults to Ignored, likewise.
+    void set_latency_model(LatencyModel model)
+    {
+        latency_ = model;
+    }
+
+    // Shrunk by tests that mean to reach a capacity: filling L2 for real would
+    // take about 175,000 triangles, so its eviction is otherwise a path no scene
+    // reaches. Both caches are emptied, a capacity change making what is resident
+    // meaningless.
+    void set_cache_lines(size_t l1, size_t l2)
+    {
+        l1_ = LineCache(l1);
+        l2_ = LineCache(l2);
+    }
+
     // Runs until every thread has retired. Throws std::runtime_error on a bad
     // register index, an unaligned or out-of-range address, a pc that leaves
-    // the program, or the step budget elapsing with the block unfinished. The
+    // the program, or the cycle budget elapsing with the block unfinished. The
     // block must outlive the call.
     void run(const Program& program, ThreadBlock& block, DeviceSpan global);
 
@@ -158,13 +277,33 @@ public:
 private:
     std::queue<Warp*> ready_queue_;  // pointers: a Warp is ~32 KB
     SchedulerStats stats_;
-    uint64_t step_budget_ = DEFAULT_STEP_BUDGET;
+    uint64_t cycle_budget_ = DEFAULT_CYCLE_BUDGET;
     WarpPolicy policy_ = WarpPolicy::LowestPc;
     MemoryModel memory_ = MemoryModel::Flat;
+    LatencyModel latency_ = LatencyModel::Ignored;
 
-    // Separate from instruction_cost because the answer is a property of the 32
-    // addresses rather than of the opcode.
-    uint64_t global_access_cost(const Warp& warp, const Instruction& instr) const;
+    // L1 belongs to the SM running one block, so run() empties it. L2 belongs to
+    // the device and outlives a launch — which it does by living here, the
+    // runtime holding one scheduler for its lifetime.
+    LineCache l1_{L1_LINES};
+    LineCache l2_{L2_LINES};
+
+    // The latency of whatever step_warp last issued, so that run_modelled need not
+    // decide it a second time — and so that a global load's answer, which comes
+    // from the memory model rather than from instruction_latency, reaches it.
+    uint32_t issued_latency_ = 0;
+
+    // Separate from instruction_cost and instruction_latency because the answer is
+    // a property of the 32 addresses rather than of the opcode.
+    GlobalAccess global_access(const Warp& warp, const Instruction& instr);
+
+    // What one line came to, given where it was found. Mutable because a lookup
+    // changes what is resident.
+    GlobalAccess cache_lookup(size_t line, const Instruction& instr);
+
+    // run() under LatencyModel::Modelled, where a warp that has issued waits for
+    // its result and the scheduler looks for one that has not.
+    void run_modelled(const Program& program, ThreadBlock& block, DeviceSpan global);
 
     // Which pc to issue under Independent. Mutable because fairness needs
     // somewhere to remember what it last did — Warp::last_issued_pc.

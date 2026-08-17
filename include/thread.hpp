@@ -53,6 +53,11 @@ struct Warp {
     // the wait cost nothing but the turns it does not take.
     bool at_barrier = false;
 
+    // The cycle this warp may next issue on, under LatencyModel::Modelled. Zero
+    // throughout while latency is ignored, which is what makes that model's
+    // scheduling identical to the one every measurement was taken under.
+    uint64_t ready_at = 0;
+
     // Where WarpPolicy::Independent left off, so the next turn can go to a
     // different pc. Unused under LowestPc, which needs no memory of its own —
     // the lowest live pc is a property of the warp's state alone.
