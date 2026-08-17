@@ -571,10 +571,36 @@ bool LineCache::touch(size_t line)
     return false;
 }
 
+void LineCache::invalidate(size_t line)
+{
+    const auto found = resident_.find(line);
+    if (found == resident_.end()) {
+        return;
+    }
+    order_.erase(found->second);
+    resident_.erase(found);
+}
+
 void LineCache::clear()
 {
     order_.clear();
     resident_.clear();
+}
+
+void WarpScheduler::invalidate_range(size_t offset, size_t bytes)
+{
+    if (bytes == 0) {
+        return;
+    }
+    // Inclusive of the line the last byte falls in, and of a partly covered line
+    // at either end: a line whose bytes are half replaced holds nothing that can
+    // be trusted, and there is no data here to update in place.
+    const size_t first = offset / CACHE_LINE_BYTES;
+    const size_t last = (offset + bytes - 1) / CACHE_LINE_BYTES;
+    for (size_t line = first; line <= last; ++line) {
+        l1_.invalidate(line);
+        l2_.invalidate(line);
+    }
 }
 
 namespace {

@@ -34,6 +34,15 @@ void MyGPURuntime::myrt_free(void* ptr)
 void MyGPURuntime::myrt_memcpy(void* dst, const void* src, size_t size, Direction dir)
 {
     mem_->memcpy(dst, src, size, dir);
+
+    // An upload replaces bytes the caches hold tags for, and they cannot see it
+    // happen: nothing went through a warp. Told nothing, they would report a hit
+    // on a line whose contents nobody had read — and since a released buffer is
+    // reallocated at the same address, that is the ordinary case rather than a
+    // corner of one. A read back changes no device byte and needs no such call.
+    if (dir == Direction::HostToDevice) {
+        scheduler_->invalidate_range(mem_->device_offset(dst), size);
+    }
 }
 
 size_t MyGPURuntime::myrt_device_offset(const void* ptr) const

@@ -98,6 +98,46 @@ TEST(Runtime, EachThreadSeesItsOwnGlobalIndex)
     rt.myrt_free(out);
 }
 
+TEST(Runtime, AnUploadForgetsTheLinesItOverwrote)
+{
+    // The caches hold tags and no data, so an upload is invisible to them unless
+    // it says so. Without this a buffer released, reallocated and filled with
+    // something else reads as a hit — the case upload-once-draw-many creates on
+    // purpose, and the one where a stale tag would be mistaken for reuse.
+    MyGPURuntime rt = make_runtime();
+    rt.myrt_set_memory_model(MemoryModel::Cached);
+
+    void* buffer = rt.myrt_malloc(CACHE_LINE_BYTES);
+    const float value = 1.0f;
+    rt.myrt_memcpy(buffer, &value, sizeof(float), Direction::HostToDevice);
+
+    // One warp-uniform read of the buffer, so each launch asks the cache about
+    // exactly one line.
+    IRBuilder k;
+    k.load(k.constant(static_cast<float>(rt.myrt_device_offset(buffer))));
+    const KernelFunc read_once = constant_kernel(k.build());
+
+    const auto misses = [&rt, &read_once] {
+        const uint64_t before = rt.stats().cache_misses;
+        rt.myrt_launch(read_once, dim3{1, 1, 1}, dim3{32, 1, 1}, nullptr);
+        return rt.stats().cache_misses - before;
+    };
+
+    EXPECT_EQ(misses(), 1u) << "the first read of a line must miss";
+    EXPECT_EQ(misses(), 0u) << "L2 outlives a launch, so the second read hits";
+
+    rt.myrt_memcpy(buffer, &value, sizeof(float), Direction::HostToDevice);
+    EXPECT_EQ(misses(), 1u) << "an upload replaced the bytes and was not noticed";
+
+    // A read back changes no device byte, so it must not cost the next reader
+    // anything.
+    float back = 0.0f;
+    rt.myrt_memcpy(&back, buffer, sizeof(float), Direction::DeviceToHost);
+    EXPECT_EQ(misses(), 0u) << "reading device memory back invalidated a line";
+
+    rt.myrt_free(buffer);
+}
+
 TEST(Runtime, TwoDimensionalLaunchGivesBothCoordinates)
 {
     // A 2D launch must hand a kernel its pixel coordinates directly: the ISA

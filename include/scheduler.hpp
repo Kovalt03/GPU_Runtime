@@ -158,6 +158,12 @@ public:
     // separately could do them in the wrong order.
     bool touch(size_t line);
 
+    // Drops a line if it is resident. What a host upload does to the copies:
+    // holding tags rather than data, the cache cannot tell that the bytes under
+    // a line have been replaced, and would report a hit on something nobody had
+    // read yet.
+    void invalidate(size_t line);
+
     // Emptied when a block starts, for a cache that belongs to one block.
     void clear();
 
@@ -255,6 +261,15 @@ public:
         l1_ = LineCache(l1);
         l2_ = LineCache(l2);
     }
+
+    // Forgets every line the byte range touches, at both levels.
+    //
+    // A host upload writes device memory without going through a warp, so the
+    // caches never see it. Holding tags and no data, they would go on reporting
+    // hits for lines whose contents had been replaced — and a buffer released
+    // and reallocated lands at the same address, which is exactly when that
+    // matters. Hardware has the same problem and answers it the same way.
+    void invalidate_range(size_t offset, size_t bytes);
 
     // Runs until every thread has retired. Throws std::runtime_error on a bad
     // register index, an unaligned or out-of-range address, a pc that leaves
