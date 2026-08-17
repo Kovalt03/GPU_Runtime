@@ -59,6 +59,25 @@ struct SchedulerStats {
 // The alternative, an explicit reconvergence stack, needs the compiler to mark
 // where control flow rejoins. Min-PC derives that from the pcs themselves, which
 // keeps the ISA free of a post-dominator annotation it has no way to compute.
+// Which live pc a warp issues when its lanes disagree.
+//
+// Every lane already carries its own pc and there is no reconvergence stack, so
+// the machine is Volta-shaped in its data. What it lacks is Volta's guarantee,
+// and that lives entirely in this choice.
+enum class WarpPolicy {
+    // The lowest live pc, always. Lanes that ran ahead wait, so a warp
+    // reconverges the moment its pcs coincide and it costs nothing to arrange.
+    // The price is that a lane can be starved by one that is merely behind it —
+    // LowestPcFirstStrandsALaneWaitingOnAHigherOne is that case.
+    LowestPc,
+
+    // Every live pc gets its turn, so no lane can be starved by another's
+    // position in the program. This is what independent thread scheduling buys
+    // and what it costs: reconvergence stops being automatic, and a kernel that
+    // needs its lanes together has to say so.
+    Independent,
+};
+
 class WarpScheduler {
 public:
     // How many warp steps one block may take before run() gives up. Issuing the
@@ -75,6 +94,13 @@ public:
     void set_step_budget(uint64_t steps)
     {
         step_budget_ = steps;
+    }
+
+    // Defaults to LowestPc, which is what every measurement in benchmarks/ was
+    // taken under.
+    void set_policy(WarpPolicy policy)
+    {
+        policy_ = policy;
     }
 
     // Runs until every thread has retired. Throws std::runtime_error on a bad
@@ -99,6 +125,11 @@ private:
     std::queue<Warp*> ready_queue_;  // pointers: a Warp is ~32 KB
     SchedulerStats stats_;
     uint64_t step_budget_ = DEFAULT_STEP_BUDGET;
+    WarpPolicy policy_ = WarpPolicy::LowestPc;
+
+    // Which pc to issue under Independent. Mutable because fairness needs
+    // somewhere to remember what it last did — Warp::last_issued_pc.
+    uint32_t select_independent_pc(Warp& warp) const;
 
     // Returns false when the warp will not take another turn — retired, or now
     // waiting at a barrier. run() tells the two apart by Warp::at_barrier.

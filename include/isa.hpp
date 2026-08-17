@@ -68,10 +68,46 @@ enum class Opcode : uint8_t {
     BRA_DIV,  // if (reg[src0] != 0.0f) pc += (int32_t)imm
               //   → splits activeMask (divergence point)
 
+    // Warp-level — the lanes talking to each other rather than merely
+    // disagreeing. See the two notes below for what the S_ prefix means and
+    // what imm carries.
+    S_BALLOT,    // mask[dst] = participants where reg[src0] != 0
+    S_ANY,       // reg[dst] = mask[src0] != 0,           in every participant
+    S_ALL,       // reg[dst] = mask[src0] == participants, in every participant
+    S_SYNCWARP,  // wait until every participant has arrived    (dst/src unused)
+
+    // The lane exchange, and the only way a value crosses between lanes without
+    // going through memory. src1 holds a lane number rather than a value, and a
+    // different one per lane, so the warp gathers in one instruction.
+    V_SHUFFLE_F32,  // reg[dst] = reg[src0] of the lane in reg[src1]
+
     // CUDA's __syncthreads().
     BARRIER,  // wait for every live warp of the block    (all operands unused)
     RET,      // end thread                               (all operands unused)
 };
+
+// --- what S_ means here -----------------------------------------------------
+// AMD reserves s_ for instructions writing a scalar register file. This machine
+// has none, so the line is drawn on the result: S_ where every lane ends up with
+// the same value, V_ where they differ. OpcodeNamesFollowScheme checks it.
+//
+// So S_ANY and S_ALL are S_ despite writing lane registers — one value
+// broadcast is what a scalar register would have held — and a lane exchange is
+// V_SHUFFLE_F32, every lane getting something different.
+
+// --- who takes part ---------------------------------------------------------
+// The warp-collective instructions name the lanes they operate over in imm,
+// rather than taking whichever lanes happen to be at the instruction. Under
+// WarpPolicy::Independent the latter is a property of the scheduler and not of
+// the program: the same kernel on the same input could ballot over a different
+// set from one run to the next.
+//
+// CUDA made this move when Volta gave each thread its own pc, replacing the
+// maskless __ballot and __shfl with the _sync family.
+//
+// A named lane that has not arrived is refused rather than skipped — a promise
+// the program cannot keep says more as a message than as a quietly smaller
+// reduction.
 
 struct Instruction {
     Opcode op;
@@ -122,6 +158,23 @@ Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0
 // CONTROL FLOW
 Instruction make_bra(int32_t offset);
 Instruction make_bra_div(uint8_t cond_reg, int32_t offset);
+// dst indexes Warp::masks for S_BALLOT and src0 does for S_ANY / S_ALL, where
+// every other factory here indexes the lane register file. The operand fields
+// are uint8_t either way, so nothing but this line says which.
+//
+// participants is spelled at every call site rather than defaulting to all 32.
+// CUDA defaults __syncwarp() to 0xffffffff and it is the commonest way to get
+// the set wrong — a kernel that has diverged names lanes that are not there.
+Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
+Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
+Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
+Instruction make_s_syncwarp(uint32_t participants);
+
+// src1 names a lane rather than holding a value, and it does so as a float in a
+// lane register: each lane reads from whichever lane its own src1 points at.
+Instruction make_v_shuffle_f32(uint8_t dst, uint8_t src0, uint8_t src1,
+                               uint32_t participants);
+
 Instruction make_barrier();
 Instruction make_ret();
 
@@ -140,6 +193,22 @@ inline CmpOp decode_cmp_op(float imm)
     uint32_t bits;
     std::memcpy(&bits, &imm, sizeof(uint32_t));
     return static_cast<CmpOp>(bits);
+}
+
+// The participation mask rides in imm the same way, and for the same reason: 32
+// bits of mask do not survive a float's 24-bit mantissa as a value.
+inline float encode_lane_mask(uint32_t participants)
+{
+    float imm;
+    std::memcpy(&imm, &participants, sizeof(float));
+    return imm;
+}
+
+inline uint32_t decode_lane_mask(float imm)
+{
+    uint32_t participants;
+    std::memcpy(&participants, &imm, sizeof(uint32_t));
+    return participants;
 }
 
 // The branch offset is a value conversion (not a bit reinterpretation),

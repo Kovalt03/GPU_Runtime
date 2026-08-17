@@ -104,6 +104,11 @@ public:
         return stats_;
     }
 
+    // How a warp picks which of its lanes to issue when they disagree. Defaults
+    // to WarpPolicy::LowestPc, which is what every figure in benchmarks/ was
+    // taken under — a caller changing it is measuring the policy itself.
+    void myrt_set_warp_policy(WarpPolicy policy);
+
     double elapsed_seconds() const
     {
         return elapsed_seconds_;

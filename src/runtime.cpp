@@ -121,6 +121,11 @@ void MyGPURuntime::myrt_sync(bool report)
 
 // Totals spanning several launches answer the same question a single run's do,
 // so the arithmetic stays in SchedulerStats.
+void MyGPURuntime::myrt_set_warp_policy(WarpPolicy policy)
+{
+    scheduler_->set_policy(policy);
+}
+
 double MyGPURuntime::divergence_rate() const
 {
     return stats_.divergence_rate();

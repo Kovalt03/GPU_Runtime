@@ -1,10 +1,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <sys/types.h>
 #include "isa.hpp"
+#include "thread.hpp"
 
 #include "scheduler.hpp"
 
@@ -116,6 +119,68 @@ size_t decode_address(float value, const char* what)
                                  std::to_string(value) + " is not a whole number");
     }
     return static_cast<size_t>(value);
+}
+
+// The mask file is the warp's, not a lane's, and it is four deep where the
+// lane file is 256. An operand that would be a perfectly ordinary register
+// index is out of range here, so the two cannot share a check.
+std::string to_hex(uint32_t v)
+{
+    char buf[9];
+    std::snprintf(buf, sizeof(buf), "%08X", v);
+    return buf;
+}
+
+void require_mask_register(uint32_t mask, const char* what)
+{
+    if (mask >= WARP_MASK_REGISTERS) {
+        throw std::runtime_error(std::string(what) + ": mask register " +
+                                 std::to_string(mask) + " leaves the " +
+                                 std::to_string(WARP_MASK_REGISTERS) + "-mask file");
+    }
+}
+
+// Every lane the instruction named has to be here. A mask that names one which
+// is not is a promise the program could not keep — under LowestPc because it
+// branched elsewhere, under Independent because it has not been scheduled yet,
+// and either way the collective result would be over a set nobody asked for.
+//
+// CUDA calls this undefined. Naming it costs one comparison and turns a wrong
+// answer into a message.
+void require_participants_present(const Warp& warp, uint32_t participants,
+                                  const char* what)
+{
+    const uint32_t missing = participants & ~warp.active_mask;
+    if (missing != 0) {
+        throw std::runtime_error(std::string(what) +
+                                 ": lanes named in the participation mask have not "
+                                 "arrived (declared 0x" +
+                                 to_hex(participants) + ", present 0x" +
+                                 to_hex(warp.active_mask) + ", missing 0x" +
+                                 to_hex(missing) + ")");
+    }
+}
+
+// Which opcodes step_warp handles in one block, gathering across the lanes and
+// then advancing the pc. BARRIER and S_SYNCWARP are not among them: both may
+// leave the pc where it is, so each keeps its own block above.
+bool is_warp_level(Opcode op)
+{
+    return op == Opcode::S_BALLOT || op == Opcode::S_ANY || op == Opcode::S_ALL ||
+           op == Opcode::V_SHUFFLE_F32;
+}
+
+// A lane index arriving as a float, which is how this machine carries every
+// integer. It has to be whole and inside the warp before it can index anything.
+uint32_t require_lane_index(float value, const char* what)
+{
+    if (value != std::floor(value) || value < 0.0f ||
+        value >= static_cast<float>(WARP_SIZE)) {
+        throw std::runtime_error(std::string(what) + ": " + std::to_string(value) +
+                                 " is not a lane index in [0, " +
+                                 std::to_string(WARP_SIZE) + ")");
+    }
+    return static_cast<uint32_t>(value);
 }
 
 void require_register_range(uint32_t reg, uint32_t count, const char* what)
@@ -411,7 +476,62 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         throw std::runtime_error(
             "BARRIER reached the lane loop; step_warp "
             "should have intercepted it");
+
+    // Warp-level, so none of them belongs in a per-lane loop, and step_warp
+    // intercepts them before it: a ballot has to see all 32 lanes at once, and
+    // S_SYNCWARP decides whether the warp advances at all.
+    case Opcode::S_BALLOT:
+    case Opcode::S_ANY:
+    case Opcode::S_ALL:
+    case Opcode::S_SYNCWARP:
+    case Opcode::V_SHUFFLE_F32:
+        throw std::runtime_error(
+            "warp-level primitive " + std::string(opcode_name(instr.op)) +
+            " is not implemented — the opcode exists so the naming and mask "
+            "storage can be settled");
     }
+}
+
+// Which pc a warp issues when no lane may be starved.
+//
+// Fair over distinct live pcs, not over lanes: lanes at one pc issue together,
+// so a turn each would weight a pc by how many sit at it and starve a lone
+// waiter exactly as LowestPc does. The deadlock this breaks is one against
+// thirty-one.
+//
+// Round-robin, taking the smallest live pc above the one issued last and
+// wrapping when there is none:
+//
+//   live {4, 8}, last 0 -> 4    last 4 -> 8    last 8 -> 4
+//
+// Costs nothing measurable. Every existing kernel issues the same work under
+// either policy, warp_steps included — a pc group runs the same instructions
+// whatever order the groups are interleaved in.
+//
+// What it gives away is the reconvergence LowestPc got for free: lanes that run
+// ahead are no longer made to wait, so a kernel that needs them together has to
+// say so with S_SYNCWARP.
+uint32_t WarpScheduler::select_independent_pc(Warp& warp) const
+{
+    // The caller has already established that some lane is live, so a pc will
+    // be found. Both of these staying at their sentinel would mean it did not.
+    uint32_t successor = UINT32_MAX;  // smallest live pc above last_issued_pc
+    uint32_t smallest = UINT32_MAX;   // smallest live pc at all, for the wrap
+
+    for (const Thread& t : warp.threads) {
+        if (!t.active) {
+            continue;
+        }
+        if (smallest > t.pc) {
+            smallest = t.pc;
+        }
+        if (t.pc > warp.last_issued_pc && t.pc < successor) {
+            successor = t.pc;
+        }
+    }
+    const uint32_t chosen = (successor != UINT32_MAX) ? successor : smallest;
+    warp.last_issued_pc = chosen;
+    return chosen;
 }
 
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
@@ -430,12 +550,17 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         return false;
     }
 
+    // The one place the policy applies. Everything downstream reads the pc that
+    // comes out of here and does not care how it was chosen.
+    const uint32_t issue_pc =
+        (policy_ == WarpPolicy::LowestPc) ? min_pc : select_independent_pc(warp);
+
     // Built from scratch: the previous step's mask says nothing about which
     // lanes have reached this instruction.
-    warp.pc = min_pc;
+    warp.pc = issue_pc;
     warp.active_mask = 0;
     for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
-        if (warp.threads[lane].active && warp.threads[lane].pc == min_pc) {
+        if (warp.threads[lane].active && warp.threads[lane].pc == issue_pc) {
             activate(warp, lane);
         }
     }
@@ -484,6 +609,203 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
 
         warp.at_barrier = true;
         return false;
+    }
+
+    if (program[warp.pc].op == Opcode::S_SYNCWARP) {
+        // The one S_ instruction that waits rather than computing. Its
+        // participation mask says which lanes have to meet here, and until they
+        // all have, the warp takes its turn without advancing.
+        //
+        // Not warp-level in the is_warp_level sense, because that path advances
+        // the pc unconditionally and waiting is exactly not doing so.
+        const uint32_t participants = decode_lane_mask(program[warp.pc].imm);
+
+        // A participant that is live but already past this instruction is never
+        // coming back, and waiting for it would spin until the step budget ran
+        // out with nothing to say. The other primitives can refuse outright;
+        // this one has to look ahead, since a lane still on its way is exactly
+        // the case it exists to wait for.
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            const Thread& t = warp.threads[lane];
+            if ((participants & (1u << lane)) != 0 && t.active && t.pc > warp.pc) {
+                throw std::runtime_error("S_SYNCWARP at pc " + std::to_string(warp.pc) +
+                                         ": lane " + std::to_string(lane) +
+                                         " is named in the participation mask but "
+                                         "is already at pc " +
+                                         std::to_string(t.pc) + " and cannot return");
+            }
+        }
+
+        if ((participants & ~warp.active_mask) != 0) {
+            // Still on their way. Spend the turn so the scheduler moves on to a
+            // pc that can make progress, and leave the pc where it is — that is
+            // what the waiting consists of.
+            //
+            // No lane op is counted because no lane did anything, which makes a
+            // wait show up as issue capacity spent for nothing. That is what a
+            // wait costs, and it is the same thing divergence_rate already
+            // measures elsewhere.
+            stats_.warp_steps += 1;
+            return true;
+        }
+
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (is_active(warp, lane)) {
+                ++warp.threads[lane].pc;
+            }
+        }
+
+        const uint64_t arrived = active_lane_count(warp);
+        stats_.warp_steps += 1;
+        stats_.active_lane_ops += arrived;
+        stats_.weighted_lane_ops += arrived * instruction_cost(Opcode::S_SYNCWARP);
+
+        // Stays in the queue, where BARRIER leaves it: a block barrier waits on
+        // the other warps and something else has to release it, while this one
+        // waits on its own lanes and has to keep taking turns to see them
+        // arrive.
+        return true;
+    }
+
+    // Warp-level primitives, intercepted for the reason BARRIER is: the lane
+    // loop below sees one thread at a time, and a ballot has to see all 32 at
+    // once. Everything these need is already in hand — warp.active_mask says
+    // who reached this instruction, which is the participating set.
+    //
+    // The mechanics after the switch are shared and already written: the pc has
+    // to be advanced by hand, since skipping the lane loop skips its increment,
+    // and the step has to be counted, since skipping the lane loop skips that
+    // too. A primitive that forgot either would loop for ever or run free.
+    if (is_warp_level(program[warp.pc].op)) {
+        const Instruction& instr = program[warp.pc];
+
+        switch (instr.op) {
+        case Opcode::S_BALLOT: {
+            // masks[dst] = the participants whose reg[src0] is non-zero.
+            //
+            // Over the declared set rather than over whoever is here, so the
+            // answer is the program's and not the scheduler's.
+            require_register_range(instr.src0, 1, "S_BALLOT src0");
+            require_mask_register(instr.dst, "S_BALLOT dst");
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            require_participants_present(warp, participants, "S_BALLOT");
+
+            uint32_t voted = 0;
+            for (uint32_t lane = 0; lane < WARP_SIZE; lane++) {
+                const bool taking_part = (participants & (1u << lane)) != 0;
+                if (taking_part && warp.threads[lane].regs[instr.src0] != 0.0f) {
+                    voted |= 1u << lane;
+                }
+            }
+            warp.masks[instr.dst] = voted;
+            break;
+        }
+
+        case Opcode::S_ANY: {
+            // reg[dst] = 1.0 in every participant if masks[src0] has any bit
+            // set. Written to every participant because the result is
+            // warp-uniform and there is nowhere else to put it — the machine has
+            // no scalar register file.
+            require_mask_register(instr.src0, "S_ANY src0");
+            require_register_range(instr.dst, 1, "S_ANY dst");
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            require_participants_present(warp, participants, "S_ANY");
+
+            const float any = (warp.masks[instr.src0] != 0u) ? 1.0f : 0.0f;
+            for (uint32_t lane = 0; lane < WARP_SIZE; lane++) {
+                if ((participants & (1u << lane)) != 0) {
+                    warp.threads[lane].regs[instr.dst] = any;
+                }
+            }
+            break;
+        }
+
+        case Opcode::S_ALL: {
+            // As S_ANY, but every participant must have voted.
+            //
+            // Compared against the declared set, not against all ones and not
+            // against whoever turned up: a full mask is unreachable in a warp
+            // that has diverged, and the active set is the scheduler's answer
+            // rather than the program's.
+            require_mask_register(instr.src0, "S_ALL src0");
+            require_register_range(instr.dst, 1, "S_ALL dst");
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            require_participants_present(warp, participants, "S_ALL");
+
+            const float all = (warp.masks[instr.src0] == participants) ? 1.0f : 0.0f;
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                if ((participants & (1u << lane)) != 0) {
+                    warp.threads[lane].regs[instr.dst] = all;
+                }
+            }
+            break;
+        }
+
+        case Opcode::V_SHUFFLE_F32: {
+            // reg[dst] of each participant = reg[src0] of the lane its own
+            // reg[src1] names.
+            //
+            // Gathered in full before anything is written. Writing as it reads
+            // would let a lane take the value another has just produced instead
+            // of the one it started with — only where dst and src0 are the same
+            // register, and only at the wrap, so a rotation is the scene that
+            // shows it. No other instruction here leaves its own lane, so none
+            // has needed the precaution.
+            require_register_range(instr.src0, 1, "V_SHUFFLE_F32 src0");
+            require_register_range(instr.src1, 1, "V_SHUFFLE_F32 src1");
+            require_register_range(instr.dst, 1, "V_SHUFFLE_F32 dst");
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            require_participants_present(warp, participants, "V_SHUFFLE_F32");
+            std::array<float, WARP_SIZE> gathered{};
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                if ((participants & (1u << lane)) == 0) {
+                    continue;
+                }
+
+                const uint32_t src_lane = require_lane_index(
+                    warp.threads[lane].regs[instr.src1], "V_SHUFFLE_F32 src1");
+
+                // A participant reading outside the mask has nowhere to take a
+                // value from, and leaving its dst as gathered was initialised
+                // would hand it a number nobody computed.
+                if ((participants & (1u << src_lane)) == 0) {
+                    throw std::runtime_error(
+                        "V_SHUFFLE_F32: lane " + std::to_string(lane) + " reads lane " +
+                        std::to_string(src_lane) +
+                        ", which the participation mask does not name");
+                }
+                gathered[lane] = warp.threads[src_lane].regs[instr.src0];
+            }
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                if ((participants & (1u << lane)) != 0) {
+                    warp.threads[lane].regs[instr.dst] = gathered[lane];
+                }
+            }
+            break;
+        }
+
+        default:
+            // is_warp_level admitted it, so this cannot be reached. Unlike
+            // opcode_name(), which must cover every opcode and therefore has no
+            // default, this switch handles a subset on purpose.
+            throw std::runtime_error("is_warp_level and step_warp disagree about " +
+                                     std::string(opcode_name(instr.op)));
+        }
+
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (is_active(warp, lane)) {
+                ++warp.threads[lane].pc;
+            }
+        }
+
+        const uint64_t voting = active_lane_count(warp);
+        stats_.warp_steps += 1;
+        stats_.active_lane_ops += voting;
+        stats_.weighted_lane_ops += voting * instruction_cost(instr.op);
+
+        // true, where BARRIER returns false: a barrier takes the warp out of the
+        // queue to wait, and these have nothing to wait for.
+        return true;
     }
 
     // Skipping the masked lanes is what divergence costs: they are paid for by

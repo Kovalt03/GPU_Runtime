@@ -13,6 +13,12 @@ namespace {
 
 constexpr size_t GLOBAL_BYTES = 1024;
 
+// Every lane of a warp, which is what a converged S_ instruction declares.
+// Spelled out at each call site rather than defaulted, because naming a lane
+// that is not there is the mistake the mask exists to expose.
+constexpr uint32_t ALL_LANES = 0xFFFFFFFFu;
+constexpr uint32_t LOW_HALF = 0x0000FFFFu;
+
 // A one-warp block plus a scratch device buffer, which is what most of these
 // tests need. The buffer is a member so its address stays valid for the span.
 struct Fixture {
@@ -60,6 +66,38 @@ void broadcast(Warp& warp, uint8_t reg, float value)
 {
     for (Thread& t : warp.threads) {
         t.regs[reg] = value;
+    }
+}
+
+// A warp-internal producer-consumer, which ordinary CUDA writes and which the
+// two scheduling policies disagree about entirely.
+//
+// Lane 0 spins on a flag in memory; every other lane jumps forward to the store
+// that sets it. The spin sits at a lower pc than the store, so the two policies
+// disagree about it entirely — which is why both tests build it from here rather
+// than from two copies that could drift.
+Program producer_consumer_program()
+{
+    Program p;
+    p.push_back(make_v_mov_f32(0, 1.0f));                           // 0
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0, CmpOp::GE));  // 1: lane >= 1
+    p.push_back(make_bra_div(1, 6));                                // 2: to the writer
+    p.push_back(make_v_mov_f32(2, 0.0f));                           // 3: spin, addr 0
+    p.push_back(make_v_ld_global_f32(3, 2, 0.0f));                  // 4:   flag = mem[0]
+    p.push_back(make_v_cmp_f32(4, 3, 2, CmpOp::EQ));                // 5:   still zero?
+    p.push_back(make_bra_div(4, -3));                               // 6:   back to 4
+    p.push_back(make_ret());                                        // 7
+    p.push_back(make_v_mov_f32(5, 0.0f));                           // 8: writer, addr 0
+    p.push_back(make_v_mov_f32(6, 1.0f));                           // 9
+    p.push_back(make_v_st_global_f32(5, 6, 0.0f));                  // 10: mem[0] = 1
+    p.push_back(make_ret());                                        // 11
+    return p;
+}
+
+void seed_lane_ids(ThreadBlock& block)
+{
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
     }
 }
 
@@ -758,24 +796,8 @@ TEST(Scheduler, LowestPcFirstStrandsALaneWaitingOnAHigherOne)
     // then schedules them independently, which it does not. What is missing is
     // a policy, not a data structure.
     ThreadBlock block = make_block(1);
-
-    Program p;
-    p.push_back(make_v_mov_f32(0, 1.0f));                           // 0
-    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0, CmpOp::GE));  // 1: lane >= 1
-    p.push_back(make_bra_div(1, 6));                                // 2: to the writer
-    p.push_back(make_v_mov_f32(2, 0.0f));                           // 3: spin, addr 0
-    p.push_back(make_v_ld_global_f32(3, 2, 0.0f));                  // 4:   flag = mem[0]
-    p.push_back(make_v_cmp_f32(4, 3, 2, CmpOp::EQ));                // 5:   still zero?
-    p.push_back(make_bra_div(4, -3));                               // 6:   back to 4
-    p.push_back(make_ret());                                        // 7
-    p.push_back(make_v_mov_f32(5, 0.0f));                           // 8: writer, addr 0
-    p.push_back(make_v_mov_f32(6, 1.0f));                           // 9
-    p.push_back(make_v_st_global_f32(5, 6, 0.0f));                  // 10: mem[0] = 1
-    p.push_back(make_ret());                                        // 11
-
-    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
-        block.warps[0].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
-    }
+    const Program p = producer_consumer_program();
+    seed_lane_ids(block);
 
     WarpScheduler scheduler;
     // Small enough that asserting the hang costs milliseconds. The spin issues
@@ -815,4 +837,498 @@ TEST(Scheduler, TheStepBudgetDoesNotStandInTheWayOfAKernelThatFinishes)
     std::vector<uint8_t> memory(16, 0);
     scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
     EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[0], 7.0f);
+}
+
+// Enabled by [m1]. Independent has to run what LowestPc strands, and leave every
+// existing measurement where it is — a policy that changed the issued work would
+// invalidate benchmarks/RESULTS.md rather than extend it.
+// Enabled by [m1], alongside the test below. One warp cannot catch a cursor
+// kept on the scheduler instead of on the warp: with nothing else taking turns,
+// a shared cursor and a private one behave identically. Two warps, each with a
+// lane to starve, is the smallest scene where they part — the other warp's turn
+// advances a shared cursor and this warp's next choice skips past the pc it was
+// supposed to visit.
+TEST(Scheduler, IndependentSchedulingIsFairWithinEachWarpSeparately)
+{
+    ThreadBlock block = make_block(2);
+    const Program p = producer_consumer_program();
+    for (uint32_t w = 0; w < 2; ++w) {
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            block.warps[w].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+        }
+    }
+
+    WarpScheduler scheduler;
+    scheduler.set_policy(WarpPolicy::Independent);
+    scheduler.set_step_budget(10000);
+
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    float flag = -1.0f;
+    std::memcpy(&flag, memory.data(), sizeof(float));
+    EXPECT_FLOAT_EQ(flag, 1.0f) << "a warp was starved by another warp's turns";
+}
+
+TEST(Scheduler, IndependentSchedulingRunsWhatLowestPcStrands)
+{
+    ThreadBlock block = make_block(1);
+    const Program p = producer_consumer_program();
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    scheduler.set_policy(WarpPolicy::Independent);
+    scheduler.set_step_budget(10000);
+
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    float flag = -1.0f;
+    std::memcpy(&flag, memory.data(), sizeof(float));
+    EXPECT_FLOAT_EQ(flag, 1.0f) << "the writer never issued";
+}
+
+// Lanes 0..15 vote yes and 16..31 vote no, so S_ANY and S_ALL disagree. A scene
+// where every lane votes the same way makes them indistinguishable, and would
+// pass against an implementation that read neither the mask nor the predicate.
+Program voting_program()
+{
+    Program p;
+    p.push_back(make_v_mov_f32(2, 16.0f));
+    p.push_back(make_v_cmp_f32(5, REG_GLOBAL_ID_X, 2, CmpOp::LT));  // r5 = lane < 16
+    p.push_back(make_s_ballot(0, 5, ALL_LANES));                    // m0 = ballot(r5)
+    p.push_back(make_s_any(6, 0, ALL_LANES));                       // r6 = any(m0)
+    p.push_back(make_s_all(7, 0, ALL_LANES));                       // r7 = all(m0)
+    p.push_back(make_ret());
+    return p;
+}
+
+TEST(Scheduler, BallotReportsWhichLanesVoted)
+{
+    ThreadBlock block = make_block(1);
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(voting_program(), block, DeviceSpan{memory.data(), memory.size()});
+
+    // The predicate, not the active mask. An implementation that balloted on
+    // activity alone would report all ones here and pass every other assertion
+    // in this file.
+    EXPECT_EQ(block.warps[0].masks[0], 0x0000FFFFu);
+}
+
+TEST(Scheduler, BallotCountsOnlyTheLanesItNamed)
+{
+    // Lanes 16..31 branch past the ballot, so the ballot declares the low half.
+    // Their registers hold a yes, and the answer must not include them: the
+    // result is over the lanes the program named, not over whatever the file
+    // happens to contain.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(5, 1.0f));                           // 0: every lane yes
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 1
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 2: lane >= 16
+    p.push_back(make_bra_div(1, 2));                                // 3: those jump on
+    p.push_back(make_s_ballot(0, 5, LOW_HALF));                     // 4
+    p.push_back(make_ret());                                        // 5
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_EQ(block.warps[0].masks[0], LOW_HALF)
+        << "lanes that branched past the ballot voted in it";
+}
+
+TEST(Scheduler, AnyAndAllReduceTheBallotToOneAnswerPerWarp)
+{
+    ThreadBlock block = make_block(1);
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(voting_program(), block, DeviceSpan{memory.data(), memory.size()});
+
+    // The same answer in every lane, including the ones that voted no: this is
+    // a reduction, not a copy of each lane's own vote. Half the warp voting yes
+    // is what separates the two — any is true, all is false.
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        EXPECT_FLOAT_EQ(block.warps[0].threads[lane].regs[6], 1.0f)
+            << "S_ANY disagreed in lane " << lane;
+        EXPECT_FLOAT_EQ(block.warps[0].threads[lane].regs[7], 0.0f)
+            << "S_ALL disagreed in lane " << lane;
+    }
+}
+
+TEST(Scheduler, AllIsTrueWhenEveryParticipatingLaneVoted)
+{
+    // The other half of S_ALL, and the reason it compares against the active
+    // mask rather than against all ones: here every lane votes yes.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(5, 1.0f));
+    p.push_back(make_s_ballot(0, 5, ALL_LANES));
+    p.push_back(make_s_all(7, 0, ALL_LANES));
+    p.push_back(make_ret());
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[7], 1.0f);
+}
+
+TEST(Scheduler, AllComparesAgainstWhoArrivedRatherThanAllThirtyTwo)
+{
+    // Lanes 16..31 branch past, and every lane that does arrive votes yes. So
+    // S_ALL is true — of the lanes participating, all of them voted.
+    //
+    // The scene exists because a full warp cannot tell the two rules apart: with
+    // every lane active the participating mask IS all ones, and comparing
+    // against the constant gives the same answer. Only under divergence do they
+    // part, and then the constant is wrong every time.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(5, 1.0f));                           // 0: every lane yes
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 1
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 2
+    p.push_back(make_bra_div(1, 3));                                // 3: 16.. skip to 6
+    p.push_back(make_s_ballot(0, 5, LOW_HALF));                     // 4
+    p.push_back(make_s_all(7, 0, LOW_HALF));                        // 5
+    p.push_back(make_ret());                                        // 6
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_EQ(block.warps[0].masks[0], LOW_HALF);
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[7], 1.0f)
+        << "S_ALL demanded votes from lanes that were never there";
+}
+
+TEST(Scheduler, AWarpUniformResultDoesNotReachLanesThatBranchedAway)
+{
+    // A lane that skipped the reduction is somewhere else in the program, and
+    // its registers belong to that path. Writing the answer to all 32 would
+    // reach through the divergence and overwrite a value the other branch is
+    // still using.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(7, 9.0f));                           // 0: sentinel
+    p.push_back(make_v_mov_f32(5, 1.0f));                           // 1
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 2
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 3
+    p.push_back(make_bra_div(1, 3));                                // 4: 16.. skip to 7
+    p.push_back(make_s_ballot(0, 5, LOW_HALF));                     // 5
+    p.push_back(make_s_any(7, 0, LOW_HALF));                        // 6: overwrites r7
+    p.push_back(make_ret());                                        // 7
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[7], 1.0f) << "lane 0 took part";
+    EXPECT_FLOAT_EQ(block.warps[0].threads[31].regs[7], 9.0f)
+        << "lane 31 branched away and had its register written anyway";
+}
+
+TEST(Scheduler, WarpPrimitivesRejectAnOperandFromTheWrongFile)
+{
+    // dst and src0 name different files depending on the opcode — the mask file
+    // is four deep where the lane file is 256, so an index that is ordinary in
+    // one is out of range in the other. Nothing in the encoding says which.
+    const Instruction bad[] = {
+        make_s_ballot(WARP_MASK_REGISTERS, 5, ALL_LANES),  // dst is a mask
+        make_s_any(6, WARP_MASK_REGISTERS, ALL_LANES),     // src0 is a mask
+        make_s_all(7, WARP_MASK_REGISTERS, ALL_LANES),
+    };
+
+    for (const Instruction& instr : bad) {
+        ThreadBlock block = make_block(1);
+        Program p;
+        p.push_back(instr);
+        p.push_back(make_ret());
+
+        WarpScheduler scheduler;
+        std::vector<uint8_t> memory(16, 0);
+        EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                     std::runtime_error)
+            << opcode_name(instr.op);
+    }
+}
+
+TEST(Scheduler, ACollectiveIgnoresLanesThatAreHereButNotNamed)
+{
+    // Nothing has diverged: all 32 lanes are at the instruction. The mask names
+    // half of them anyway, and the other half must take no part — they are
+    // present, but the program did not ask them.
+    //
+    // The case that separates a declared set from an inferred one. Wherever a
+    // warp has diverged the two coincide, because a lane that branched away is
+    // not active either; only a converged warp with a partial declaration tells
+    // them apart.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(5, 1.0f));        // every lane votes yes
+    p.push_back(make_s_ballot(0, 5, LOW_HALF));  // but only sixteen are asked
+    p.push_back(make_s_all(7, 0, LOW_HALF));
+    p.push_back(make_s_any(6, 0, LOW_HALF));
+    p.push_back(make_ret());
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_EQ(block.warps[0].masks[0], LOW_HALF) << "lanes outside the mask voted";
+
+    // Every named lane voted, so S_ALL is true — against the declared set. Read
+    // against the active mask it would be false, all 32 lanes being here.
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[7], 1.0f);
+
+    // And the answer reaches the participants only.
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[6], 1.0f);
+    EXPECT_FLOAT_EQ(block.warps[0].threads[31].regs[6], 0.0f)
+        << "a lane outside the mask was written to";
+}
+
+TEST(Scheduler, NamingALaneThatIsNotThereIsRefused)
+{
+    // The promise the mask makes. Lanes 16..31 have branched away, so declaring
+    // all 32 names lanes that cannot take part — under LowestPc because they
+    // are elsewhere in the program, and under Independent because they may
+    // simply not have been scheduled yet. CUDA leaves this undefined; a
+    // simulator can say so instead.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(5, 1.0f));                           // 0
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 1
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 2
+    p.push_back(make_bra_div(1, 2));                                // 3: 16.. -> 5
+    p.push_back(make_s_ballot(0, 5, ALL_LANES));                    // 4: over-declares
+    p.push_back(make_ret());                                        // 5
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, SyncwarpGathersLanesThatIndependentSchedulingLetDrift)
+{
+    // Lanes take different paths and then meet. Under LowestPc they converge on
+    // their own, because a lane that ran ahead is made to wait; under
+    // Independent nothing makes them, and the sync is the only thing that can.
+    //
+    // Both policies must produce the same frame, which is what makes the sync
+    // worth having rather than merely present.
+    Program p;
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 0
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 1
+    p.push_back(make_bra_div(1, 3));                                // 2: 16.. -> 5
+    p.push_back(make_v_mov_f32(3, 1.0f));                           // 3
+    p.push_back(make_bra(2));                                       // 4: -> 6
+    p.push_back(make_v_mov_f32(3, 2.0f));                           // 5
+    p.push_back(make_s_syncwarp(ALL_LANES));                        // 6
+    p.push_back(make_v_mov_f32(9, 7.0f));                           // 7
+    p.push_back(make_ret());                                        // 8
+
+    for (const WarpPolicy policy : {WarpPolicy::LowestPc, WarpPolicy::Independent}) {
+        ThreadBlock block = make_block(1);
+        seed_lane_ids(block);
+
+        WarpScheduler scheduler;
+        scheduler.set_policy(policy);
+        std::vector<uint8_t> memory(16, 0);
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            EXPECT_FLOAT_EQ(block.warps[0].threads[lane].regs[9], 7.0f)
+                << "lane " << lane << " never passed the sync";
+        }
+    }
+}
+
+TEST(Scheduler, SyncwarpRefusesToWaitForALaneAlreadyPastIt)
+{
+    // A participant that branched beyond the sync is never coming back. Waiting
+    // would spin until the step budget ran out and report only that the block
+    // did not finish, which says nothing about why.
+    ThreadBlock block = make_block(1);
+
+    Program p;
+    p.push_back(make_v_mov_f32(2, 16.0f));                          // 0
+    p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 1
+    p.push_back(make_bra_div(1, 3));                                // 2: 16.. -> 4
+    p.push_back(make_s_syncwarp(ALL_LANES));                        // 3: waits for them
+    p.push_back(make_ret());                                        // 4
+
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    scheduler.set_step_budget(10000);
+    std::vector<uint8_t> memory(16, 0);
+
+    // Checked by message, not merely by type: without the look-ahead this waits
+    // until the step budget runs out and throws anyway, so EXPECT_THROW alone
+    // would pass against the very implementation this test rules out.
+    try {
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+        FAIL() << "the sync completed with a lane that had gone past it";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("S_SYNCWARP"), std::string::npos)
+            << "gave up on the step budget rather than naming the lane: " << e.what();
+    }
+}
+
+// lane i takes lane i+1, wrapping, in place. The rotation is what makes this a
+// real exchange rather than a broadcast, and reusing one register for dst and
+// src0 is what lets a write reach a source another lane has yet to read.
+Program rotate_in_place(uint8_t reg, uint32_t participants)
+{
+    Program p;
+    p.push_back(make_v_mov_f32(1, 1.0f));
+    p.push_back(make_v_mov_f32(2, static_cast<float>(WARP_SIZE)));
+    p.push_back(make_v_add_f32(6, REG_GLOBAL_ID_X, 1));  // lane + 1
+    p.push_back(make_v_cmp_f32(3, 6, 2, CmpOp::LT));     // still in range?
+    p.push_back(make_bra_div(3, 2));                     // yes -> skip
+    p.push_back(make_v_mov_f32(6, 0.0f));                // no  -> wrap to 0
+    p.push_back(make_v_shuffle_f32(reg, reg, 6, participants));
+    p.push_back(make_ret());
+    return p;
+}
+
+TEST(Scheduler, ShuffleReadsEveryLaneBeforeWritingAny)
+{
+    // The last lane is the one that catches it. Reading forward while iterating
+    // forward means every other lane takes a source nothing has touched yet;
+    // only the wrap reaches a lane already written, so the first thirty-one
+    // agree whether or not the reads were separated from the writes.
+    ThreadBlock block = make_block(1);
+    seed_lane_ids(block);
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[5] = static_cast<float>(lane);
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(rotate_in_place(5, ALL_LANES), block,
+                  DeviceSpan{memory.data(), memory.size()});
+
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        EXPECT_FLOAT_EQ(block.warps[0].threads[lane].regs[5],
+                        static_cast<float>((lane + 1) % WARP_SIZE))
+            << "lane " << lane;
+    }
+}
+
+TEST(Scheduler, ShuffleRefusesALaneIndexThatIsNotOne)
+{
+    // The index is a float a kernel computed, so it can be fractional or well
+    // outside the warp. Used as a subscript it would read past a 33 KB warp
+    // into whatever follows, and quietly — the run below returned zero before
+    // this check existed.
+    for (const float index : {3.7f, 900.0f, -5.0f}) {
+        ThreadBlock block = make_block(1);
+        Program p;
+        p.push_back(make_v_shuffle_f32(7, 5, 6, ALL_LANES));
+        p.push_back(make_ret());
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            block.warps[0].threads[lane].regs[6] = index;
+        }
+
+        WarpScheduler scheduler;
+        std::vector<uint8_t> memory(16, 0);
+        EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                     std::runtime_error)
+            << index;
+    }
+}
+
+TEST(Scheduler, ShuffleIgnoresTheIndexHeldByALaneTakingNoPart)
+{
+    // A lane outside the mask is on another path, and the register the shuffle
+    // reads its index from belongs to that path. Validating it would fail the
+    // instruction over a lane that is not in it.
+    ThreadBlock block = make_block(1);
+    Program p;
+    p.push_back(make_v_shuffle_f32(7, 5, 6, LOW_HALF));
+    p.push_back(make_ret());
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[5] = 100.0f + static_cast<float>(lane);
+        block.warps[0].threads[lane].regs[6] = (lane < 16) ? 0.0f : 12345.6f;
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[7], 100.0f);
+}
+
+TEST(Scheduler, ShuffleRefusesToReadOutsideTheParticipationMask)
+{
+    // A participant has to end up with a value. Skipping the read instead would
+    // leave its dst holding whatever the gather buffer started as — a number
+    // nobody computed, in a frame that looks plausible.
+    ThreadBlock block = make_block(1);
+    Program p;
+    p.push_back(make_v_shuffle_f32(7, 5, 6, LOW_HALF));
+    p.push_back(make_ret());
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[5] = 100.0f + static_cast<float>(lane);
+        block.warps[0].threads[lane].regs[6] = (lane == 3) ? 20.0f : 0.0f;
+    }
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(16, 0);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, AWarpCarriesItsOwnMaskRegisters)
+{
+    // The storage decision, pinned before anything writes to it: a 32-bit mask
+    // cannot live in the float register file, which is exact only to 2^24, so
+    // the top eight lanes of a ballot would be lost. Masks belong to the warp,
+    // not the lane, and there are several so a kernel holding one ballot can
+    // take another.
+    const Warp warp;
+    EXPECT_EQ(warp.masks.size(), WARP_MASK_REGISTERS);
+    for (const uint32_t mask : warp.masks) {
+        EXPECT_EQ(mask, 0u) << "a warp must start with no lanes balloted";
+    }
+
+    // The reason the file exists at all: this is the value a full ballot has to
+    // hold, and a float cannot hold it. Compared as doubles because converting
+    // the rounded float back to uint32_t is undefined — it lands one above the
+    // range, which is exactly the problem being demonstrated.
+    const uint32_t all_lanes = 0xFFFFFFFFu;
+    EXPECT_NE(static_cast<double>(static_cast<float>(all_lanes)),
+              static_cast<double>(all_lanes));
+
+    // And the boundary it starts at: lane 24 is the first whose bit a float
+    // cannot carry alongside the ones below it.
+    EXPECT_EQ(static_cast<double>(static_cast<float>((1u << 24) - 1)),
+              static_cast<double>((1u << 24) - 1));
+    EXPECT_NE(static_cast<double>(static_cast<float>((1u << 25) - 1)),
+              static_cast<double>((1u << 25) - 1));
 }

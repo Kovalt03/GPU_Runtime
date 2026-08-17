@@ -55,6 +55,13 @@ std::string_view opcode_name(Opcode op)
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
     case Opcode::BRA_DIV:          return "BRA_DIV";
+    // WARP-LEVEL
+    case Opcode::S_BALLOT:         return "S_BALLOT";
+    case Opcode::S_ANY:            return "S_ANY";
+    case Opcode::S_ALL:            return "S_ALL";
+    case Opcode::S_SYNCWARP:       return "S_SYNCWARP";
+    case Opcode::V_SHUFFLE_F32:    return "V_SHUFFLE_F32";
+    // SYNC
     case Opcode::BARRIER:          return "BARRIER";
     case Opcode::RET:              return "RET";
     }
@@ -209,6 +216,40 @@ Instruction make_bra_div(uint8_t cond_reg, int32_t offset)
     return {Opcode::BRA_DIV, 0, cond_reg, 0, encode_branch_offset(offset)};
 }
 
+// ---------------------------------------------------------------------------
+// WARP-LEVEL — participants rides in imm (encode_lane_mask / decode_lane_mask)
+// ---------------------------------------------------------------------------
+
+Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants)
+{
+    return {Opcode::S_BALLOT, dst, src0, 0, encode_lane_mask(participants)};
+}
+
+Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants)
+{
+    return {Opcode::S_ANY, dst, src0, 0, encode_lane_mask(participants)};
+}
+
+Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants)
+{
+    return {Opcode::S_ALL, dst, src0, 0, encode_lane_mask(participants)};
+}
+
+Instruction make_s_syncwarp(uint32_t participants)
+{
+    return {Opcode::S_SYNCWARP, 0, 0, 0, encode_lane_mask(participants)};
+}
+
+Instruction make_v_shuffle_f32(uint8_t dst, uint8_t src0, uint8_t src1,
+                               uint32_t participants)
+{
+    return {Opcode::V_SHUFFLE_F32, dst, src0, src1, encode_lane_mask(participants)};
+}
+
+// ---------------------------------------------------------------------------
+// SYNC
+// ---------------------------------------------------------------------------
+
 Instruction make_barrier()
 {
     return {Opcode::BARRIER, 0, 0, 0, 0.0f};
@@ -272,8 +313,20 @@ uint32_t instruction_cost(Opcode op)
 
     // The instruction itself is nothing; the cost of a barrier is the stall
     // while the slowest warp catches up, and that shows as warps not issuing
-    // rather than as weight on this line.
-    case Opcode::BARRIER: return 1;
+    // rather than as weight on this line. S_SYNCWARP is the same argument one
+    // level down.
+    case Opcode::BARRIER:
+    case Opcode::S_SYNCWARP: return 1;
+
+    // Placeholders. A ballot reads all 32 lanes and reduces them, and a shuffle
+    // permutes across them, so neither is one lane-op whatever it turns out to
+    // cost. The figure comes from measuring a warp reduction against the
+    // shared-memory one it replaces; until then a plausible number here would be
+    // one nothing measured.
+    case Opcode::S_BALLOT:
+    case Opcode::S_ANY:
+    case Opcode::S_ALL:
+    case Opcode::V_SHUFFLE_F32: return 1;
     }
 
     return 1;

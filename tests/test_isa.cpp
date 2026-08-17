@@ -12,11 +12,18 @@ namespace {
 constexpr int OPCODE_COUNT = static_cast<int>(Opcode::RET) + 1;
 
 // Control flow sits at the end of the enum. The naming-scheme test splits
-// the opcodes into these two groups.
+// the opcodes into three groups, of which this is one.
 bool is_control_flow(Opcode op)
 {
     return op == Opcode::BRA || op == Opcode::BRA_DIV || op == Opcode::BARRIER ||
-           op == Opcode::RET;
+           op == Opcode::RET || op == Opcode::S_SYNCWARP;
+}
+
+// Warp-uniform: one result, the same in every lane. S_SYNCWARP carries the
+// prefix but produces nothing at all, so it is grouped with control flow above.
+bool is_warp_uniform(Opcode op)
+{
+    return op == Opcode::S_BALLOT || op == Opcode::S_ANY || op == Opcode::S_ALL;
 }
 
 bool starts_with(std::string_view s, std::string_view prefix)
@@ -67,10 +74,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 25 opcodes, 0-indexed → RET == 24
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 24);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 23);
-    EXPECT_EQ(OPCODE_COUNT, 25);
+    // 30 opcodes, 0-indexed → RET == 29
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 29);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 28);
+    EXPECT_EQ(OPCODE_COUNT, 30);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -105,9 +112,20 @@ TEST(Isa, OpcodeNamesFollowScheme)
                 << name << ": control flow must not carry the V_ prefix";
             EXPECT_FALSE(has_type_suffix(name))
                 << name << ": control flow must not carry a type suffix";
+        } else if (is_warp_uniform(op)) {
+            // One result for the whole warp, so it is not a lane-wise
+            // instruction and does not claim V_. No type suffix either: a mask
+            // is bits rather than a float, and the type tokens the scheme
+            // reserves are all float widths.
+            EXPECT_TRUE(starts_with(name, "S_"))
+                << name << ": warp-uniform instruction must start with S_";
+            EXPECT_FALSE(has_type_suffix(name))
+                << name << ": a warp-uniform result carries no float type";
         } else {
             EXPECT_TRUE(starts_with(name, "V_"))
                 << name << ": lane-wise instruction must start with V_";
+            EXPECT_FALSE(starts_with(name, "S_"))
+                << name << ": a per-lane result must not claim the S_ prefix";
             EXPECT_TRUE(has_type_suffix(name))
                 << name << ": type suffix must come last (_F32 / _F64 / _F16)";
         }
