@@ -328,15 +328,14 @@ void IRBuilder::load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset)
 
 Reg<Vec3> IRBuilder::load_vec3(Reg<Scalar> address, float offset)
 {
-    // Three separate loads until V_LD_GLOBAL_VEC3_F32 exists. That opcode is
-    // worth adding only alongside a kernel that loops over triangles, where the
-    // coalescing it models can actually be measured.
     const Reg<Vec3> dst = alloc<Vec3>();
-    for (uint32_t i = 0; i < Vec3::REGISTERS; ++i) {
-        emit(make_v_ld_global_f32(static_cast<uint8_t>(dst.first() + i), address.first(),
-                                  offset + static_cast<float>(i) * COMPONENT_STRIDE));
-    }
+    emit(make_v_ld_global_vec3_f32(dst.first(), address.first(), offset));
     return dst;
+}
+
+void IRBuilder::load_vec3_into(Reg<Vec3> dst, Reg<Scalar> address, float offset)
+{
+    emit(make_v_ld_global_vec3_f32(dst.first(), address.first(), offset));
 }
 
 Reg<Scalar> IRBuilder::load_shared(Reg<Scalar> address, float offset)

@@ -74,10 +74,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 30 opcodes, 0-indexed → RET == 29
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 29);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 28);
-    EXPECT_EQ(OPCODE_COUNT, 30);
+    // 31 opcodes, 0-indexed → RET == 30
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 30);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 29);
+    EXPECT_EQ(OPCODE_COUNT, 31);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -87,7 +87,8 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_MATVEC_MAT4_F32), 15);
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 21);
+    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 22);
 }
 
 // ---------------------------------------------------------------------------
@@ -149,8 +150,9 @@ TEST(Isa, ShapeTokensAreFromTheAllowedSet)
 
 TEST(Isa, MemoryOpcodesCarryAddressSpace)
 {
-    const Opcode mem_ops[] = {Opcode::V_LD_GLOBAL_F32, Opcode::V_ST_GLOBAL_F32,
-                              Opcode::V_LD_SHARED_F32, Opcode::V_ST_SHARED_F32};
+    const Opcode mem_ops[] = {Opcode::V_LD_GLOBAL_F32, Opcode::V_LD_GLOBAL_VEC3_F32,
+                              Opcode::V_ST_GLOBAL_F32, Opcode::V_LD_SHARED_F32,
+                              Opcode::V_ST_SHARED_F32};
 
     for (const Opcode op : mem_ops) {
         const std::string_view name = opcode_name(op);
@@ -221,6 +223,20 @@ TEST(Isa, MatrixCostsMoreThanScalarArithmetic)
               instruction_cost(Opcode::V_CROSS_VEC3_F32));
 }
 
+TEST(Isa, TheVectorLoadIsPricedAsTheThreeItReplaces)
+{
+    // Under a flat charge per lane, moving three floats costs what moving three
+    // floats costs however many instructions ask for it. The saving this opcode
+    // exists to show is in transactions and in issues, and neither is visible to
+    // instruction_cost — MemoryModel::Coalesced is where it appears.
+    EXPECT_EQ(instruction_cost(Opcode::V_LD_GLOBAL_VEC3_F32),
+              3 * instruction_cost(Opcode::V_LD_GLOBAL_F32));
+
+    // Both leave their latency to the memory model, which knows where the line
+    // was found. A non-zero here would be charged on top of that.
+    EXPECT_EQ(instruction_latency(Opcode::V_LD_GLOBAL_VEC3_F32), 0u);
+}
+
 TEST(Isa, UnaryFactoriesLeaveSrc1Unused)
 {
     // V_RCP / V_SQRT / V_NORM_VEC3 leave src1 unused. The executor must never
@@ -246,6 +262,16 @@ TEST(Isa, StoreFactoriesUseSrc0AsAddress)
     EXPECT_EQ(ld.dst, 4);
     EXPECT_EQ(ld.src0, 9);
     EXPECT_EQ(ld.imm, 0.0f) << "the default offset must be 0";
+
+    // The vector load reads like the scalar one: dst first, address second, and
+    // src1 unused. dst names the first of three registers, as every VEC3 does.
+    const Instruction ld3 =
+        make_v_ld_global_vec3_f32(/*dst=*/4, /*addr_reg=*/9, /*offset=*/12.0f);
+    EXPECT_EQ(ld3.op, Opcode::V_LD_GLOBAL_VEC3_F32);
+    EXPECT_EQ(ld3.dst, 4);
+    EXPECT_EQ(ld3.src0, 9);
+    EXPECT_EQ(ld3.src1, 0);
+    EXPECT_EQ(ld3.imm, 12.0f);
 }
 
 TEST(Isa, VmovImm)

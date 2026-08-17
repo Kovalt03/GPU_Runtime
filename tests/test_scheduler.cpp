@@ -1612,6 +1612,147 @@ TEST(Scheduler, LinesFetchedTogetherCostTheWorstOfThemNotTheSumOfThem)
         << "the warp waited for its lines one after another";
 }
 
+TEST(Scheduler, AVectorLoadLandsThreeFloatsInThreeRegisters)
+{
+    Fixture f;
+    f.poke(16, 1.0f);
+    f.poke(20, 2.0f);
+    f.poke(24, 3.0f);
+    broadcast(f.warp(), 0, 16.0f);
+
+    Program p;
+    p.push_back(make_v_ld_global_vec3_f32(/*dst=*/10, /*addr_reg=*/0));
+    p.push_back(make_ret());
+    f.run(p);
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[10], 1.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[11], 2.0f);
+    EXPECT_FLOAT_EQ(f.lane(0).regs[12], 3.0f);
+
+    // The range is checked before anything is written, as it is for the VEC3
+    // arithmetic: a load that filled two registers and then threw would leave a
+    // lane half updated.
+    Fixture over;
+    broadcast(over.warp(), 0, 16.0f);
+    Program spill;
+    spill.push_back(make_v_ld_global_vec3_f32(/*dst=*/254, /*addr_reg=*/0));
+    spill.push_back(make_ret());
+    EXPECT_THROW(over.run(spill), std::runtime_error);
+}
+
+TEST(Scheduler, AVectorLoadIsOneTransactionWhereThreeScalarsAreThree)
+{
+    // What the opcode exists to show, and why it waited for MemoryModel. Every
+    // lane reads the same twelve bytes, which is one line: the wide load asks for
+    // it once and three scalar loads ask three times.
+    // Measured against a program that only retires, so the comparison is of the
+    // loads alone: a RET costs every lane and would otherwise sit in both totals.
+    Program bare;
+    bare.push_back(make_ret());
+
+    auto measure = [&bare](const Program& p, MemoryModel model) {
+        auto weighted = [model](const Program& prog) {
+            Fixture f;
+            broadcast(f.warp(), 0, 16.0f);
+            f.sched.set_memory_model(model);
+            f.run(prog);
+            return f.sched.stats();
+        };
+        SchedulerStats stats = weighted(p);
+        stats.weighted_lane_ops -= weighted(bare).weighted_lane_ops;
+        return stats;
+    };
+
+    Program wide;
+    wide.push_back(make_v_ld_global_vec3_f32(10, 0));
+    wide.push_back(make_ret());
+
+    Program scalars;
+    scalars.push_back(make_v_ld_global_f32(10, 0, 0.0f));
+    scalars.push_back(make_v_ld_global_f32(11, 0, 4.0f));
+    scalars.push_back(make_v_ld_global_f32(12, 0, 8.0f));
+    scalars.push_back(make_ret());
+
+    const SchedulerStats wide_coalesced = measure(wide, MemoryModel::Coalesced);
+    const SchedulerStats scalar_coalesced = measure(scalars, MemoryModel::Coalesced);
+    EXPECT_EQ(wide_coalesced.weighted_lane_ops * 3, scalar_coalesced.weighted_lane_ops);
+
+    // And the reason it could not have been measured before: charged per lane per
+    // float, the two are the same number. The flat model cannot tell a
+    // transaction from a byte.
+    const SchedulerStats wide_flat = measure(wide, MemoryModel::Flat);
+    const SchedulerStats scalar_flat = measure(scalars, MemoryModel::Flat);
+    EXPECT_EQ(wide_flat.weighted_lane_ops, scalar_flat.weighted_lane_ops);
+
+    // The saving in issues is visible to either model, one instruction against
+    // three, and is what the latency test below turns into cycles.
+    EXPECT_LT(wide_flat.warp_steps, scalar_flat.warp_steps);
+}
+
+TEST(Scheduler, AVectorLoadStraddlingALineIsChargedForBoth)
+{
+    // The count is of lines touched, not of instructions issued, so a vector that
+    // crosses a boundary costs what it costs. Twelve bytes from the last eight of
+    // a line reach into the next.
+    auto load_cost = [](float address) {
+        Fixture f;
+        broadcast(f.warp(), 0, address);
+        f.sched.set_memory_model(MemoryModel::Coalesced);
+
+        Program p;
+        p.push_back(make_v_ld_global_vec3_f32(10, 0));
+        p.push_back(make_ret());
+        f.run(p);
+
+        Fixture bare;
+        Program only_ret;
+        only_ret.push_back(make_ret());
+        bare.sched.set_memory_model(MemoryModel::Coalesced);
+        bare.run(only_ret);
+
+        return f.sched.stats().weighted_lane_ops - bare.sched.stats().weighted_lane_ops;
+    };
+
+    EXPECT_EQ(load_cost(static_cast<float>(CACHE_LINE_BYTES - 8)),
+              2 * instruction_cost(Opcode::V_LD_GLOBAL_F32));
+    EXPECT_EQ(load_cost(static_cast<float>(CACHE_LINE_BYTES)),
+              instruction_cost(Opcode::V_LD_GLOBAL_F32));
+}
+
+TEST(Scheduler, AVectorLoadWaitsOnceWhereThreeScalarsWaitThreeTimes)
+{
+    // In-order issue with no scoreboard: a warp that has issued a load cannot
+    // issue again until the result lands. Three loads are three waits, and one
+    // warp has nobody to hide behind.
+    auto cycles = [](const Program& p) {
+        ThreadBlock block = make_block(1);
+        std::vector<uint8_t> memory(GLOBAL_BYTES, 0);
+        WarpScheduler scheduler;
+        scheduler.set_memory_model(MemoryModel::Cached);
+        scheduler.set_latency_model(LatencyModel::Modelled);
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+        return scheduler.stats().cycles;
+    };
+
+    Program wide;
+    wide.push_back(make_v_mov_f32(0, 16.0f));
+    wide.push_back(make_v_ld_global_vec3_f32(10, 0));
+    wide.push_back(make_v_add_f32(20, 10, 12));  // waits on the load
+    wide.push_back(make_ret());
+
+    Program scalars;
+    scalars.push_back(make_v_mov_f32(0, 16.0f));
+    scalars.push_back(make_v_ld_global_f32(10, 0, 0.0f));
+    scalars.push_back(make_v_ld_global_f32(11, 0, 4.0f));
+    scalars.push_back(make_v_ld_global_f32(12, 0, 8.0f));
+    scalars.push_back(make_v_add_f32(20, 10, 12));
+    scalars.push_back(make_ret());
+
+    // The first trip goes to memory either way; what the scalars add is two more
+    // waits for lines already in L1.
+    EXPECT_LT(cycles(wide), cycles(scalars));
+}
+
 TEST(Scheduler, TheCycleBudgetCoversTimeSpentWaiting)
 {
     // The budget counts cycles rather than issues, so a block that only ever waits

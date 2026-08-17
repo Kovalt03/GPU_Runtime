@@ -385,6 +385,21 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // Twelve bytes from one address. No alignment beyond the four bytes every
+    // f32 access wants: a VEC3 is three floats wherever they lie, and the
+    // triangles these read are packed nine floats to the triangle.
+    case Opcode::V_LD_GLOBAL_VEC3_F32: {
+        require_register_range(instr.dst, 3, "V_LD_GLOBAL_VEC3_F32 dst");
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_GLOBAL_VEC3_F32");
+        for (uint32_t i = 0; i < 3; ++i) {
+            thread.regs[instr.dst + i] =
+                load_f32(global.base, global.size, addr + i * sizeof(float),
+                         "V_LD_GLOBAL_VEC3_F32");
+        }
+        break;
+    }
+
     // Store leaves dst unused: the address is src0 and the value is src1.
     case Opcode::V_ST_GLOBAL_F32: {
         const size_t addr =
@@ -562,6 +577,30 @@ void LineCache::clear()
     resident_.clear();
 }
 
+namespace {
+
+// What one transaction costs, whatever instruction asked for it.
+//
+// A line fetched is a line fetched, so the wide load pays the scalar price per
+// line: what it saves is how many lines it asks for. Charging its own cost here
+// would hand that straight back, three floats being priced at three hundred once
+// per line. Still keyed on the opcode so that pricing a store apart from a load
+// stays a change in one place.
+uint32_t transaction_cost(Opcode op)
+{
+    return op == Opcode::V_LD_GLOBAL_VEC3_F32 ? instruction_cost(Opcode::V_LD_GLOBAL_F32)
+                                              : instruction_cost(op);
+}
+
+// How many floats one lane asks for, which decides how many addresses a warp
+// puts to the cache.
+uint32_t access_components(Opcode op)
+{
+    return op == Opcode::V_LD_GLOBAL_VEC3_F32 ? VEC3_COMPONENTS : 1u;
+}
+
+}  // namespace
+
 // What one line costs, given where it was found.
 //
 // Called once per distinct line by global_access_cost, so a warp whose 32 lanes
@@ -583,9 +622,7 @@ GlobalAccess WarpScheduler::cache_lookup(size_t line, const Instruction& instr)
 
     ++stats_.cache_misses;
 
-    // Cost from instr rather than a constant, so that pricing a store differently
-    // is a change here and nowhere else. Both cost the same today.
-    return {instruction_cost(instr.op), MEMORY_LATENCY};
+    return {transaction_cost(instr.op), MEMORY_LATENCY};
 }
 
 // What a warp's global load or store costs, given where its lanes are pointing.
@@ -600,8 +637,11 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
         return {lanes * instruction_cost(instr.op), store_latency};
     }
 
-    // One line per lane at worst, so a sorted array counts them without a set.
-    std::array<size_t, WARP_SIZE> lines{};
+    // One line per float asked for at worst, so a sorted array counts them
+    // without a set. A vector load asks for three and normally lands them in one
+    // line, which is the whole of what it is for.
+    const uint32_t components = access_components(instr.op);
+    std::array<size_t, WARP_SIZE * VEC3_COMPONENTS> lines{};
     uint32_t n = 0;
     for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
         if (!is_active(warp, lane)) {
@@ -612,7 +652,9 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
         // in two places for a saving nothing is waiting on.
         const size_t addr = decode_address(
             warp.threads[lane].regs[instr.src0] + instr.imm, "global access");
-        lines[n++] = addr / CACHE_LINE_BYTES;
+        for (uint32_t c = 0; c < components; ++c) {
+            lines[n++] = (addr + c * sizeof(float)) / CACHE_LINE_BYTES;
+        }
     }
     std::sort(lines.begin(), lines.begin() + n);
     const auto distinct = static_cast<uint64_t>(
@@ -639,7 +681,7 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
     // completely and must read one it only partly covers, so the two are not
     // alike — but telling them apart means tracking which lanes cover which
     // bytes, and nothing here asks that yet.
-    return {distinct * instruction_cost(instr.op), store_latency};
+    return {distinct * transaction_cost(instr.op), store_latency};
 }
 
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
@@ -938,7 +980,9 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     // access costs depends on where the lanes point, once the memory model
     // looks. Everything else is charged by opcode alone.
     const Instruction& issued = program[warp.pc];
-    if (issued.op == Opcode::V_LD_GLOBAL_F32 || issued.op == Opcode::V_ST_GLOBAL_F32) {
+    if (issued.op == Opcode::V_LD_GLOBAL_F32 ||
+        issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
+        issued.op == Opcode::V_ST_GLOBAL_F32) {
         const GlobalAccess access = global_access(warp, issued);
         stats_.weighted_lane_ops += access.cost;
         issued_latency_ = access.latency;

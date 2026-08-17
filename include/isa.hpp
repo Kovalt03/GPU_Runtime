@@ -15,9 +15,9 @@
 //   V_      lane-wise: writes the per-thread register file. Control flow only
 //           touches warp state (pc / activeMask), so it carries no prefix.
 //           A warp-uniform unit would use S_ (reserved).
-//   SHAPE   omitted = scalar, VEC3 = 3 consecutive regs.
-//           Reserved: VEC4, MAT3 (9 regs), MAT4 (16 regs) — VEC4 and wider
-//           must start at a 4-aligned register index.
+//   SHAPE   omitted = scalar, VEC3 = 3 consecutive regs, MAT4 = 16.
+//           Reserved: VEC4, MAT3 (9 regs) — VEC4 and wider must start at a
+//           4-aligned register index.
 //   SPACE   GLOBAL | SHARED. Reserved: CONST, LOCAL.
 //   TYPE    always last. F32 today; F64 / F16 reserved.
 //
@@ -59,6 +59,13 @@ enum class Opcode : uint8_t {
 
     // Memory — address is always src0, stored value is always src1.
     V_LD_GLOBAL_F32,  // reg[dst] = global[reg[src0] + imm]       (src1 unused)
+
+    // Three consecutive floats in one instruction, dst naming the first
+    // register as every VEC3 does. Not shorthand for three of the above: a warp
+    // asking for twelve bytes at one address touches the lines they fall in
+    // once, where three instructions pay for their lines three times.
+    V_LD_GLOBAL_VEC3_F32,  // reg[dst..+2] = global[reg[src0] + imm ..+8]
+
     V_ST_GLOBAL_F32,  // global[reg[src0] + imm] = reg[src1]      (dst unused)
     V_LD_SHARED_F32,  // reg[dst] = shared[reg[src0] + imm]       (src1 unused)
     V_ST_SHARED_F32,  // shared[reg[src0] + imm] = reg[src1]      (dst unused)
@@ -109,6 +116,10 @@ enum class Opcode : uint8_t {
 // the program cannot keep says more as a message than as a quietly smaller
 // reduction.
 
+// Registers a VEC3 occupies, and floats the wide load moves. Named because the
+// scheduler has to size a warp's address list by it and the two must agree.
+inline constexpr uint32_t VEC3_COMPONENTS = 3;
+
 struct Instruction {
     Opcode op;
     uint8_t dst;   // destination register idx (first register for VEC/MAT)
@@ -151,6 +162,7 @@ Instruction make_v_cmp_f32(uint8_t dst, uint8_t src0, uint8_t src1, CmpOp op);
 
 // MEM
 Instruction make_v_ld_global_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
+Instruction make_v_ld_global_vec3_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_global_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
 Instruction make_v_ld_shared_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);

@@ -320,17 +320,15 @@ TEST(IRBuilder, LoadAndStoreUseTheAddressAsSrc0)
     EXPECT_TRUE(same(p[1], make_v_st_global_f32(addr.first(), value.first(), 8.0f)));
 }
 
-TEST(IRBuilder, LoadVec3ReadsThreeConsecutiveFloats)
+TEST(IRBuilder, LoadVec3ReadsThreeConsecutiveFloatsInOneInstruction)
 {
     IRBuilder k;
     const Reg<Scalar> addr = k.scalar();
-    const Reg<Vec3> v = k.load_vec3(addr);
+    const Reg<Vec3> v = k.load_vec3(addr, 12.0f);
 
     const Program p = k.build();
-    ASSERT_GE(p.size(), 3u);
-    EXPECT_TRUE(same(p[0], make_v_ld_global_f32(v.first() + 0, addr.first(), 0.0f)));
-    EXPECT_TRUE(same(p[1], make_v_ld_global_f32(v.first() + 1, addr.first(), 4.0f)));
-    EXPECT_TRUE(same(p[2], make_v_ld_global_f32(v.first() + 2, addr.first(), 8.0f)));
+    ASSERT_EQ(p.size(), 2u) << "one load and the RET build() appends";
+    EXPECT_TRUE(same(p[0], make_v_ld_global_vec3_f32(v.first(), addr.first(), 12.0f)));
 }
 
 // ---------------------------------------------------------------------------

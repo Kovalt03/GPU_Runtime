@@ -200,11 +200,16 @@ public:
     // wrong way round is a mistake the raw factories allow and this does not,
     // the address being an argument and the value a return.
     Reg<Scalar> load(Reg<Scalar> address, float offset = 0.0f);
+
+    // One instruction, not three: a warp asking for twelve bytes at one address
+    // pays for the lines they fall in once. Prefer it wherever three floats are
+    // wanted together, which is every vertex these kernels read.
     Reg<Vec3> load_vec3(Reg<Scalar> address, float offset = 0.0f);
 
     // As load, into a register the caller already holds — the counterpart to
     // set(), and what fills the first three slots of a VEC4 in place.
     void load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
+    void load_vec3_into(Reg<Vec3> dst, Reg<Scalar> address, float offset = 0.0f);
 
     // The block's own scratchpad. Addresses are byte offsets, as the global
     // pair uses, so the two read alike at a call site.

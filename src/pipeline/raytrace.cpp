@@ -109,18 +109,12 @@ Program build_raytrace_program(void** args)
         const Label next = k.label();
         k.place(top);
 
-        // The vertices have to arrive as Vec3 for cross and dot to take them,
-        // and load hands back a scalar it allocated itself. load_into is what
-        // puts three of them in one range.
-        const Reg<Vec3> v0 = k.vec3();
-        const Reg<Vec3> v1 = k.vec3();
-        const Reg<Vec3> v2 = k.vec3();
-        for (uint32_t c = 0; c < 3; ++c) {
-            const float component = static_cast<float>(c * sizeof(float));
-            k.load_into(v0.component(c), cursor, component + 0.0f);
-            k.load_into(v1.component(c), cursor, component + 12.0f);
-            k.load_into(v2.component(c), cursor, component + 24.0f);
-        }
+        // A triangle is nine floats, so each vertex is one wide load. Every lane
+        // of a warp is on the same triangle here, which makes the three of them
+        // three transactions where the nine scalar loads this replaced were nine.
+        const Reg<Vec3> v0 = k.load_vec3(cursor, 0.0f);
+        const Reg<Vec3> v1 = k.load_vec3(cursor, 12.0f);
+        const Reg<Vec3> v2 = k.load_vec3(cursor, 24.0f);
 
         // Möller-Trumbore, a line for each line of intersect().
         const Reg<Vec3> e1 = k.sub(v1, v0);
