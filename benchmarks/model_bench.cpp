@@ -262,13 +262,15 @@ int main(int argc, char** argv)
         return 1;
     }
     csv << "comparison,case,route,triangles,model,base,variant,change_pct\n";
+    // The scene names hold commas, so that field is quoted. Unquoted, a reader
+    // splits one row into nine fields and blames its own parser.
     const auto rows_to_csv = [&csv](const char* what,
                                     const std::vector<Comparison>& rows) {
         for (const Comparison& c : rows) {
             for (size_t i = 0; i < MODEL_COUNT; ++i) {
-                csv << what << ',' << c.subject << ',' << c.variant << ',' << c.triangles
-                    << ',' << MODELS[i].name << ',' << c.base_cost[i] << ','
-                    << c.variant_cost[i] << ',' << c.delta[i] << '\n';
+                csv << what << ",\"" << c.subject << "\"," << c.variant << ','
+                    << c.triangles << ',' << MODELS[i].name << ',' << c.base_cost[i]
+                    << ',' << c.variant_cost[i] << ',' << c.delta[i] << '\n';
             }
         }
     };
