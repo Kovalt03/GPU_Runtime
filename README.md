@@ -213,9 +213,10 @@ on their own line, `int* ptr`.
 | A cache over the same scenes | **-40%**, flat — L2 is never outgrown here |
 | Latency covered by 16 warps against 1 | **30 → 6** cycles a warp |
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
+| A second draw of resident geometry | **192 → 0** misses, and 0.04% of the bill |
 | A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
 | Opcodes | 31 |
-| Tests | 267 |
+| Tests | 271 |
 
 ### What divergence costs
 
@@ -293,10 +294,10 @@ flattened walk made twelve, and the pass costs **24.0%** more.
 | pass 2 — coverage | 31,317,520 | 38,841,872 | +24.0% |
 
 That 24% is what a flat charge per lane says, and it is roughly double what the
-other cost models say: **+12.8% with a cache**, +16.2% in cycles even with each
-dependent load waiting on the one before it. Every lane of a warp is on the same
-triangle, so all thirty-two read the same three indices — one transaction, which
-is precisely the case a per-lane charge overstates.
+other cost models say: **+12.7% with a cache**, +13.9% in cycles with every load
+charged a full wait. Every lane of a warp is on the same triangle, so all
+thirty-two read the same three indices — one transaction, which is precisely the
+case a per-lane charge overstates.
 
 Which way the total falls depends on the ratio of vertices to pixels, so both
 paths are kept and neither is the successor of the other. The tiled routes sit
@@ -481,6 +482,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
 | Latency hiding | modelled **within a block** — a result arrives some cycles after it is issued and other warps cover the wait. Hardware puts several blocks on an SM and lets all their warps cover each other; here a block runs to completion first |
 | Instruction-level parallelism | **absent** — issue is in-order with no scoreboard, so a warp waits out every instruction whether or not the next one wanted the result. A dependent chain and independent accesses cost the same; occupancy is what covers a wait here, never the warp's own next instruction |
+| Persistent buffers | modelled — `upload` / `release` hold geometry between draws, and a repeated draw of what fits refetches nothing. Capacity and compulsory misses are told apart by whether a second draw pays again |
 | Streams, async copy | **absent** — every launch is synchronous |
 
 ### The three that matter most
@@ -490,17 +492,11 @@ lines are charged independently, so nothing here saturates: no shared resource, 
 DRAM row buffer, no ceiling. Counting how many transactions a kernel makes is a
 different question from how long they take together, and only the first is answered.
 
-**Capacity misses.** Every miss measured is compulsory — a line touched for the
-first time. Drawing more does not change that, because each draw reads only its own
-data, and drawing the *same* geometry twice does not either: `draw_*` allocates per
-call and never frees, so the second copy is new data as far as the cache is
-concerned. Upload-once-draw-many is missing from the runtime API, and a depth
-prepass would need it.
-
 **Early-Z.** Rejecting a fragment before shading it is most of what makes a modern
 rasteriser fast on a scene with depth complexity. Every pixel here shades every
-triangle that covers it — and building it means the persistent buffers above, since
-the depth pass and the colour pass have to read one copy of the geometry.
+triangle that covers it. The persistent buffers it needs — one copy of the geometry
+read by a depth pass and then by a colour pass — are now there; the depth pass
+itself is not.
 
 **Occupancy across blocks.** Latency is covered within a block, which is where this
 machine can see it: `myrt_launch` runs blocks one after another, so the warps of

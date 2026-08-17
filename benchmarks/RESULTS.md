@@ -488,12 +488,12 @@ modelled:
 
 | L1 lines | Vertices held | Cost | | Cycles | | L2 hits |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 | 16 | 43,413,292 | -0.23% | 26,486,424 | -2.9% | 71,838 → 67,230 |
-| 4 | 32 | 42,348,844 | -1.33% | 18,348,184 | -19.4% | 44,830 → 18,846 |
-| 8 | 64 | 42,058,796 | **-1.60%** | 16,106,904 | **-24.7%** | 36,701 → 5,662 |
-| 16 | 128 | 42,046,124 | -0.87% | 16,008,984 | -15.1% | 21,789 → 5,086 |
-| 32 | 256 | 42,025,004 | +0.02% | 15,845,784 | +0.4% | 3,741 → 4,126 |
-| 1024 (hardware) | 8,192 | 42,016,512 | -0.00% | 15,780,504 | 0.0% | 3,740 → 3,740 |
+| 2 | 16 | 43,413,292 | -0.23% | 26,486,224 | -2.9% | 71,838 → 67,230 |
+| 4 | 32 | 42,348,822 | -1.33% | 18,347,984 | -19.4% | 44,765 → 18,845 |
+| 8 | 64 | 42,057,366 | **-1.60%** | 16,095,824 | **-24.7%** | 36,637 → 5,597 |
+| 16 | 128 | 42,044,694 | -0.87% | 15,997,904 | -15.1% | 21,725 → 5,021 |
+| 32 | 256 | 42,023,574 | +0.02% | 15,834,704 | +0.4% | 3,677 → 4,061 |
+| 1024 (hardware) | 8,192 | 42,015,126 | -0.00% | 15,769,424 | 0.0% | 3,677 → 3,677 |
 
 **It is not fewer fetches.** The misses are 226 in every row, before and after: each
 line is compulsory, touched once by someone whatever the order. What the reorder
@@ -513,6 +513,45 @@ puts that out of reach of a benchmark.
 -0.01% and +0.12%: `bin_triangles` de-indexes on the host, so a block streams each
 triangle's three vertices and has nothing to re-read. That control is what
 separates this from the depth ordering a shuffle also changes.
+
+---
+
+## Uploading once and drawing many
+
+Every miss above was compulsory, and by construction: `draw_*` uploaded its
+buffers, drew, and abandoned them, so each draw asked the cache about an address
+nobody had touched. `upload` / `release` hold the geometry instead, and the
+question a repeated draw asks is whether the cache could keep it.
+
+Three draws of one upload, latency modelled:
+
+| Triangles | Cache | Draw | Misses | Cost | Cycles |
+|---:|---|---:|---:|---:|---:|
+| 360 | hardware | 1 | 192 | 37,136,442 | 13,975,936 |
+| 360 | hardware | 2 | **0** | 37,123,002 | 13,975,936 |
+| 360 | hardware | 3 | **0** | 37,123,002 | 13,975,936 |
+| 3,000 | scaled | 1 | 72,318 | 313,916,878 | 130,742,840 |
+| 3,000 | scaled | 2 | **72,318** | 313,916,878 | 130,742,840 |
+| 3,000 | scaled | 3 | **72,318** | 313,916,878 | 130,742,840 |
+
+**The distinction is now measurable, and the answer is that both kinds exist.**
+At the hardware sizes the scene fits and a second draw fetches nothing at all —
+every one of those 192 misses was compulsory. Scaled down until the scene
+outgrows L2, the same 72,318 misses recur on every draw: those are capacity
+misses, and holding the geometry buys nothing, because what evicted it was the
+rest of the same draw.
+
+**And it is worth almost nothing here.** 192 misses out of 346,000 lookups is
+0.04% of the issue cost, and the cycles do not move at all — a block of 64 warps
+covers a trip to memory with somebody else's work. The same reading as the cache
+section above: the knee is in the hit rate, not in the bill. What upload-once
+buys at this scale is the ability to ask the question.
+
+**An upload drops the lines it overwrites.** The caches hold tags and no data, so
+a buffer released, reallocated at the same address and refilled would otherwise
+read as resident — `myrt_memcpy` invalidates, and the draw after a re-upload
+misses again on exactly the lines it replaced, 34 of them for the sphere's index
+buffer.
 
 ---
 
@@ -558,8 +597,8 @@ divergence and going faster are different things.**
 
 | Mesh | Triangles | flat | coalesced | cached | cycles |
 |---|---:|---:|---:|---:|---:|
-| cube | 12 | +24.0% | +17.3% | **+12.8%** | +16.2% |
-| sphere | 360 | +24.5% | +18.2% | **+13.1%** | +12.8% |
+| cube | 12 | +24.0% | +17.3% | **+12.7%** | +13.9% |
+| sphere | 360 | +24.5% | +18.2% | **+13.1%** | +12.7% |
 
 Predicted to get worse, being three dependent loads a triangle before a vertex
 address is known, and it got better: the index buffer costs half what the flat
@@ -572,7 +611,7 @@ no scoreboard, so a warp waits out every instruction's latency whether or not
 anything needed the result: a chain of three loads and three independent ones
 cost the same cycles here, which is pinned in
 `DependenceIsNotDistinguishedFromIssueOrder`. That is pessimistic rather than
-generous — every load in the indexed path is charged a full wait — so 16.2% is an
+generous — every load in the indexed path is charged a full wait — so 13.9% is an
 upper bound on what the extra loads cost in time, and it is still well inside the
 24% the flat model charged for them in issue capacity.
 
