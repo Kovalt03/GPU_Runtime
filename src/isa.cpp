@@ -318,15 +318,20 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::BARRIER:
     case Opcode::S_SYNCWARP: return 1;
 
-    // Placeholders. A ballot reads all 32 lanes and reduces them, and a shuffle
-    // permutes across them, so neither is one lane-op whatever it turns out to
-    // cost. The figure comes from measuring a warp reduction against the
-    // shared-memory one it replaces; until then a plausible number here would be
-    // one nothing measured.
+    // A crossbar across the warp rather than a lane's own arithmetic, and priced
+    // like the shared-memory traffic it replaces: hardware runs the exchange
+    // through the same permute network, and AMD's ds_bpermute literally borrows
+    // the LDS wiring for it.
+    //
+    // 8, the same as a shared load, is the conservative end of what
+    // reduction_bench leaves open. Summing a warp costs 68 instructions through
+    // shared memory against 33 through the exchange, so a shuffle could cost 22
+    // before the two came level — and that comparison already flatters shared
+    // memory, since this machine charges nothing for the barrier's stall.
     case Opcode::S_BALLOT:
     case Opcode::S_ANY:
     case Opcode::S_ALL:
-    case Opcode::V_SHUFFLE_F32: return 1;
+    case Opcode::V_SHUFFLE_F32: return 8;
     }
 
     return 1;

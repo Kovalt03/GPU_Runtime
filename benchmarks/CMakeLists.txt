@@ -12,3 +12,6 @@ target_link_libraries(divergence_bench PRIVATE gpurt project_warnings)
 
 add_executable(render_bench render_bench.cpp)
 target_link_libraries(render_bench PRIVATE gpurt project_warnings)
+
+add_executable(reduction_bench reduction_bench.cpp)
+target_link_libraries(reduction_bench PRIVATE gpurt project_warnings)

@@ -9,6 +9,7 @@ session:
 ```
 cmake --build build -j8
 ./build/benchmarks/render_bench     # stdout, plus benchmarks/result/render_bench.{md,csv}
+./build/benchmarks/reduction_bench  #         plus benchmarks/result/reduction.{md,csv}
 ```
 
 The scenes are code in `benchmarks/render_bench.cpp`, and the routes it measures
@@ -290,6 +291,59 @@ Two details worth keeping:Two details worth keeping:
   cooperative fill is a second source, and the coverage flag has no bearing on
   it. An earlier test asserted a flat zero for all three routes and passed only
   because its 64x32 frame had too few tiles to split the fill.
+
+---
+
+## Summing a warp
+
+The reduction is five rounds either way — the live values halve each time, and
+log2(32) is five. What differs is a round.
+
+```
+cmake --build build -j8
+./build/benchmarks/reduction_bench
+```
+
+| Warps | Route | Instructions | Warp steps | Lane ops |
+|---|---|---:|---:|---:|
+| 1 | shared | 68 | 68 | 2,176 |
+| 1 | shuffle | 33 | 33 | **1,056** |
+| 8 | shared | 68 | 544 | 17,408 |
+| 8 | shuffle | 33 | 264 | **8,448** |
+
+Shared memory spends a round on a store, a barrier, a load, a second barrier to
+keep a fast lane from overwriting a slot a slow one has yet to read, and the
+address arithmetic for both ends. The exchange spends it on one instruction.
+Computing which lane to take from costs three instructions in both and cancels
+out; it is written branchless so that a divergent wrap does not put warp splits
+into a measurement about something else.
+
+### What priced the primitives
+
+`S_BALLOT`, `S_ANY`, `S_ALL` and `V_SHUFFLE_F32` were placeholders at 1 until
+this ran, because a ballot reduces 32 lanes and a shuffle permutes them, and
+neither is one lane-op.
+
+The measurement does not name a cost on its own — it bounds one. A shuffle
+would have to reach **22** before the two routes came level, so the 8 they now
+carry, the same as a shared load, is the conservative end of what is open. The
+independent argument for that number is that hardware runs the exchange through
+the permute network the shared memory already has: AMD's `ds_bpermute` borrows
+the LDS wiring outright.
+
+Re-running with the primitives at 8 leaves the break-even at 22, which is the
+check that the figure is not arguing in a circle: it is derived from the
+instruction mix, not from the price.
+
+### And what it leaves out
+
+**This machine charges nothing for a barrier's stall.** `warp_steps` comes out
+at exactly one per warp per instruction however many warps are in the block —
+68, 136, 272, 544 — so waiting for the slowest warp is free here and is most of
+what a barrier costs on hardware.
+
+The comparison above therefore flatters shared memory rather than the exchange,
+and the exchange wins anyway.
 
 ---
 
