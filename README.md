@@ -75,9 +75,10 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   25 opcodes, 8 bytes each                       │
+  │   30 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
   │   V_LD_GLOBAL_F32 / V_LD_SHARED_F32              │
+  │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
   │   V_CMP_F32 / BRA_DIV / BARRIER / RET            │
   └──────┬───────────────────────────────────────────┘
          │  physical memory access
@@ -99,12 +100,18 @@ than force a rename:
 ```
 ALU        V_<OP>[_<SHAPE>]_<TYPE>          V_ADD_F32, V_CROSS_VEC3_F32
 Memory     V_<LD|ST>_<SPACE>[_<SHAPE>]_<TYPE>   V_LD_GLOBAL_F32
+Warp       S_<OP>                           S_BALLOT, S_ANY, S_ALL
 Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
 ```
 
-- **`V_`** marks instructions that write the per-lane register file, following
-  the AMD `v_add_f32` convention. Control flow only mutates warp state
-  (`pc`, `activeMask`), so it carries no prefix.
+- **`V_`** marks instructions whose result differs between lanes; **`S_`** those
+  where every lane ends up with the same value, following AMD, where `s_`
+  instructions write a scalar register file. This machine has none, so the line
+  is drawn on the result rather than the file. Control flow mutates warp state
+  only (`pc`, `activeMask`) and carries no prefix.
+- A lane exchange gives every lane something different, so it is
+  `V_SHUFFLE_F32` and not `S_SHUFFLE` — the rule decides it rather than
+  intuition about which instructions feel collective.
 - **`<SHAPE>`** is omitted for scalars. `VEC3` and `MAT4` are built —
   `V_MATVEC_MAT4_F32` arrived for the vertex stage and filled the slot the
   scheme had reserved for it, without renaming anything. `MAT3` is still open.
@@ -114,27 +121,6 @@ Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
 AMD `v_add_f32`, WGSL / SPIR-V / Rust `f32`. The rule is machine-checked by
 `OpcodeNamesFollowScheme` in `tests/test_isa.cpp`, so it cannot drift as
 opcodes are added.
-
----
-
-## Implementation stages
-
-| # | Layer | Header / Source | Status |
-|---|-------|-----------------|--------|
-| 1 | Virtual ISA | `include/isa.hpp` · `src/isa.cpp` | ✅ |
-| 2 | Memory Model | `include/memory.hpp` · `src/memory.cpp` | ✅ |
-| 3 | Thread / Warp | `include/thread.hpp` · `src/thread.cpp` | ✅ |
-| 4 | Warp Scheduler | `include/scheduler.hpp` · `src/scheduler.cpp` | ✅ |
-| 5 | Runtime API | `include/runtime.hpp` · `src/runtime.cpp` | ✅ |
-| 6 | Ray-Triangle Kernel | `kernels/ray_triangle.cpp` | ✅ |
-| 7 | Divergence Benchmark | `benchmarks/divergence_bench.cpp` | ✅ |
-| 8 | IR Builder | `include/ir_builder.hpp` · `src/ir_builder.cpp` | ✅ |
-| 9 | Host geometry | `include/math3d.hpp` · `src/math3d.cpp` | ✅ |
-| 10 | Rasteriser | `pipeline/vertex.*` · `pipeline/raster.*` | ✅ |
-| 11 | Tile binning + shared memory | `pipeline/raster_tiled.*` · `BARRIER` | ✅ |
-| 12 | Ray tracer over the same scene | `pipeline/raytrace.*` | ✅ |
-| 13 | Mesh input, index buffer, vertex cache scoring | `include/mesh.hpp` · `src/mesh.cpp` | ✅ |
-| 14 | Predication against the branch | `pipeline/raster_emit.hpp` | ✅ |
 
 ---
 
@@ -210,8 +196,8 @@ on their own line, `int* ptr`.
 | Rasteriser, staged through shared memory | **-96%** against the naive walk |
 | Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
 | Predication against the branch (raster / ray) | **+2%** / **+4.4%**, divergence to zero |
-| Opcodes | 25 |
-| Tests | 225 |
+| Opcodes | 30 |
+| Tests | 247 |
 
 ### What divergence costs
 
@@ -418,6 +404,8 @@ against `walk` and nothing else, and a BVH is what would close it.
 | | Here |
 |---|---|
 | Warps of 32, `activeMask`, reconvergence | modelled — the centre of the project |
+| Independent thread scheduling | modelled — `WarpPolicy::Independent`, per-thread pc with no lane starving another |
+| Warp-level primitives | modelled — ballot, any, all, syncwarp, shuffle, each naming its participants |
 | Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
 | Latency hiding | **absent** — the reason warps are batched at all, and invisible here |
 | Streams, async copy | **absent** — every launch is synchronous |
