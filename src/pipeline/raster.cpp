@@ -72,6 +72,7 @@ Program build_raster_program(void** args)
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
 
+
         // The cursor walks the buffer, the counter ends the loop. Both advance
         // through fma, the only opcode that accumulates in place.
         //
@@ -84,6 +85,22 @@ Program build_raster_program(void** args)
             static_cast<float>(a.indexed ? 3 * sizeof(float) : 3 * SCREEN_VERTEX_BYTES));
         const Reg<Scalar> i = k.constant(0.0f);
         const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
+
+        // Above the loop, so a constant is issued once for the launch rather
+        // than once a triangle. Emitted whatever the mode, six moves being
+        // cheaper than the branch it would take to declare them conditionally.
+        const bool diffuse = a.shading.mode == ShadingMode::Diffuse;
+        const Reg<Vec3> light =
+            k.constant(a.shading.light_position.x, a.shading.light_position.y,
+                       a.shading.light_position.z);
+        const Reg<Vec3> base_colour = k.constant(
+            a.shading.base_colour.x, a.shading.base_colour.y, a.shading.base_colour.z);
+        const Reg<Scalar> world_base = k.constant(static_cast<float>(a.world_offset));
+        const Reg<Scalar> normal_base = k.constant(static_cast<float>(a.normal_offset));
+        const Reg<Scalar> world_stride =
+            k.constant(static_cast<float>(WORLD_VERTEX_BYTES));
+        const Reg<Scalar> normal_stride =
+            k.constant(static_cast<float>(FACE_NORMAL_BYTES));
 
         // Chosen here, on the host, so only one form reaches the instruction
         // stream — a KernelFunc runs once per launch and the flag costs no lane
@@ -193,8 +210,66 @@ Program build_raster_program(void** args)
         // anything kept so far.
         const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
 
-        emit_keep(k, a.predicated, take, best_z, best, depth, one, w0, w1, w2, t.iw0,
-                  t.iw1, t.iw2);
+        // What a kept pixel is coloured with. Barycentric reads nothing beyond
+        // the weights; Diffuse reads the world vertices pass 1 projected and the
+        // triangle's normal, both of which are still on the device because the
+        // geometry is.
+        const auto shade = [&](Reg<Vec3> dst) {
+            if (!diffuse) {
+                emit_shade(k, dst, w0, w1, w2, t.iw0, t.iw1, t.iw2);
+                return;
+            }
+
+            // The same perspective correction emit_shade applies to a colour.
+            // A world position is an attribute like any other: affine weights
+            // interpolate it wrongly across a projected triangle.
+            const Reg<Scalar> a0 = k.mul(w0, t.iw0);
+            const Reg<Scalar> a1 = k.mul(w1, t.iw1);
+            const Reg<Scalar> a2 = k.mul(w2, t.iw2);
+            const Reg<Scalar> inv_total = k.rcp(k.add(k.add(a0, a1), a2));
+
+            // Three vertices of world space, wherever this form keeps them.
+            // Flattened, a triangle is three consecutive vertices; indexed, the
+            // indices have to be read again — the dependent load that form pays
+            // everywhere else, here once more.
+            Reg<Scalar> p0 = world_base;
+            Reg<Scalar> p1 = world_base;
+            Reg<Scalar> p2 = world_base;
+            if (a.indexed) {
+                p0 = k.add(world_base, k.mul(k.load(cursor, 0.0f), world_stride));
+                p1 = k.add(world_base, k.mul(k.load(cursor, 4.0f), world_stride));
+                p2 = k.add(world_base, k.mul(k.load(cursor, 8.0f), world_stride));
+            } else {
+                const Reg<Scalar> triangle_base =
+                    k.add(world_base, k.mul(i, k.constant(3.0f * WORLD_VERTEX_BYTES)));
+                p0 = triangle_base;
+                p1 = k.add(triangle_base, world_stride);
+                p2 = k.add(triangle_base, k.mul(world_stride, k.constant(2.0f)));
+            }
+
+            const Reg<Vec3> v0 = k.load_vec3(p0);
+            const Reg<Vec3> v1 = k.load_vec3(p1);
+            const Reg<Vec3> v2 = k.load_vec3(p2);
+
+            Reg<Vec3> point = k.scale(v0, k.mul(a0, inv_total));
+            point = k.add(point, k.scale(v1, k.mul(a1, inv_total)));
+            point = k.add(point, k.scale(v2, k.mul(a2, inv_total)));
+
+            // Read rather than derived. The ray tracer takes the cross product
+            // of edges it already holds; this kernel would have to load three
+            // vertices to do the same, and the host has already done it once.
+            const Reg<Vec3> normal =
+                k.load_vec3(k.add(normal_base, k.mul(i, normal_stride)));
+
+            const Reg<Vec3> to_light = k.normalize(k.sub(light, point));
+            const Reg<Scalar> lambert = k.max(zero, k.dot(normal, to_light));
+            const Reg<Vec3> lit = k.scale(base_colour, lambert);
+            k.copy_into(dst.component(0), lit.component(0));
+            k.copy_into(dst.component(1), lit.component(1));
+            k.copy_into(dst.component(2), lit.component(2));
+        };
+
+        emit_keep(k, a.predicated, take, best_z, best, depth, one, shade);
 
         k.fma(cursor, stride, one);
         k.fma(i, one, one);

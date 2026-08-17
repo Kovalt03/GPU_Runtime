@@ -55,26 +55,6 @@ RayBasis ray_basis(const Camera& camera, float aspect);
 // face along with it. Against t it keeps a hit behind the origin from counting.
 inline constexpr float INTERSECT_EPSILON = 1e-6f;
 
-// How a hit is coloured.
-//
-// Barycentric is the debug colouring both renderers share, and the only one the
-// rasteriser can produce: pass 1 keeps screen x, y and depth, so the world
-// position and normal a light needs are gone by the time it runs. Lighting is
-// therefore the point at which the two paths stop being directly comparable,
-// which is why it is a mode rather than a replacement.
-enum class ShadingMode {
-    Barycentric,
-    Diffuse,
-};
-
-struct Shading {
-    ShadingMode mode = ShadingMode::Barycentric;
-
-    // World space. Only read in Diffuse.
-    Float3 light_position{2.0f, 3.0f, 1.0f};
-    Float3 base_colour{1.0f, 1.0f, 1.0f};
-};
-
 struct RaytraceStageArgs {
     RayBasis basis;
     Shading shading;

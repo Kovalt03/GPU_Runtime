@@ -61,3 +61,34 @@ struct ScreenTriangle {
 // renderers can be compared image against image rather than by description.
 inline constexpr uint32_t PIXEL_FLOATS = 3;
 inline constexpr uint32_t PIXEL_BYTES = PIXEL_FLOATS * sizeof(float);
+
+// --- shading -----------------------------------------------------------------
+// How a hit is coloured, shared by both renderers so that a frame from one can
+// be held against a frame from the other.
+//
+// Barycentric is the debug colouring, and was for a long time the only one the
+// rasteriser could produce: pass 1 keeps screen x, y, depth and 1/w, so the
+// world position and normal a light needs are gone by the time pass 2 runs. What
+// changed is that the geometry now stays on the device — the world vertices pass
+// 1 read are still there, and a face normal a triangle is a small buffer beside
+// them.
+enum class ShadingMode {
+    Barycentric,
+    Diffuse,
+};
+
+struct Shading {
+    ShadingMode mode = ShadingMode::Barycentric;
+
+    // World space. Only read in Diffuse.
+    Float3 light_position{2.0f, 3.0f, 1.0f};
+    Float3 base_colour{1.0f, 1.0f, 1.0f};
+};
+
+// One unit normal a triangle, which is what the raster routes read rather than
+// deriving it per pixel. The ray tracer takes the cross product it already has
+// the edges for; the rasteriser would have to load three world vertices to do
+// the same, and does load them — for the point a point light needs.
+inline constexpr uint32_t FACE_NORMAL_FLOATS = 3;
+inline constexpr uint32_t FACE_NORMAL_BYTES = FACE_NORMAL_FLOATS * sizeof(float);
+

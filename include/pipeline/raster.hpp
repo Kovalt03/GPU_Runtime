@@ -58,6 +58,20 @@ struct RasterStageArgs {
     // lane pays for a shade it may discard. emit_keep holds both forms and what
     // the trade measured out at.
     bool predicated = false;
+
+    // What a covered pixel is coloured with, and the two buffers Diffuse needs
+    // beyond the screen vertices.
+    //
+    // A point light wants the world position of the pixel, which pass 1 threw
+    // away when it projected — so pass 2 interpolates it from the world vertices
+    // the geometry still holds, using the same perspective-corrected weights the
+    // colour would have used. The normal is read rather than derived: one load
+    // against a cross product and a normalize per pixel.
+    //
+    // Both offsets are ignored in Barycentric, where nothing reads them.
+    Shading shading;
+    size_t world_offset = 0;
+    size_t normal_offset = 0;
 };
 
 // Builds pass 2. args[0] must point at a RasterStageArgs that outlives the

@@ -171,6 +171,12 @@ struct DeviceGeometry {
     void* screen = nullptr;  // pass 1's output, one slot a world vertex
     void* index = nullptr;   // null when the geometry arrived flattened
 
+    // One unit normal a triangle, for the routes that light what they draw.
+    // Uploaded with the vertices rather than derived per pixel, and only for
+    // geometry that will go through a vertex stage — the ray tracer takes the
+    // cross product of edges it has already loaded.
+    void* normals = nullptr;
+
     uint32_t vertex_count = 0;
     uint32_t triangle_count = 0;
 
@@ -213,15 +219,27 @@ void release(MyGPURuntime& rt, DeviceFrame& frame);
 //
 // The tiled pair still allocate per draw, their tile lists being a function of
 // the camera as well as the geometry, and that is where binning belongs.
+// shading last rather than beside the ray tracer's, which takes it before
+// predicated: adding it there would have moved every existing call site's
+// arguments by one and turned a compile error into a silent reinterpretation.
+//
+// Diffuse is the walk's alone. The tiled pair read their triangles from tile
+// lists that carry screen positions only, and would need those lists to grow by
+// a world position a vertex and a normal a triangle; they refuse it instead.
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
                               const DeviceFrame& frame, const DrawTarget& target,
-                              bool predicated = false);
+                              bool predicated = false,
+                              const Shading& shading = Shading{});
+// Both take the shading argument and both refuse Diffuse, which is a better
+// answer than drawing an unlit frame and letting a caller believe otherwise.
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                const DeviceFrame& frame, const DrawTarget& target,
-                               bool predicated = false);
+                               bool predicated = false,
+                               const Shading& shading = Shading{});
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                 const DeviceFrame& frame, const DrawTarget& target,
-                                bool predicated = false);
+                                bool predicated = false,
+                                const Shading& shading = Shading{});
 
 // Throws on indexed geometry rather than resolving it. The index buffer exists
 // to feed a vertex stage and this route has none, so an indexed upload is not a

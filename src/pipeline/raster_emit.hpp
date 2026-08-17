@@ -59,25 +59,30 @@ inline void emit_shade(IRBuilder& k, Reg<Vec3> dst, Reg<Scalar> w0, Reg<Scalar> 
 // divergence and going faster turn out to be different things: what decides it
 // is how much of the loop sits inside the branch, and here most of the cost
 // (three edges, the weights, the depth) sits outside it.
+template <typename Shade>
 inline void emit_keep(IRBuilder& k, bool predicated, Reg<Scalar> take, Reg<Scalar> best_z,
-                      Reg<Vec3> best, Reg<Scalar> depth, Reg<Scalar> one, Reg<Scalar> w0,
-                      Reg<Scalar> w1, Reg<Scalar> w2, Reg<Scalar> iw0, Reg<Scalar> iw1,
-                      Reg<Scalar> iw2)
+                      Reg<Vec3> best, Reg<Scalar> depth, Reg<Scalar> one,
+                      const Shade& shade)
 {
+    // shade is a callable rather than the six weights it used to take, because
+    // what colours a pixel is no longer one expression: the walk can light what
+    // it draws, and lighting reads buffers the tiled routes' tile lists do not
+    // carry. The branch-or-blend decision is the same either way, which is what
+    // this function is for.
     if (!predicated) {
         // Depth from the affine weights, colour from the corrected ones: NDC z
         // is linear in screen space and an attribute is not.
         k.if_(take, [&] {
             k.copy_into(best_z, depth);
-            emit_shade(k, best, w0, w1, w2, iw0, iw1, iw2);
+            shade(best);
         });
         return;
     }
 
-    // Into a scratch range rather than into best: emit_shade overwrites what it
+    // Into a scratch range rather than into best: the shade overwrites what it
     // is handed, and the blend below still needs the old value.
     const Reg<Vec3> shaded = k.vec3();
-    emit_shade(k, shaded, w0, w1, w2, iw0, iw1, iw2);
+    shade(shaded);
 
     const Reg<Scalar> keep = k.sub(one, take);
     const auto blend = [&](Reg<Scalar> dst, Reg<Scalar> src) {

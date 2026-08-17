@@ -1218,6 +1218,92 @@ TEST(Pipeline, BothRenderersAgreeFromAnAngle)
         << differing << " of " << traced.size() << " pixels disagree";
 }
 
+TEST(Pipeline, TheLitRasteriserAgreesWithTheLitRayTracer)
+{
+    // Lighting used to be the point at which the two renderers stopped being
+    // comparable: pass 1 projects a vertex and keeps screen x, y, depth and 1/w,
+    // so the world position a point light needs was gone by pass 2. Holding the
+    // geometry on the device brought it back — pass 2 interpolates the world
+    // vertices pass 1 read, with the same perspective correction it gives a
+    // colour, and takes the triangle's normal from a buffer beside them.
+    //
+    // The two arrive at that position by different routes: the tracer solves for
+    // the ray-triangle hit, the rasteriser interpolates across the projected
+    // triangle. Agreeing is what says both are right.
+    const std::vector<WorldTriangle> scene = shared_scene();
+    const std::vector<Float3> world = as_vertex_list(scene);
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    Shading lit;
+    lit.mode = ShadingMode::Diffuse;
+
+    MyGPURuntime ray_rt(1u << 24);
+    const std::vector<Float3> traced = draw_raytrace(ray_rt, world, target, lit);
+
+    MyGPURuntime raster_rt(1u << 24);
+    DeviceGeometry geometry = upload(raster_rt, world);
+    DeviceFrame frame = allocate_frame(raster_rt, target);
+    const std::vector<Float3> rastered =
+        draw_walk(raster_rt, geometry, frame, target, false, lit);
+
+    ASSERT_EQ(traced.size(), rastered.size());
+    uint32_t differing = 0;
+    uint32_t shaded = 0;
+    for (size_t i = 0; i < traced.size(); ++i) {
+        const bool same = std::abs(traced[i].x - rastered[i].x) < PIXEL_EPS &&
+                          std::abs(traced[i].y - rastered[i].y) < PIXEL_EPS &&
+                          std::abs(traced[i].z - rastered[i].z) < PIXEL_EPS;
+        differing += same ? 0u : 1u;
+        // Lit rather than merely covered: a diffuse term of zero would leave a
+        // frame that a broken normal would also produce.
+        if (rastered[i].x > 0.01f) {
+            ++shaded;
+        }
+    }
+    EXPECT_GT(shaded, 0u) << "nothing was lit, so nothing was compared";
+    EXPECT_LT(differing, traced.size() / 100)
+        << differing << " of " << traced.size() << " pixels disagree";
+
+    // And it is not the barycentric frame under another name.
+    const std::vector<Float3> plain = draw_walk(raster_rt, geometry, frame, target);
+    uint32_t moved = 0;
+    for (size_t i = 0; i < plain.size(); ++i) {
+        moved += std::abs(plain[i].x - rastered[i].x) > PIXEL_EPS ? 1u : 0u;
+    }
+    EXPECT_GT(moved, 0u) << "Diffuse drew what Barycentric draws";
+
+    release(raster_rt, frame);
+    release(raster_rt, geometry);
+}
+
+TEST(Pipeline, LightingIsTheWalksAlone)
+{
+    // The tiled pair read their triangles from tile lists that carry screen
+    // positions and nothing else. Lighting them means growing those lists by a
+    // world position a vertex and a normal a triangle, which is a change to the
+    // binning format rather than to a kernel — so they refuse rather than draw
+    // something unlit and call it lit.
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    Shading lit;
+    lit.mode = ShadingMode::Diffuse;
+
+    MyGPURuntime rt(1u << 24);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    EXPECT_THROW(draw_tiled(rt, geometry, frame, target, false, lit), std::runtime_error);
+
+    // And geometry uploaded for the ray tracer has no normals to light with.
+    DeviceGeometry world_only = upload(rt, world, VertexStage::None);
+    EXPECT_THROW(draw_walk(rt, world_only, frame, target, false, lit),
+                 std::runtime_error);
+
+    release(rt, world_only);
+    release(rt, frame);
+    release(rt, geometry);
+}
+
 // ---------------------------------------------------------------------------
 // Meshes
 // ---------------------------------------------------------------------------

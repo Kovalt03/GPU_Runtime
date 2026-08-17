@@ -25,6 +25,78 @@ struct Owned {
     }
 };
 
+// One unit normal a triangle, computed where the world positions are already in
+// hand and uploaded beside them.
+//
+// cross(v1 - v0, v2 - v0) normalised, which is the expression the ray tracer
+// emits per hit — the two renderers have to agree about which side of a triangle
+// faces the light, and the cheapest way to guarantee that is one formula.
+//
+// A degenerate triangle has no normal and gets a zero one rather than a NaN:
+// normalize throws on a zero-length vector, and a scene is allowed to contain a
+// sliver that no light will ever reach.
+void upload_face_normals(MyGPURuntime& rt, DeviceGeometry& geometry,
+                         const std::vector<Float3>& vertices,
+                         const std::vector<uint32_t>& indices)
+{
+    const bool indexed = !indices.empty();
+    const size_t triangles = indexed ? indices.size() / 3 : vertices.size() / 3;
+    if (triangles == 0) {
+        return;
+    }
+
+    std::vector<float> normals;
+    normals.reserve(triangles * FACE_NORMAL_FLOATS);
+    for (size_t t = 0; t < triangles; ++t) {
+        const Float3 v0 = indexed ? vertices[indices[t * 3 + 0]] : vertices[t * 3 + 0];
+        const Float3 v1 = indexed ? vertices[indices[t * 3 + 1]] : vertices[t * 3 + 1];
+        const Float3 v2 = indexed ? vertices[indices[t * 3 + 2]] : vertices[t * 3 + 2];
+
+        const Float3 face = cross(v1 - v0, v2 - v0);
+        const Float3 unit = length(face) > 0.0f ? normalize(face) : Float3{};
+        normals.push_back(unit.x);
+        normals.push_back(unit.y);
+        normals.push_back(unit.z);
+    }
+
+    const size_t bytes = normals.size() * sizeof(float);
+    geometry.normals = rt.myrt_malloc(bytes);
+    rt.myrt_memcpy(geometry.normals, normals.data(), bytes, Direction::HostToDevice);
+}
+
+// The half both uploads share: vertices on the device, and somewhere for pass 1
+// to put them.
+//
+// Normals are not here because what counts as a triangle differs — a vertex list
+// is triangles three at a time, a mesh is whatever its indices say — and doing
+// it in the shared half meant allocating one set, overwriting the handle with
+// the other, and never freeing the first. The leak test found it.
+DeviceGeometry upload_positions(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                VertexStage stage)
+{
+    DeviceGeometry geometry;
+    geometry.vertex_count = static_cast<uint32_t>(world.size());
+    geometry.triangle_count = static_cast<uint32_t>(world.size() / 3);
+
+    const size_t world_bytes =
+        static_cast<size_t>(geometry.vertex_count) * WORLD_VERTEX_BYTES;
+    geometry.world = rt.myrt_malloc(world_bytes);
+    if (stage == VertexStage::Projects) {
+        geometry.screen = rt.myrt_malloc(static_cast<size_t>(geometry.vertex_count) *
+                                         SCREEN_VERTEX_BYTES);
+    }
+
+    std::vector<float> flat;
+    flat.reserve(world.size() * WORLD_VERTEX_FLOATS);
+    for (const Float3& v : world) {
+        flat.push_back(v.x);
+        flat.push_back(v.y);
+        flat.push_back(v.z);
+    }
+    rt.myrt_memcpy(geometry.world, flat.data(), world_bytes, Direction::HostToDevice);
+    return geometry;
+}
+
 // vertex_count rather than the vertices themselves, because that is all pass 1
 // depends on: build_vertex_program transforms slot i into slot i and never asks
 // whether i is shared.
@@ -172,26 +244,11 @@ TiledRasterStageArgs bin_and_upload(MyGPURuntime& rt, const DeviceGeometry& geom
 DeviceGeometry upload(MyGPURuntime& rt, const std::vector<Float3>& world,
                       VertexStage stage)
 {
-    DeviceGeometry geometry;
-    geometry.vertex_count = static_cast<uint32_t>(world.size());
-    geometry.triangle_count = static_cast<uint32_t>(world.size() / 3);
-
-    const size_t world_bytes =
-        static_cast<size_t>(geometry.vertex_count) * WORLD_VERTEX_BYTES;
-    geometry.world = rt.myrt_malloc(world_bytes);
+    DeviceGeometry geometry = upload_positions(rt, world, stage);
     if (stage == VertexStage::Projects) {
-        geometry.screen = rt.myrt_malloc(static_cast<size_t>(geometry.vertex_count) *
-                                         SCREEN_VERTEX_BYTES);
+        // Three vertices a triangle, in the order they arrive.
+        upload_face_normals(rt, geometry, world, {});
     }
-
-    std::vector<float> flat;
-    flat.reserve(world.size() * WORLD_VERTEX_FLOATS);
-    for (const Float3& v : world) {
-        flat.push_back(v.x);
-        flat.push_back(v.y);
-        flat.push_back(v.z);
-    }
-    rt.myrt_memcpy(geometry.world, flat.data(), world_bytes, Direction::HostToDevice);
     return geometry;
 }
 
@@ -200,7 +257,7 @@ DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)
     // mesh.vertices rather than mesh.flattened(): that is what sizes both the
     // world buffer and pass 1's output by the unique count, and a cube reserves
     // eight screen slots where the flattened list needed thirty-six.
-    DeviceGeometry geometry = upload(rt, mesh.vertices, VertexStage::Projects);
+    DeviceGeometry geometry = upload_positions(rt, mesh.vertices, VertexStage::Projects);
     geometry.triangle_count = mesh.triangle_count();
     geometry.indices = mesh.indices;
 
@@ -218,6 +275,10 @@ DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)
     geometry.index = rt.myrt_malloc(index_bytes);
     rt.myrt_memcpy(geometry.index, as_floats.data(), index_bytes,
                    Direction::HostToDevice);
+
+    // From the indices: the unique vertices in the order they happen to arrive
+    // are not triangles, and normalling them would describe a shape nobody drew.
+    upload_face_normals(rt, geometry, mesh.vertices, mesh.indices);
     return geometry;
 }
 
@@ -243,6 +304,7 @@ void release(MyGPURuntime& rt, DeviceGeometry& geometry)
     rt.myrt_free(geometry.world);
     rt.myrt_free(geometry.screen);
     rt.myrt_free(geometry.index);
+    rt.myrt_free(geometry.normals);
     geometry = DeviceGeometry{};
 }
 
@@ -256,13 +318,23 @@ void release(MyGPURuntime& rt, DeviceFrame& frame)
 
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
                               const DeviceFrame& frame, const DrawTarget& target,
-                              bool predicated)
+                              bool predicated, const Shading& shading)
 {
+    if (shading.mode == ShadingMode::Diffuse && geometry.normals == nullptr) {
+        throw std::runtime_error(
+            "draw_walk: lighting needs the face normals, and this geometry was "
+            "uploaded without a vertex stage");
+    }
+
     run_pass_one(rt, geometry, target);
 
     RasterStageArgs args;
     args.screen_offset = rt.myrt_device_offset(geometry.screen);
     args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.shading = shading;
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.normal_offset =
+        geometry.normals == nullptr ? 0 : rt.myrt_device_offset(geometry.normals);
     args.width = target.width;
     args.height = target.height;
     args.triangle_count = geometry.triangle_count;
@@ -279,8 +351,14 @@ std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
 
 std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                const DeviceFrame& frame, const DrawTarget& target,
-                               bool predicated)
+                               bool predicated, const Shading& shading)
 {
+    if (shading.mode != ShadingMode::Barycentric) {
+        throw std::runtime_error(
+            "draw_tiled: a tile list carries screen positions only, so this route "
+            "cannot light what it draws — the walk can");
+    }
+
     // The kernel is the same program whichever form the geometry arrived in:
     // bin_triangles copies each triangle into every tile it reaches, so what
     // reaches the device is already de-indexed.
@@ -293,8 +371,14 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                 const DeviceFrame& frame, const DrawTarget& target,
-                                bool predicated)
+                                bool predicated, const Shading& shading)
 {
+    if (shading.mode != ShadingMode::Barycentric) {
+        throw std::runtime_error(
+            "draw_shared: a tile list carries screen positions only, so this route "
+            "cannot light what it draws — the walk can");
+    }
+
     run_pass_one(rt, geometry, target);
     TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
     args.predicated = predicated;
