@@ -1443,6 +1443,35 @@ TEST(Pipeline, PredicationChangesTheCostAndNotThePixels)
     }
 }
 
+TEST(Pipeline, PredicationLosesByFarMoreOnceLoadsAreChargedByTheLine)
+{
+    // The flat model was flattering the blend. Both variants make the same
+    // loads, and at 100 a lane those drowned the arithmetic the blend adds; a
+    // warp's load is one transaction once lines are counted, and the arithmetic
+    // is then most of what is left to compare.
+    const Mesh cube = cube_mesh();
+    const DrawTarget target{WIDTH, HEIGHT, cube_camera()};
+
+    const auto penalty = [&cube, &target](MemoryModel model) {
+        const auto cost = [&](bool predicated) {
+            MyGPURuntime rt(1u << 24);
+            rt.myrt_set_memory_model(model);
+            draw_walk(rt, cube, target, predicated);
+            return static_cast<double>(rt.stats().weighted_lane_ops);
+        };
+        const double branch = cost(false);
+        return (cost(true) - branch) / branch;
+    };
+
+    const double flat = penalty(MemoryModel::Flat);
+    const double cached = penalty(MemoryModel::Cached);
+
+    EXPECT_GT(flat, 0.0) << "the blend was not dearer even under the flat charge";
+    EXPECT_LT(flat, 0.05) << "the flat penalty is the couple of percent recorded";
+    EXPECT_GT(cached, 4 * flat)
+        << "charging by the line left the blend's arithmetic no dearer than before";
+}
+
 TEST(Pipeline, EveryRouteDrawsTheSameCube)
 {
     const Mesh cube = cube_mesh();

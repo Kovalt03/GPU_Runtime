@@ -18,3 +18,7 @@ target_link_libraries(reduction_bench PRIVATE gpurt project_warnings)
 
 add_executable(cache_bench cache_bench.cpp)
 target_link_libraries(cache_bench PRIVATE gpurt project_warnings)
+
+# The same comparisons render_bench makes, under the cost models it does not use.
+add_executable(model_bench model_bench.cpp)
+target_link_libraries(model_bench PRIVATE gpurt project_warnings)
