@@ -958,6 +958,22 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         return true;
     }
 
+    // The one place a per-lane cost is not simply lanes x cost: what a global
+    // access costs depends on where the lanes point, once the memory model
+    // looks. Everything else is charged by opcode alone.
+    //
+    // Priced before the lanes run, because execute() may overwrite the register
+    // the address came from: a load into its own address register is a legal
+    // instruction, and pricing afterwards would read the value just fetched as
+    // if it were an address — charging the wrong line, or refusing a valid
+    // program because what it loaded was negative or fractional.
+    const Instruction& issued = program[warp.pc];
+    const bool addresses_memory = issued.op == Opcode::V_LD_GLOBAL_F32 ||
+                                  issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
+                                  issued.op == Opcode::V_ST_GLOBAL_F32;
+    const GlobalAccess access =
+        addresses_memory ? global_access(warp, issued) : GlobalAccess{};
+
     // Skipping the masked lanes is what divergence costs: they are paid for by
     // the step and produce nothing. Advancing pc before execute() is what lets a
     // branch simply overwrite it.
@@ -976,14 +992,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     stats_.warp_steps += 1;
     stats_.active_lane_ops += lanes;
 
-    // The one place a per-lane cost is not simply lanes x cost: what a global
-    // access costs depends on where the lanes point, once the memory model
-    // looks. Everything else is charged by opcode alone.
-    const Instruction& issued = program[warp.pc];
-    if (issued.op == Opcode::V_LD_GLOBAL_F32 ||
-        issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
-        issued.op == Opcode::V_ST_GLOBAL_F32) {
-        const GlobalAccess access = global_access(warp, issued);
+    if (addresses_memory) {
         stats_.weighted_lane_ops += access.cost;
         issued_latency_ = access.latency;
     } else {

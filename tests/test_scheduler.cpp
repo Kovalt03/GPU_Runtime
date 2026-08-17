@@ -1640,6 +1640,76 @@ TEST(Scheduler, AVectorLoadLandsThreeFloatsInThreeRegisters)
     EXPECT_THROW(over.run(spill), std::runtime_error);
 }
 
+TEST(Scheduler, DependenceIsNotDistinguishedFromIssueOrder)
+{
+    // The bound on what the cycle count can be asked. A warp that has issued
+    // waits out the latency before issuing again, whether or not the next
+    // instruction wanted the result, so a dependent chain and independent
+    // accesses come out identical. Occupancy is what this models; a scoreboard
+    // is what it does not.
+    //
+    // Pessimistic rather than generous, which is what makes a figure taken from
+    // it an upper bound on what dependent loads cost.
+    const auto cycles = [](const Program& p) {
+        ThreadBlock block = make_block(1);
+        std::vector<uint8_t> memory(GLOBAL_BYTES, 0);
+        // Each slot points at the next, so the chained loads walk forward.
+        for (size_t i = 0; i < 8; ++i) {
+            const float next = static_cast<float>((i + 1) * sizeof(float));
+            std::memcpy(memory.data() + i * sizeof(float), &next, sizeof(float));
+        }
+        WarpScheduler scheduler;
+        scheduler.set_memory_model(MemoryModel::Cached);
+        scheduler.set_latency_model(LatencyModel::Modelled);
+        scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+        return scheduler.stats().cycles;
+    };
+
+    Program chained;
+    chained.push_back(make_v_mov_f32(0, 0.0f));
+    chained.push_back(make_v_ld_global_f32(1, 0));  // each address is the last result
+    chained.push_back(make_v_ld_global_f32(2, 1));
+    chained.push_back(make_v_ld_global_f32(3, 2));
+    chained.push_back(make_ret());
+
+    Program independent;
+    independent.push_back(make_v_mov_f32(0, 0.0f));
+    independent.push_back(make_v_ld_global_f32(1, 0, 0.0f));
+    independent.push_back(make_v_ld_global_f32(2, 0, 4.0f));
+    independent.push_back(make_v_ld_global_f32(3, 0, 8.0f));
+    independent.push_back(make_ret());
+
+    EXPECT_EQ(cycles(chained), cycles(independent));
+}
+
+TEST(Scheduler, ALoadIsPricedFromItsAddressAndNotFromWhatItFetched)
+{
+    // A load may name its address register as its destination, and the memory
+    // model reads that register to decide which line was touched. Pricing after
+    // the lanes had run charged the value just fetched as an address — the wrong
+    // line where that value happened to be a plausible one, and a refusal where
+    // it was negative or fractional, both for a program that is not in error.
+    for (const float payload : {-1.0f, 3.5f, 8.0f}) {
+        Fixture f;
+        f.poke(128, payload);
+        broadcast(f.warp(), 0, 128.0f);
+        f.sched.set_memory_model(MemoryModel::Coalesced);
+
+        Program p;
+        p.push_back(make_v_ld_global_f32(/*dst=*/0, /*addr_reg=*/0));
+        p.push_back(make_ret());
+
+        ASSERT_NO_THROW(f.run(p)) << "payload " << payload;
+        EXPECT_FLOAT_EQ(f.lane(0).regs[0], payload);
+
+        // One line, whatever arrived in the register: every lane read address 128.
+        const uint64_t retire = WARP_SIZE * instruction_cost(Opcode::RET);
+        EXPECT_EQ(f.sched.stats().weighted_lane_ops - retire,
+                  instruction_cost(Opcode::V_LD_GLOBAL_F32))
+            << "payload " << payload;
+    }
+}
+
 TEST(Scheduler, AVectorLoadIsOneTransactionWhereThreeScalarsAreThree)
 {
     // What the opcode exists to show, and why it waited for MemoryModel. Every
