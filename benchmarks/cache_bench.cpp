@@ -374,6 +374,57 @@ int main(int argc, char** argv)
         md << buf;
     }
 
+    // --- uploading once and drawing many ---------------------------------------
+
+    // Every miss this project measured before was compulsory by construction:
+    // draw_* uploaded, drew and abandoned its buffers, so the next draw asked
+    // about an address nobody had touched. Holding the geometry separates the
+    // two kinds — a line refetched now is one the cache could not keep.
+    std::printf("\n  Drawing resident geometry three times over\n\n");
+    std::printf("  %8s %10s %6s %10s %14s %12s\n", "tris", "cache", "draw", "misses",
+                "cost", "cycles");
+
+    struct Repeat {
+        uint32_t triangles;
+        bool scaled;
+        uint32_t draw;
+        uint64_t misses;
+        uint64_t weighted;
+        uint64_t cycles;
+    };
+    std::vector<Repeat> repeats;
+
+    for (const bool scaled : {false, true}) {
+        // Small enough to fit the hardware cache, and large enough not to fit
+        // the scaled one — the two sides of the distinction being drawn.
+        const uint32_t triangles = scaled ? 3000 : 360;
+        const std::vector<Float3> world = scene(triangles);
+
+        MyGPURuntime rt(1u << 29);
+        rt.myrt_set_memory_model(MemoryModel::Cached);
+        rt.myrt_set_latency_model(LatencyModel::Modelled);
+        if (scaled) {
+            rt.myrt_set_cache_lines(SCALED_L1, SCALED_L2);
+        }
+
+        DeviceGeometry geometry = upload(rt, world);
+        DeviceFrame frame = allocate_frame(rt, target());
+        for (uint32_t draw = 1; draw <= 3; ++draw) {
+            draw_walk(rt, geometry, frame, target());
+            repeats.push_back(Repeat{triangles, scaled, draw, rt.stats().cache_misses,
+                                     rt.stats().weighted_lane_ops, rt.stats().cycles});
+        }
+        release(rt, frame);
+        release(rt, geometry);
+    }
+
+    for (const Repeat& r : repeats) {
+        std::printf("  %8u %10s %6u %10s %14s %12s\n", r.triangles,
+                    r.scaled ? "scaled" : "hardware", r.draw,
+                    with_commas(r.misses).c_str(), with_commas(r.weighted).c_str(),
+                    with_commas(r.cycles).c_str());
+    }
+
     // --- what the flat model was hiding: ordering a mesh for a vertex cache -----
 
     const std::string mesh_path = args.text(0, "assets/sphere.obj");
@@ -468,6 +519,27 @@ int main(int argc, char** argv)
                   with_commas(tiled_fixed.cycles).c_str(),
                   change(tiled_mixed.cycles, tiled_fixed.cycles));
     md << buf;
+
+    csv << "\ntriangles,cache,draw,misses,weighted,cycles\n";
+    for (const Repeat& r : repeats) {
+        csv << r.triangles << ',' << (r.scaled ? "scaled" : "hardware") << ',' << r.draw
+            << ',' << r.misses << ',' << r.weighted << ',' << r.cycles << '\n';
+    }
+
+    md << "\n## Drawing resident geometry three times over\n\n"
+       << "Uploaded once and drawn three times, with latency modelled. The scaled rows\n"
+          "hold L1 at "
+       << SCALED_L1 << " lines and L2 at " << SCALED_L2
+       << ", which the scene outgrows.\n\n"
+       << "| Triangles | Cache | Draw | Misses | Cost | Cycles |\n"
+       << "|---:|---|---:|---:|---:|---:|\n";
+    for (const Repeat& r : repeats) {
+        std::snprintf(buf, sizeof(buf), "| %u | %s | %u | %s | %s | %s |\n", r.triangles,
+                      r.scaled ? "scaled" : "hardware", r.draw,
+                      with_commas(r.misses).c_str(), with_commas(r.weighted).c_str(),
+                      with_commas(r.cycles).c_str());
+        md << buf;
+    }
 
     std::printf("\nwrote %s.md and %s.csv\n", prefix.c_str(), prefix.c_str());
     return 0;
