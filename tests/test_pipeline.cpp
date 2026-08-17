@@ -1475,12 +1475,16 @@ TEST(Pipeline, EveryRouteDrawsTheSameCube)
     EXPECT_TRUE(lit) << "the cube did not reach the frame";
 }
 
-TEST(Pipeline, ReorderingForAVertexCacheBuysNothingHere)
+TEST(Pipeline, ReorderingForAVertexCacheBuysNothingUnderTheFlatModel)
 {
     // Ordering a mesh for a vertex cache is worth a factor of three or four on
     // fixed-function hardware. Pass 1 here materialises each unique vertex once
     // whatever order the triangles arrive in, so the issued work barely notices
     // — and that is what materialising cost a buffer and a pass for.
+    //
+    // A flat charge per lane also cannot tell a vertex just read from one that was
+    // not, which is a second reason for the same reading. The test below separates
+    // them by putting the question to MemoryModel::Cached.
     const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
     const Mesh mixed = shuffled(sphere, 12345);
     const Mesh fixed = optimised_for_cache(mixed, 32);
@@ -1510,6 +1514,56 @@ TEST(Pipeline, ReorderingForAVertexCacheBuysNothingHere)
         EXPECT_FLOAT_EQ(fixed_frame[i].y, mixed_frame[i].y) << "pixel " << i;
         EXPECT_FLOAT_EQ(fixed_frame[i].z, mixed_frame[i].z) << "pixel " << i;
     }
+}
+
+TEST(Pipeline, ReorderingPaysOnceTheCacheIsSmallerThanTheMesh)
+{
+    // What the flat model was hiding. The indexed walk carries the index buffer
+    // into pass 2 and reads a vertex through it, so a vertex two triangles apart in
+    // the list may still be resident — and whether it is depends on the order the
+    // triangles arrive in, which is what Forsyth's heuristic chooses.
+    //
+    // A small frame: the reuse being measured is between the triangles a block
+    // walks, and every block walks all of them however many pixels there are.
+    const Mesh sphere = load_obj(std::string(GPURT_ASSETS_DIR) + "/sphere.obj");
+    const Mesh mixed = shuffled(sphere, 12345);
+    const Mesh fixed = optimised_for_cache(mixed, 32);
+    const DrawTarget target{16, 16, cube_camera()};
+
+    // Eight lines hold 64 of the sphere's 182 vertices. Latency modelled as well,
+    // because an L1 hit against an L2 hit is 8 against 30 in issue capacity and 30
+    // against 200 in cycles — the same reordering shows up far larger in time.
+    const auto walk = [&target](const Mesh& mesh, size_t l1_lines) {
+        MyGPURuntime rt(1u << 26);
+        rt.myrt_set_memory_model(MemoryModel::Cached);
+        rt.myrt_set_latency_model(LatencyModel::Modelled);
+        rt.myrt_set_cache_lines(l1_lines, 512);
+        draw_walk(rt, mesh, target);
+        return rt.stats();
+    };
+
+    const SchedulerStats mixed_small = walk(mixed, 8);
+    const SchedulerStats fixed_small = walk(fixed, 8);
+
+    // The mechanism, and it is not fewer fetches: every line is touched by someone
+    // either way, so the misses are compulsory and identical. What moves is which
+    // level answered the rest.
+    EXPECT_EQ(fixed_small.cache_misses, mixed_small.cache_misses);
+    EXPECT_LT(fixed_small.l2_hits * 3, mixed_small.l2_hits);
+
+    EXPECT_LT(fixed_small.weighted_lane_ops, mixed_small.weighted_lane_ops);
+    EXPECT_LT(fixed_small.cycles * 10, mixed_small.cycles * 9)
+        << "reordering saved less than a tenth of the cycles";
+
+    // And the bound on the claim: at the hardware size the mesh fits, nothing is
+    // evicted, and the reorder has nothing to win back.
+    const SchedulerStats mixed_large = walk(mixed, L1_LINES);
+    const SchedulerStats fixed_large = walk(fixed, L1_LINES);
+    EXPECT_EQ(fixed_large.l2_hits, mixed_large.l2_hits);
+    EXPECT_LT(std::abs(static_cast<double>(fixed_large.cycles) -
+                       static_cast<double>(mixed_large.cycles)) /
+                  static_cast<double>(mixed_large.cycles),
+              0.001);
 }
 
 TEST(Pipeline, TriangleOrderReachesTheCountersOnlyThroughDepth)

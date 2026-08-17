@@ -10,7 +10,14 @@ session:
 cmake --build build -j8
 ./build/benchmarks/render_bench     # stdout, plus benchmarks/result/render_bench.{md,csv}
 ./build/benchmarks/reduction_bench  #         plus benchmarks/result/reduction.{md,csv}
+./build/benchmarks/cache_bench      #         plus benchmarks/result/cache.{md,csv}
 ```
+
+**Which cost model.** Every figure here is taken with a global access charged per
+lane and no instruction waiting on another — `MemoryModel::Flat` and
+`LatencyModel::Ignored`, the defaults. The four sections from *Charging memory by
+the line* to *ordering a mesh* measure what the other models change, and are the
+only ones that do.
 
 The scenes are code in `benchmarks/render_bench.cpp`, and the routes it measures
 are the same `draw_walk` / `draw_tiled` / `draw_shared` / `draw_raytrace` the
@@ -291,6 +298,176 @@ Two details worth keeping:Two details worth keeping:
   cooperative fill is a second source, and the coverage flag has no bearing on
   it. An earlier test asserted a flat zero for all three routes and passed only
   because its 64x32 frame had too few tiles to split the fill.
+
+---
+
+## Charging memory by the line
+
+A warp issues one load and its 32 lanes name 32 addresses. `MemoryModel::Flat`
+charges every lane; `Coalesced` charges the distinct 128-byte lines they land in.
+
+| Route | Flat | Coalesced | |
+|---|---:|---:|---:|
+| walk | 31,317,520 | 2,210,320 | **-92.9%** |
+| tiled | 11,311,632 | 854,032 | -92.4% |
+| shared | 2,354,064 | 1,383,664 | -41.2% |
+| raytrace | 23,656,822 | 1,692,022 | -92.8% |
+
+About 93% comes off three of the four, and all of it is one thing: these kernels
+read their triangle **warp-uniformly**, so 32 lanes name one address and the flat
+model was charging that as 32 loads. The comments had said hardware would broadcast
+it from a scalar unit and that this is why the ISA reserves an `S_` prefix; here is
+the figure.
+
+### It reverses shared-memory staging
+
+| Against tiled | Flat | Coalesced |
+|---|---:|---:|
+| staging | **-79.2%** | **+62.0%** |
+
+Staging exists to stop 32 lanes issuing the same global load. That load costs one
+line either way, so it was saving nothing — while still paying its shared stores,
+its loads and two barriers a round.
+
+The section above says the 96% staging wins is arithmetic on a flat 100-against-8
+rather than a cache story. It is worse than that: it is not a win at all once a
+line is the unit.
+
+`shared` drops only 41% for the same reason — its share of global traffic was
+already small, so there was less being overcharged.
+
+---
+
+## What a cache is worth
+
+`MemoryModel::Cached` asks, of each line, whether it had to be fetched. L1 holds
+1024 lines and is emptied when a block starts; L2 holds 65,536 and is the device's,
+outliving a launch as it does on hardware.
+
+| Triangles | Lines | vs L1 | Coalesced | Cached | | Hit rate |
+|---:|---:|---:|---:|---:|---:|---:|
+| 360 | 135 | 0.13x | 62,432,720 | 37,136,442 | **-40.5%** | 99.9% |
+| 1,000 | 375 | 0.37x | 173,189,296 | 103,011,098 | -40.5% | 100.0% |
+| 3,000 | 1,125 | 1.10x | 519,302,256 | 308,868,058 | -40.5% | 100.0% |
+| 10,000 | 3,750 | 3.66x | 1,730,694,480 | 1,029,364,282 | -40.5% | 100.0% |
+
+**A constant, not a curve.** The working set grows 27-fold past L1's capacity and
+nothing moves, because pass 1's stores leave the whole screen buffer in L2 and pass
+2 finds it there. At this scale L2 is effectively infinite: filling it would take
+about 175,000 triangles.
+
+### Binning is a locality optimisation too
+
+Scaled to L1 32 lines and L2 512 — chosen so the scenes outgrow them, and not
+hardware sizes:
+
+| Triangles | scene / L2 | Route | Hit rate | Misses |
+|---:|---:|---|---:|---:|
+| 1,000 | 0.73x | walk | 100.0% | 383 |
+| 3,000 | 2.20x | walk | 96.9% | **72,318** |
+| 3,000 | 2.20x | tiled | 99.5% | 1,398 |
+| 10,000 | 7.32x | walk | 96.9% | 240,318 |
+| 10,000 | 7.32x | tiled | 99.6% | 4,242 |
+
+A block of the naive walk reads every triangle, so its working set is the whole
+scene. A block of the tiled route reads one tile's list. Shrink the cache until the
+scene outgrows it and the walk starts missing while the tiled route does not.
+
+The flat model attributed all of binning's win to dropping triangles. Part of it is
+locality, and there was no way to say so before.
+
+Total cost moves only 1.6% for all that — the misses are a hundred times more
+numerous and still a minority. The knee is in the hit rate, not in the bill.
+
+### What is still invisible
+
+**Capacity misses do not arise from drawing more.** Twenty-four draws in
+succession leave the hit rate at 99.4%: each reads only its own data, so a line
+evicted by a later draw is never asked for again. Every miss is compulsory.
+
+Drawing the *same* geometry twice does not help either, because `draw_*` allocates
+per call and never frees — the second copy lands at a different address, so it is
+new data as far as the cache is concerned.
+
+That is a gap in the runtime API rather than in the cache: there is no way to
+upload once and draw many times, which is what real code does and what a depth
+prepass would need.
+
+---
+
+## Waiting, and covering the wait
+
+`LatencyModel::Modelled` makes a result available some cycles after it is issued,
+and a warp that has issued cannot issue again until then. Latencies are chosen
+ratios with the provenance the costs have: arithmetic 4, a special function 16,
+shared memory 30, and a global load from wherever its line was found — L1 30, L2
+200, memory 400.
+
+| Warps | Steps | Cycles | Stalls | Cycles/warp |
+|---:|---:|---:|---:|---:|
+| 1 | 6 | 30 | 24 | 30.0 |
+| 2 | 12 | 32 | 20 | 16.0 |
+| 4 | 24 | 36 | 12 | 9.0 |
+| 8 | 48 | 56 | 8 | 7.0 |
+| 16 | 96 | 96 | 0 | **6.0** |
+
+A chain of dependent arithmetic, and the reason warps are batched at all: one warp
+waits out every latency alone, sixteen cover it completely. This is the first thing
+the simulator could not say before — with nothing ever waiting, resident warps
+neither helped nor hindered each other.
+
+**Whether occupancy is enough depends on what is being hidden.** A trip to memory
+is 400 cycles against a block's 32 warps of a few each, so filling the block
+spreads it rather than removing it: 32 warps still stall.
+
+That is also where the cache shows up in time rather than in issue capacity. Every
+warp reading one line, 16 warps: `Flat` 448 cycles against `Cached` 421 — the first
+warp goes to memory and the rest find it in L1.
+
+**Cycles are hidden within a block only.** Hardware puts several blocks on an SM
+and lets all their warps cover each other; here a block runs to completion before
+the next starts.
+
+---
+
+## What the flat model was hiding: ordering a mesh
+
+Reordering a mesh's triangles for a vertex cache is worth a factor of three or four
+on fixed-function hardware. Measured here before there was a cache, it was worth
+0.004% — and even that was depth ordering rather than reuse, since a flat charge
+per lane cannot tell a vertex just read from one that was not.
+
+A cache can. The same sphere, shuffled and then reordered by Forsyth's heuristic —
+ACMR 2.54 to 0.64 — drawn by the indexed walk, with L2 at 512 lines and latency
+modelled:
+
+| L1 lines | Vertices held | Cost | | Cycles | | L2 hits |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 16 | 43,413,292 | -0.23% | 26,486,424 | -2.9% | 71,838 → 67,230 |
+| 4 | 32 | 42,348,844 | -1.33% | 18,348,184 | -19.4% | 44,830 → 18,846 |
+| 8 | 64 | 42,058,796 | **-1.60%** | 16,106,904 | **-24.7%** | 36,701 → 5,662 |
+| 16 | 128 | 42,046,124 | -0.87% | 16,008,984 | -15.1% | 21,789 → 5,086 |
+| 32 | 256 | 42,025,004 | +0.02% | 15,845,784 | +0.4% | 3,741 → 4,126 |
+| 1024 (hardware) | 8,192 | 42,016,512 | -0.00% | 15,780,504 | 0.0% | 3,740 → 3,740 |
+
+**It is not fewer fetches.** The misses are 226 in every row, before and after: each
+line is compulsory, touched once by someone whatever the order. What the reorder
+moves is which level answered the rest — L2 hits fall by a factor of six, and the
+two levels are 8 against 30 in issue capacity and 30 against 200 in cycles. Hence
+the two columns differing by a factor of fifteen: reordering buys a little issue
+capacity and a great deal of time.
+
+**The saving has a window, and the window is the mesh.** 64 vertices held is the
+peak because the heuristic is scored against a 32-entry FIFO. Below it nothing
+stays resident whatever the order; above 256 the whole 182-vertex sphere fits and
+there is nothing to evict, which is where the hardware size sits — a mesh would
+need more than 8,192 vertices to reach it, and the walk being O(pixels x triangles)
+puts that out of reach of a benchmark.
+
+**The route has to be able to see the order.** The tiled route at the same L1 moves
+-0.01% and +0.12%: `bin_triangles` de-indexes on the host, so a block streams each
+triangle's three vertices and has nothing to re-read. That control is what
+separates this from the depth ordering a shuffle also changes.
 
 ---
 

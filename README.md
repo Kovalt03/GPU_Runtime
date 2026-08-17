@@ -169,6 +169,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # Summing a warp: shared memory against the lane exchange
 ./build/benchmarks/reduction_bench          # benchmarks/result/reduction.{md,csv}
+
+# A cache against a growing working set
+./build/benchmarks/cache_bench              # benchmarks/result/cache.{md,csv}
 ```
 
 ### Formatting
@@ -200,8 +203,12 @@ on their own line, `int* ptr`.
 | Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
 | Predication against the branch (raster / ray) | **+2%** / **+4.4%**, divergence to zero |
 | Warp reduction, exchange against shared memory | **33** instructions against 68 |
+| Charging memory by the line, not the lane | **-93%**, and staging stops winning |
+| A cache over the same scenes | **-40%**, flat — L2 is never outgrown here |
+| Latency covered by 16 warps against 1 | **30 → 6** cycles a warp |
+| Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
 | Opcodes | 30 |
-| Tests | 247 |
+| Tests | 259 |
 
 ### What divergence costs
 
@@ -285,10 +292,19 @@ outside the trade entirely: binning de-indexes on the host, so they take pass
 
 `simulated_cache_misses` counts what a 32-entry post-transform FIFO would have
 missed, which is ACMR — the number the literature quotes. Reordering triangles
-by Forsyth's linear-speed heuristic moves a shuffled sphere from **2.60 to
-0.68** against a floor of 0.51. That is a real saving in a machine with such a
-cache, and this one has none: reordering changes the issued work here by
-0.004%, all of it from triangles arriving in a different depth order.
+by Forsyth's linear-speed heuristic moves a shuffled sphere from **2.54 to
+0.64** against a floor of 0.51.
+
+What that is worth here depends on which cost model is asked, and the answer
+changed when one arrived. A flat charge per lane cannot tell a vertex just read
+from one that was not, and reported 0.004% — all of it triangles arriving in a
+different depth order. Against a memory cache the mesh does not fit in, the same
+reorder takes **1.6% off the issued work and 25% off the cycles** of the indexed
+walk. Not by fetching less: every miss is compulsory either way, and what moves is
+which level answered, L2 hits falling six-fold. The window closes as the cache
+grows — at the hardware L1 this sphere fits with room to spare and the reorder wins
+nothing, so what is measured is a mesh larger than its cache rather than this mesh
+on this hardware.
 
 ### Removing divergence is not the same as going faster
 
@@ -421,8 +437,9 @@ against `walk` and nothing else, and a BVH is what would close it.
 
 | | Here |
 |---|---|
-| L1 / L2 / VRAM hierarchy | **absent** — a global load costs a flat 100 |
-| Coalescing | **absent** — the cost model charges per lane whatever the address pattern |
+| L1 / L2 hierarchy | modelled: 1024 lines and 65,536 of 128 bytes, LRU, tags only. Nothing here outgrows L2, so what it demonstrably does is catch what L1 drops |
+| Coalescing | modelled: a warp's 32 addresses are charged by the distinct lines they touch. Transaction counts, not bandwidth contention |
+| DRAM, bandwidth saturation | **absent** — transactions never queue for a shared resource |
 | Shared memory + barrier | modelled: 4096 floats a block, `BARRIER`, a load costing 8 |
 | Register file | modelled: 256 per thread, and running out throws |
 
@@ -434,31 +451,32 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Independent thread scheduling | modelled — `WarpPolicy::Independent`, per-thread pc with no lane starving another |
 | Warp-level primitives | modelled — ballot, any, all, syncwarp, shuffle, each naming its participants |
 | Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
-| Latency hiding | **absent** — the reason warps are batched at all, and invisible here |
+| Latency hiding | modelled **within a block** — a result arrives some cycles after it is issued and other warps cover the wait. Hardware puts several blocks on an SM and lets all their warps cover each other; here a block runs to completion first |
 | Streams, async copy | **absent** — every launch is synchronous |
 
 ### The three that matter most
 
-**Coalescing.** Whether 32 lanes read 32 adjacent floats or 32 scattered ones is
-the first question asked of any real kernel, and this cost model cannot tell
-them apart. It is why `V_LD_GLOBAL_VEC3_F32` is specified but unbuilt: there is
-nothing for it to demonstrate yet. It also means the 95% that shared-memory
-staging wins is arithmetic on a flat 100-vs-8, not a cache story.
+**Bandwidth.** Transactions are counted, never queued. Two warps each needing four
+lines are charged independently, so nothing here saturates: no shared resource, no
+DRAM row buffer, no ceiling. Counting how many transactions a kernel makes is a
+different question from how long they take together, and only the first is answered.
 
-**Latency hiding.** Warps exist so that a stall on one can be covered by
-another. Blocks run to completion in sequence here and every instruction costs
-a fixed number, so occupancy — the number a real tuning session revolves
-around — has nowhere to appear.
+**Capacity misses.** Every miss measured is compulsory — a line touched for the
+first time. Drawing more does not change that, because each draw reads only its own
+data, and drawing the *same* geometry twice does not either: `draw_*` allocates per
+call and never frees, so the second copy is new data as far as the cache is
+concerned. Upload-once-draw-many is missing from the runtime API, and a depth
+prepass would need it.
 
-**Early-Z.** Rejecting a fragment before shading it is most of what makes a
-modern rasteriser fast on a scene with depth complexity. Every pixel here
-shades every triangle that covers it.
+**Early-Z.** Rejecting a fragment before shading it is most of what makes a modern
+rasteriser fast on a scene with depth complexity. Every pixel here shades every
+triangle that covers it — and building it means the persistent buffers above, since
+the depth pass and the colour pass have to read one copy of the geometry.
 
-Closing the first would mean the cost model reading a warp's 32 addresses
-rather than only its opcode, and every figure above being taken again. The
-second would mean instructions carrying a latency separate from their
-throughput, so that a warp waiting on a load could be stepped over rather than
-charged a flat number.
+**Occupancy across blocks.** Latency is covered within a block, which is where this
+machine can see it: `myrt_launch` runs blocks one after another, so the warps of
+one never cover the waiting of another. A real SM holds several blocks at once and
+that is most of where occupancy comes from.
 
 ---
 

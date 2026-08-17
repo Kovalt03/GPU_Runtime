@@ -23,8 +23,16 @@
 // starts missing while the tiled route does not — a distinction the flat cost model
 // had no way to express, and part of what it was attributing to dropped triangles.
 //
+// The last section asks what else the flat model was hiding. Ordering a mesh for a
+// vertex cache is worth a factor of three or four on fixed-function hardware and
+// was worth a thousandth of a percent here, because a flat charge per lane cannot
+// tell a vertex that was just read from one that was not. A cache can, so the
+// question is put again — the same reorder, measured through the new model.
+//
 //   ./build/benchmarks/cache_bench            benchmarks/result/cache.{md,csv}
 //   ./build/benchmarks/cache_bench --out dir  writes into that directory
+//   ./build/benchmarks/cache_bench m.obj      reorders that mesh instead of the
+//                                             sphere, from the project root
 
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +43,7 @@
 
 #include "app_run.hpp"
 #include "math3d.hpp"
+#include "mesh.hpp"
 #include "pipeline/draw.hpp"
 #include "pipeline/types.hpp"
 #include "runtime.hpp"
@@ -78,6 +87,11 @@ struct Reading {
     uint64_t l1_hits = 0;
     uint64_t l2_hits = 0;
     uint64_t misses = 0;
+    // Zero unless the reading was taken under LatencyModel::Modelled, where a warp
+    // that has issued waits before it issues again. Only the reorder section below
+    // needs it: what moves there is which level answered, and the two levels are
+    // ten cycles apart in cost and a hundred and seventy in time.
+    uint64_t cycles = 0;
     bool ran = true;
 
     uint64_t lookups() const
@@ -131,6 +145,44 @@ Reading measure(Route route, const std::vector<Float3>& world, MemoryModel model
     return r;
 }
 
+// L1 sizes for the reorder sweep, in lines. A line holds eight screen vertices, so
+// these hold 16 to 8,192 and the sphere's 182 sit inside the range — deliberately,
+// since ordering triangles for a cache can only pay where the mesh does not fit in
+// one. The last is the hardware size, and is there to report that it does not.
+constexpr size_t REORDER_L1[] = {2, 4, 8, 16, 32, L1_LINES};
+
+// The same question put to a mesh, with the order of its triangles as the variable.
+//
+// The indexed walk is the only route where that order can reach the cache: it
+// carries the index buffer into pass 2 and reads a vertex through it, so a vertex
+// two triangles apart in the list may still be resident. bin_triangles de-indexes
+// on the host, which is why the tiled route appears below as a control.
+//
+// Taken with latency on, because what the reorder moves is which level answered
+// rather than how many misses there were, and the levels are 8 against 30 in issue
+// capacity but 30 against 200 in cycles.
+Reading measure_mesh(const Mesh& mesh, size_t l1_lines, bool tiled = false)
+{
+    MyGPURuntime rt(1u << 29);
+    rt.myrt_set_memory_model(MemoryModel::Cached);
+    rt.myrt_set_latency_model(LatencyModel::Modelled);
+    rt.myrt_set_cache_lines(l1_lines, SCALED_L2);
+
+    if (tiled) {
+        draw_tiled(rt, mesh, target());
+    } else {
+        draw_walk(rt, mesh, target());
+    }
+
+    Reading r;
+    r.weighted = rt.stats().weighted_lane_ops;
+    r.l1_hits = rt.stats().l1_hits;
+    r.l2_hits = rt.stats().l2_hits;
+    r.misses = rt.stats().cache_misses;
+    r.cycles = rt.stats().cycles;
+    return r;
+}
+
 // How many lines of screen data a scene holds, which is what a warp re-reads.
 size_t working_lines(uint32_t triangles)
 {
@@ -157,6 +209,12 @@ std::string with_commas(uint64_t v)
     }
     return out;
 }
+
+struct ReorderRow {
+    size_t l1_lines = 0;
+    Reading mixed;
+    Reading fixed;
+};
 
 struct Row {
     uint32_t triangles = 0;
@@ -315,6 +373,101 @@ int main(int argc, char** argv)
                       change(r.cached.weighted, r.scaled.weighted));
         md << buf;
     }
+
+    // --- what the flat model was hiding: ordering a mesh for a vertex cache -----
+
+    const std::string mesh_path = args.text(0, "assets/sphere.obj");
+    const Mesh mesh = load_obj(mesh_path);
+    const Mesh mixed = shuffled(mesh, 12345);
+    const Mesh fixed = optimised_for_cache(mixed, 32);
+    const auto acmr = [&mesh](const Mesh& m) {
+        return static_cast<double>(simulated_cache_misses(m, 32)) /
+               static_cast<double>(mesh.triangle_count());
+    };
+
+    std::vector<ReorderRow> reorder;
+    for (const size_t l1 : REORDER_L1) {
+        reorder.push_back(
+            ReorderRow{l1, measure_mesh(mixed, l1), measure_mesh(fixed, l1)});
+    }
+
+    // The route that cannot see the reorder, at the size where the walk sees it most.
+    // Without it the saving below could be read as the depth ordering that the
+    // shuffle also changes, which is what the flat model measured and reported as a
+    // thousandth of a percent.
+    const size_t control_l1 = 8;
+    const Reading tiled_mixed = measure_mesh(mixed, control_l1, true);
+    const Reading tiled_fixed = measure_mesh(fixed, control_l1, true);
+
+    std::printf("\n  Ordering %s for a vertex cache, through the indexed walk\n",
+                mesh_path.c_str());
+    std::printf("  %u vertices in %zu lines, %u triangles, ACMR %.2f -> %.2f\n\n",
+                mesh.vertex_count(),
+                (static_cast<size_t>(mesh.vertex_count()) * SCREEN_VERTEX_BYTES +
+                 CACHE_LINE_BYTES - 1) /
+                    CACHE_LINE_BYTES,
+                mesh.triangle_count(), acmr(mixed), acmr(fixed));
+    std::printf("  %8s %9s %14s %9s %14s %9s %12s\n", "L1 lines", "vertices", "cost",
+                "change", "cycles", "change", "L2 hits");
+    for (const ReorderRow& r : reorder) {
+        std::printf(
+            "  %8zu %9zu %14s %8.2f%% %14s %8.2f%% %6s ->%6s\n", r.l1_lines,
+            r.l1_lines * CACHE_LINE_BYTES / SCREEN_VERTEX_BYTES,
+            with_commas(r.fixed.weighted).c_str(),
+            change(r.mixed.weighted, r.fixed.weighted),
+            with_commas(r.fixed.cycles).c_str(), change(r.mixed.cycles, r.fixed.cycles),
+            with_commas(r.mixed.l2_hits).c_str(), with_commas(r.fixed.l2_hits).c_str());
+    }
+    std::printf("  %8zu %9s %14s %8.2f%% %14s %8.2f%%   (tiled, de-indexed)\n",
+                control_l1, "", with_commas(tiled_fixed.weighted).c_str(),
+                change(tiled_mixed.weighted, tiled_fixed.weighted),
+                with_commas(tiled_fixed.cycles).c_str(),
+                change(tiled_mixed.cycles, tiled_fixed.cycles));
+
+    csv << "\nl1_lines,route,order,weighted,cycles,l1_hits,l2_hits,misses\n";
+    const auto reorder_csv = [&csv](size_t l1, const char* route, const char* order,
+                                    const Reading& reading) {
+        csv << l1 << ',' << route << ',' << order << ',' << reading.weighted << ','
+            << reading.cycles << ',' << reading.l1_hits << ',' << reading.l2_hits << ','
+            << reading.misses << '\n';
+    };
+    for (const ReorderRow& r : reorder) {
+        reorder_csv(r.l1_lines, "walk", "shuffled", r.mixed);
+        reorder_csv(r.l1_lines, "walk", "forsyth", r.fixed);
+    }
+    reorder_csv(control_l1, "tiled", "shuffled", tiled_mixed);
+    reorder_csv(control_l1, "tiled", "forsyth", tiled_fixed);
+
+    std::snprintf(buf, sizeof(buf), "ACMR %.2f to %.2f", acmr(mixed), acmr(fixed));
+    md << "\n## Ordering a mesh for a vertex cache, once there is a cache\n\n"
+       << mesh_path << ": " << mesh.vertex_count() << " vertices, "
+       << mesh.triangle_count()
+       << " triangles, shuffled and then reordered by\n"
+          "Forsyth's heuristic — "
+       << buf
+       << ". Both orders draw the same frame. Measured through\n"
+          "the indexed walk with L2 held at "
+       << SCALED_L2 << " lines and latency modelled.\n\n"
+       << "| L1 lines | Vertices held | Cost | | Cycles | | L2 hits |\n"
+       << "|---:|---:|---:|---:|---:|---:|---:|\n";
+    for (const ReorderRow& r : reorder) {
+        std::snprintf(
+            buf, sizeof(buf),
+            "| %zu | %zu | %s | **%.2f%%** | %s | **%.2f%%** | %s -> %s |\n", r.l1_lines,
+            r.l1_lines * CACHE_LINE_BYTES / SCREEN_VERTEX_BYTES,
+            with_commas(r.fixed.weighted).c_str(),
+            change(r.mixed.weighted, r.fixed.weighted),
+            with_commas(r.fixed.cycles).c_str(), change(r.mixed.cycles, r.fixed.cycles),
+            with_commas(r.mixed.l2_hits).c_str(), with_commas(r.fixed.l2_hits).c_str());
+        md << buf;
+    }
+    std::snprintf(buf, sizeof(buf),
+                  "| %zu | tiled, de-indexed | %s | %.2f%% | %s | %.2f%% | |\n",
+                  control_l1, with_commas(tiled_fixed.weighted).c_str(),
+                  change(tiled_mixed.weighted, tiled_fixed.weighted),
+                  with_commas(tiled_fixed.cycles).c_str(),
+                  change(tiled_mixed.cycles, tiled_fixed.cycles));
+    md << buf;
 
     std::printf("\nwrote %s.md and %s.csv\n", prefix.c_str(), prefix.c_str());
     return 0;

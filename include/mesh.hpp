@@ -83,9 +83,13 @@ Mesh shuffled(const Mesh& mesh, uint32_t seed);
 // still need it, and the triangle scoring highest on the sum of its three goes
 // next.
 //
-// Worth a factor of three or four on a fixed-function IA. Here it moves the
-// issued work by a thousandth of a percent, and even that much is depth
+// Worth a factor of three or four on a fixed-function IA. What it is worth here
+// depends on which cost model is asked. Under the flat charge per lane it moves
+// the issued work by a thousandth of a percent, and even that much is depth
 // ordering rather than vertex reuse — nearest-wins fires a different number of
-// times when the triangles covering a pixel arrive in a different order. The
-// tests hold both halves of that.
+// times when the triangles covering a pixel arrive in a different order.
+//
+// Under MemoryModel::Cached, with an L1 the mesh does not fit in, the same
+// reorder is worth a quarter of the indexed walk's cycles: the vertices a
+// triangle reads are more often still resident. The tests hold all three.
 Mesh optimised_for_cache(const Mesh& mesh, uint32_t cache_size = 32);
