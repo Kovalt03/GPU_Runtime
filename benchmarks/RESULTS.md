@@ -11,13 +11,14 @@ cmake --build build -j8
 ./build/benchmarks/render_bench     # stdout, plus benchmarks/result/render_bench.{md,csv}
 ./build/benchmarks/reduction_bench  #         plus benchmarks/result/reduction.{md,csv}
 ./build/benchmarks/cache_bench      #         plus benchmarks/result/cache.{md,csv}
+./build/benchmarks/model_bench      #         plus benchmarks/result/models.{md,csv}
 ```
 
 **Which cost model.** Every figure here is taken with a global access charged per
 lane and no instruction waiting on another — `MemoryModel::Flat` and
-`LatencyModel::Ignored`, the defaults. The five sections from *Charging memory by
-the line* to *ordering a mesh* measure what the other models change, and are the
-only ones that do.
+`LatencyModel::Ignored`, the defaults. The sections from *Charging memory by the
+line* to *two conclusions, re-put to the new rulers* measure what the other
+models change, and are the only ones that do.
 
 The scenes are code in `benchmarks/render_bench.cpp`, and the routes it measures
 are the same `draw_walk` / `draw_tiled` / `draw_shared` / `draw_raytrace` the
@@ -512,6 +513,67 @@ puts that out of reach of a benchmark.
 -0.01% and +0.12%: `bin_triangles` de-indexes on the host, so a block streams each
 triangle's three vertices and has nothing to re-read. That control is what
 separates this from the depth ordering a shuffle also changes.
+
+---
+
+## Two conclusions, re-put to the new rulers
+
+Everything above the memory-model sections was measured when a global access cost
+100 a lane and nothing waited. Two of those conclusions trade loads against
+arithmetic, so both had reason to move once a warp's load became one transaction
+and results took time to arrive. `model_bench` puts them again, on the routes and
+scenes `render_bench` already uses — the `flat` column reproduces the tables
+above to the lane-op.
+
+### Branch against blend
+
+Positive means the blend costs more. `cycles` is time under `Cached` and
+`LatencyModel::Modelled`; the rest are issue capacity.
+
+| Scene | Route | flat | coalesced | cached | cycles |
+|---|---|---:|---:|---:|---:|
+| small, spread | walk | +2.0% | +28.1% | +47.2% | +15.8% |
+| small, spread | tiled | +1.6% | +19.4% | +32.1% | +14.7% |
+| small, spread | raytrace | +4.4% | **+75.4%** | **+92.6%** | +46.0% |
+| full-frame, stacked | walk | +1.9% | +27.4% | +45.8% | +15.8% |
+| full-frame, stacked | tiled | +1.9% | +27.1% | +45.4% | +25.4% |
+| full-frame, stacked | raytrace | +2.5% | +32.0% | +37.2% | +26.8% |
+
+**The flat model was flattering predication by a factor of twenty.** Both variants
+make the same loads, and at 100 a lane those loads were most of the bill —
+whatever the blend added in arithmetic was a rounding error against them. Charged
+by the line, a warp's load is one transaction, and what is left to compare is
+mostly the arithmetic the blend performs for lanes the branch would have skipped.
+The ray tracer, where the branch guards nearly the whole of Möller-Trumbore,
+nearly doubles.
+
+The prediction written before the measurement was that predication might *win*
+once divergence grew dearer. It lost by an order of magnitude more instead. The
+divergence it removes is still removed — the blend is at exactly 0.00% on every
+route and scene here, against 0.58% to 15.01% for the branch — which makes this
+the strongest version yet of the finding the section above states: **removing
+divergence and going faster are different things.**
+
+### Indexed against flattened, pass 2
+
+| Mesh | Triangles | flat | coalesced | cached | cycles |
+|---|---:|---:|---:|---:|---:|
+| cube | 12 | +24.0% | +17.3% | **+12.8%** | +16.2% |
+| sphere | 360 | +24.5% | +18.2% | **+13.1%** | +12.8% |
+
+Predicted to get worse, being three dependent loads a triangle before a vertex
+address is known, and it got better: the index buffer costs half what the flat
+model said. Those loads are warp-uniform — every lane of a warp is on the same
+triangle, so all 32 read the same three indices — which is exactly the case a
+per-lane charge overstated thirty-twofold. Even with latency modelled, where each
+dependent load is a wait the flattened path does not make, 16.2% is well inside
+the 24% the flat model charged.
+
+**Both movements are the same error seen from two sides.** A flat charge per lane
+overprices loads relative to arithmetic, so it flattered the variant that trades
+arithmetic for loads and penalised the variant that trades loads for arithmetic.
+Neither conclusion reverses; both change size enough that the ranking they were
+quoted to support has to be read against the model that produced it.
 
 ---
 

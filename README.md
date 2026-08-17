@@ -175,6 +175,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # A cache against a growing working set
 ./build/benchmarks/cache_bench              # benchmarks/result/cache.{md,csv}
+
+# The flat model's conclusions, put to the other cost models
+./build/benchmarks/model_bench              # benchmarks/result/models.{md,csv}
 ```
 
 ### Formatting
@@ -204,7 +207,7 @@ on their own line, `int* ptr`.
 | Rasteriser, tile binning | **-85%** issued work |
 | Rasteriser, staged through shared memory | **-96%** against the naive walk |
 | Vertex stage, indexed (cube: 8 vertices, not 36) | **-76%** |
-| Predication against the branch (raster / ray) | **+2%** / **+4.4%**, divergence to zero |
+| Predication against the branch (raster / ray) | **+2%** / **+4.4%** per lane, **+47%** / **+93%** per line |
 | Warp reduction, exchange against shared memory | **33** instructions against 68 |
 | Charging memory by the line, not the lane | **-93%**, and staging stops winning |
 | A cache over the same scenes | **-40%**, flat — L2 is never outgrown here |
@@ -212,7 +215,7 @@ on their own line, `int* ptr`.
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
 | A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
 | Opcodes | 31 |
-| Tests | 264 |
+| Tests | 265 |
 
 ### What divergence costs
 
@@ -289,6 +292,12 @@ flattened walk made twelve, and the pass costs **24.0%** more.
 | pass 1 — vertex transforms | 27,868 | 6,584 | **-76.4%** |
 | pass 2 — coverage | 31,317,520 | 38,841,872 | +24.0% |
 
+That 24% is what a flat charge per lane says, and it is roughly double what the
+other cost models say: **+12.8% with a cache**, +16.2% in cycles even with each
+dependent load waiting on the one before it. Every lane of a warp is on the same
+triangle, so all thirty-two read the same three indices — one transaction, which
+is precisely the case a per-lane charge overstates.
+
 Which way the total falls depends on the ratio of vertices to pixels, so both
 paths are kept and neither is the successor of the other. The tiled routes sit
 outside the trade entirely: binning de-indexes on the host, so they take pass
@@ -345,6 +354,21 @@ So the trade is not decided by how much divergence there is to remove — the
 rasteriser's quietest route and the tracer's noisiest both lose. What decides
 it is how much work the branch was skipping, and more of the loop inside the
 branch cuts both ways.
+
+**And the flat charge above was flattering it by a factor of twenty.** Both
+variants make the same loads; at 100 a lane those were most of the bill, and the
+arithmetic the blend adds was lost against them. Charge a warp's load as the
+cache line it touches and that arithmetic is most of what is left to compare:
+
+| 16 small triangles, 64x32 | per lane | per line | with a cache | in cycles |
+|---|---:|---:|---:|---:|
+| every pixel walks every triangle | +2.0% | +28.1% | +47.2% | +15.8% |
+| binned into tiles | +1.6% | +19.4% | +32.1% | +14.7% |
+| ray tracer | +4.4% | +75.4% | **+92.6%** | +46.0% |
+
+The divergence still goes — the blend measures exactly 0.00% on every route —
+which makes this the strongest form of the finding rather than a retraction. What
+changed is the price of buying it.
 
 Folding the exits away also removes what they were guarding, which coverage
 never had to worry about: the determinant reciprocal divides by zero once
@@ -559,7 +583,11 @@ gpu-runtime-sim/
 │   ├── CMakeLists.txt
 │   ├── RESULTS.md
 │   ├── divergence_bench.cpp
+│   ├── scenes.hpp           # the scenes render_bench and model_bench share
 │   ├── render_bench.cpp     # generates the measurement tables in RESULTS.md
+│   ├── reduction_bench.cpp  # summing a warp, two ways
+│   ├── cache_bench.cpp      # a cache against a working set that outgrows it
+│   ├── model_bench.cpp      # the flat model's conclusions under the others
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```
