@@ -565,9 +565,16 @@ Predicted to get worse, being three dependent loads a triangle before a vertex
 address is known, and it got better: the index buffer costs half what the flat
 model said. Those loads are warp-uniform — every lane of a warp is on the same
 triangle, so all 32 read the same three indices — which is exactly the case a
-per-lane charge overstated thirty-twofold. Even with latency modelled, where each
-dependent load is a wait the flattened path does not make, 16.2% is well inside
-the 24% the flat model charged.
+per-lane charge overstated thirty-twofold.
+
+**On the dependence itself this machine cannot be asked.** Issue is in-order with
+no scoreboard, so a warp waits out every instruction's latency whether or not
+anything needed the result: a chain of three loads and three independent ones
+cost the same cycles here, which is pinned in
+`DependenceIsNotDistinguishedFromIssueOrder`. That is pessimistic rather than
+generous — every load in the indexed path is charged a full wait — so 16.2% is an
+upper bound on what the extra loads cost in time, and it is still well inside the
+24% the flat model charged for them in issue capacity.
 
 **Both movements are the same error seen from two sides.** A flat charge per lane
 overprices loads relative to arithmetic, so it flattered the variant that trades

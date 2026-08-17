@@ -215,7 +215,7 @@ on their own line, `int* ptr`.
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
 | A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
 | Opcodes | 31 |
-| Tests | 265 |
+| Tests | 267 |
 
 ### What divergence costs
 
@@ -480,6 +480,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Warp-level primitives | modelled — ballot, any, all, syncwarp, shuffle, each naming its participants |
 | Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
 | Latency hiding | modelled **within a block** — a result arrives some cycles after it is issued and other warps cover the wait. Hardware puts several blocks on an SM and lets all their warps cover each other; here a block runs to completion first |
+| Instruction-level parallelism | **absent** — issue is in-order with no scoreboard, so a warp waits out every instruction whether or not the next one wanted the result. A dependent chain and independent accesses cost the same; occupancy is what covers a wait here, never the warp's own next instruction |
 | Streams, async copy | **absent** — every launch is synchronous |
 
 ### The three that matter most
