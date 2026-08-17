@@ -21,6 +21,11 @@ struct SchedulerStats {
     uint64_t warp_steps = 0;       // instructions issued to a warp
     uint64_t active_lane_ops = 0;  // lane-instructions that actually ran
 
+    // Turns spent with no warp able to issue, every resident one waiting on a
+    // result. The number occupancy exists to drive down, and zero while
+    // instruction_latency returns zero.
+    uint64_t stall_steps = 0;
+
     // active_lane_ops weighted by instruction_cost, so that throughput readings
     // distinguish a kernel full of global loads from one full of adds.
     uint64_t weighted_lane_ops = 0;
@@ -45,6 +50,7 @@ struct SchedulerStats {
         warp_steps += other.warp_steps;
         active_lane_ops += other.active_lane_ops;
         weighted_lane_ops += other.weighted_lane_ops;
+        stall_steps += other.stall_steps;
         return *this;
     }
 };
@@ -78,6 +84,28 @@ enum class WarpPolicy {
     Independent,
 };
 
+// How a global access is charged. A warp issues one load and its 32 lanes name
+// 32 addresses; what that costs depends on how many separate pieces of memory
+// they land in, which is the first question asked of any real kernel.
+enum class MemoryModel {
+    // Every lane pays instruction_cost whatever it asked for, so a warp reading
+    // one address costs what a warp reading 32 scattered ones does.
+    Flat,
+
+    // Charged by the distinct cache lines the warp touches.
+    //
+    // Not a refinement of Flat but a different answer: the raster kernels read
+    // their triangle warp-uniformly, which is one line rather than 32 lanes, and
+    // that alone takes about 93% off every route. It also reverses shared-memory
+    // staging, which existed to stop 32 lanes issuing the same load and turns
+    // out to have been saving something that cost one line anyway.
+    Coalesced,
+};
+
+// Bytes fetched together. 128 is what NVIDIA moves for a warp-wide access, and
+// at four bytes a float that is a warp's 32 lanes exactly.
+inline constexpr uint32_t CACHE_LINE_BYTES = 128;
+
 class WarpScheduler {
 public:
     // How many warp steps one block may take before run() gives up. Issuing the
@@ -103,6 +131,12 @@ public:
         policy_ = policy;
     }
 
+    // Defaults to Flat, likewise.
+    void set_memory_model(MemoryModel model)
+    {
+        memory_ = model;
+    }
+
     // Runs until every thread has retired. Throws std::runtime_error on a bad
     // register index, an unaligned or out-of-range address, a pc that leaves
     // the program, or the step budget elapsing with the block unfinished. The
@@ -126,6 +160,11 @@ private:
     SchedulerStats stats_;
     uint64_t step_budget_ = DEFAULT_STEP_BUDGET;
     WarpPolicy policy_ = WarpPolicy::LowestPc;
+    MemoryModel memory_ = MemoryModel::Flat;
+
+    // Separate from instruction_cost because the answer is a property of the 32
+    // addresses rather than of the opcode.
+    uint64_t global_access_cost(const Warp& warp, const Instruction& instr) const;
 
     // Which pc to issue under Independent. Mutable because fairness needs
     // somewhere to remember what it last did — Warp::last_issued_pc.

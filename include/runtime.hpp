@@ -109,6 +109,10 @@ public:
     // taken under — a caller changing it is measuring the policy itself.
     void myrt_set_warp_policy(WarpPolicy policy);
 
+    // How a global access is charged. Defaults to MemoryModel::Flat, which is
+    // what every figure in benchmarks/ was taken under.
+    void myrt_set_memory_model(MemoryModel model);
+
     double elapsed_seconds() const
     {
         return elapsed_seconds_;

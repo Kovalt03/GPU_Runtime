@@ -336,3 +336,16 @@ uint32_t instruction_cost(Opcode op)
 
     return 1;
 }
+
+uint32_t instruction_latency(Opcode)
+{
+    // Uniformly zero: no instruction makes another wait, so a warp never stalls
+    // and having more of them resident buys nothing.
+    //
+    // Filling this in is a modelling choice rather than a measurement — there is
+    // no hardware here to time — and it wants the same provenance the costs
+    // above have: ratios picked to be plausible, stated as picked. What matters
+    // is a global load against an add and a shared load against both, and the
+    // scheduler has to learn to wait before any of them means anything.
+    return 0;
+}

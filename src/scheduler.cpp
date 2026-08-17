@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -534,6 +536,40 @@ uint32_t WarpScheduler::select_independent_pc(Warp& warp) const
     return chosen;
 }
 
+// What a warp's global load or store costs, given where its lanes are pointing.
+uint64_t WarpScheduler::global_access_cost(const Warp& warp,
+                                           const Instruction& instr) const
+{
+    const uint64_t lanes = active_lane_count(warp);
+    if (memory_ == MemoryModel::Flat) {
+        return lanes * instruction_cost(instr.op);
+    }
+
+    // One line per lane at worst, so a sorted array counts them without a set.
+    std::array<size_t, WARP_SIZE> lines{};
+    uint32_t n = 0;
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        if (!is_active(warp, lane)) {
+            continue;
+        }
+        // The same expression execute() evaluates a lane at a time. Computed
+        // twice rather than handed back, which would put the address arithmetic
+        // in two places for a saving nothing is waiting on.
+        const size_t addr = decode_address(
+            warp.threads[lane].regs[instr.src0] + instr.imm, "global access");
+        lines[n++] = addr / CACHE_LINE_BYTES;
+    }
+    std::sort(lines.begin(), lines.begin() + n);
+    const auto distinct = static_cast<uint64_t>(
+        std::unique(lines.begin(), lines.begin() + n) - lines.begin());
+
+    // A store is charged like a load. Hardware need not read a line a write
+    // fills completely and must read one it only partly covers, so the two are
+    // not alike — but telling them apart means tracking which lanes cover which
+    // bytes, and nothing here asks that yet.
+    return distinct * instruction_cost(instr.op);
+}
+
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
                               DeviceSpan global)
 {
@@ -825,7 +861,15 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     const uint64_t lanes = active_lane_count(warp);
     stats_.warp_steps += 1;
     stats_.active_lane_ops += lanes;
-    stats_.weighted_lane_ops += lanes * instruction_cost(program[warp.pc].op);
+
+    // The one place a per-lane cost is not simply lanes x cost: what a global
+    // access costs depends on where the lanes point, once the memory model
+    // looks. Everything else is charged by opcode alone.
+    const Instruction& issued = program[warp.pc];
+    const bool touches_global =
+        issued.op == Opcode::V_LD_GLOBAL_F32 || issued.op == Opcode::V_ST_GLOBAL_F32;
+    stats_.weighted_lane_ops += touches_global ? global_access_cost(warp, issued)
+                                               : lanes * instruction_cost(issued.op);
     return true;
 }
 

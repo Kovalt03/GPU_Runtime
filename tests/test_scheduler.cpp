@@ -19,6 +19,9 @@ constexpr size_t GLOBAL_BYTES = 1024;
 constexpr uint32_t ALL_LANES = 0xFFFFFFFFu;
 constexpr uint32_t LOW_HALF = 0x0000FFFFu;
 
+// RET is last, which the exhaustive tests in test_isa.cpp also rest on.
+constexpr int OPCODE_COUNT_FOR_LATENCY = static_cast<int>(Opcode::RET) + 1;
+
 // A one-warp block plus a scratch device buffer, which is what most of these
 // tests need. The buffer is a member so its address stays valid for the span.
 struct Fixture {
@@ -1331,4 +1334,88 @@ TEST(Scheduler, AWarpCarriesItsOwnMaskRegisters)
               static_cast<double>((1u << 24) - 1));
     EXPECT_NE(static_cast<double>(static_cast<float>((1u << 25) - 1)),
               static_cast<double>((1u << 25) - 1));
+}
+
+// Every lane loads from base + stride*lane, and the stride decides how many
+// cache lines a warp touches.
+Program strided_load(float stride)
+{
+    Program p;
+    p.push_back(make_v_mov_f32(1, stride));
+    p.push_back(make_v_mul_f32(2, REG_GLOBAL_ID_X, 1));  // address
+    p.push_back(make_v_ld_global_f32(3, 2, 0.0f));
+    p.push_back(make_ret());
+    return p;
+}
+
+uint64_t weighted_for(float stride, MemoryModel model, size_t bytes)
+{
+    ThreadBlock block = make_block(1);
+    seed_lane_ids(block);
+
+    WarpScheduler scheduler;
+    scheduler.set_memory_model(model);
+    std::vector<uint8_t> memory(bytes, 0);
+    scheduler.run(strided_load(stride), block, DeviceSpan{memory.data(), memory.size()});
+    return scheduler.stats().weighted_lane_ops;
+}
+
+TEST(Scheduler, ACoalescedLoadCostsALineWhereAScatteredOneCostsThirtyTwo)
+{
+    // Four bytes a lane puts all 32 in one 128-byte line; 128 bytes a lane puts
+    // each in its own. Both scenes are needed: with only one of them, counting
+    // lines and counting lanes differ by a constant and either would pass.
+    const uint64_t adjacent = weighted_for(4.0f, MemoryModel::Coalesced, 1 << 14);
+    const uint64_t scattered = weighted_for(128.0f, MemoryModel::Coalesced, 1 << 14);
+
+    EXPECT_EQ(scattered, adjacent + 31 * instruction_cost(Opcode::V_LD_GLOBAL_F32))
+        << "a scattered warp did not pay for 32 lines against one";
+
+    // And the shape of it: the load is the only instruction whose cost moved, so
+    // the difference is exactly 31 extra lines.
+    EXPECT_EQ(scattered - adjacent, 31u * instruction_cost(Opcode::V_LD_GLOBAL_F32));
+}
+
+TEST(Scheduler, TheFlatModelCannotTellTheTwoApart)
+{
+    // Which is why the tables taken under it say nothing about memory layout —
+    // and why V_LD_GLOBAL_VEC3_F32 has a name reserved and no implementation.
+    EXPECT_EQ(weighted_for(4.0f, MemoryModel::Flat, 1 << 14),
+              weighted_for(128.0f, MemoryModel::Flat, 1 << 14));
+}
+
+TEST(Scheduler, EveryLaneReadingOneAddressIsOneLine)
+{
+    // A broadcast is one line, and so is the adjacent case — but there the 32
+    // addresses all differ. Counting distinct addresses instead of distinct
+    // lines would pass the scattered test and separate these two, so comparing
+    // them is what pins the unit.
+    EXPECT_EQ(weighted_for(0.0f, MemoryModel::Coalesced, 1 << 14),
+              weighted_for(4.0f, MemoryModel::Coalesced, 1 << 14));
+}
+
+TEST(Scheduler, NothingStallsWhileEveryLatencyIsZero)
+
+{
+    // The model in force: a result is usable the instant it is issued, so no
+    // warp ever waits and having more of them resident buys nothing. This is
+    // what makes latency hiding invisible here, and the counter that would show
+    // it stays at zero until instruction_latency returns something.
+    for (int i = 0; i < OPCODE_COUNT_FOR_LATENCY; ++i) {
+        EXPECT_EQ(instruction_latency(static_cast<Opcode>(i)), 0u)
+            << opcode_name(static_cast<Opcode>(i));
+    }
+
+    ThreadBlock block = make_block(4);
+    Program p;
+    p.push_back(make_v_mov_f32(0, 0.0f));  // address 0
+    p.push_back(make_v_ld_global_f32(1, 0, 0.0f));
+    p.push_back(make_v_add_f32(2, 1, 1));  // depends on the load
+    p.push_back(make_ret());
+
+    WarpScheduler scheduler;
+    std::vector<uint8_t> memory(64, 0);
+    scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()});
+
+    EXPECT_EQ(scheduler.stats().stall_steps, 0u);
 }

@@ -126,6 +126,11 @@ void MyGPURuntime::myrt_set_warp_policy(WarpPolicy policy)
     scheduler_->set_policy(policy);
 }
 
+void MyGPURuntime::myrt_set_memory_model(MemoryModel model)
+{
+    scheduler_->set_memory_model(model);
+}
+
 double MyGPURuntime::divergence_rate() const
 {
     return stats_.divergence_rate();

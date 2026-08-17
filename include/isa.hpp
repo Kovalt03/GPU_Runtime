@@ -229,3 +229,17 @@ std::string_view opcode_name(Opcode op);
 // full of adds. Only throughput readings depend on this; divergence is a ratio
 // of issued capacity to capacity used and is unaffected.
 uint32_t instruction_cost(Opcode op);
+
+// How long a result takes to become usable, as against how much issue capacity
+// the instruction consumes. instruction_cost is the second; this is the first,
+// and the two are independent — a global load occupies the issue slot as briefly
+// as an add and takes hundreds of cycles to land.
+//
+// The distinction is the reason warps are batched at all. A scheduler with other
+// warps ready can step over one waiting on a load; a scheduler without them
+// cannot, and occupancy is the number that decides which case a kernel is in.
+//
+// Returns 0 throughout for now, which is the model every figure in benchmarks/
+// was taken under: a result is available the instant it is issued and nothing
+// ever waits.
+uint32_t instruction_latency(Opcode op);
