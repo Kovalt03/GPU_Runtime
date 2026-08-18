@@ -963,6 +963,72 @@ cheaply than the first.
 
 ---
 
+## Regrouping the threads before they disagree
+
+A warp issues one instruction, so lanes that disagree take turns — that is the
+cost this whole project is about. `REORDER` moves the block's threads between
+its warps by a key the kernel supplies, so the ones about to do the same thing
+end up together. Nothing a thread holds changes; registers and pc travel with
+it, which is why the answer is identical and only the divergence moves.
+
+```
+cmake --build build -j8
+./build/benchmarks/ser_bench
+```
+
+### It is worth what the key is scattered
+
+A block of 8 warps and a 32-instruction branch, by how the threads taking it sit.
+
+| Spread | Taking | Warp steps | reordered | change | Cycles | reordered | change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| scattered | 32 | 288 | 71 | **-75.3%** | 288 | 164 | **-43.1%** |
+| scattered | 128 | 288 | 164 | **-43.1%** | 288 | 164 | -43.1% |
+| scattered | 224 | 288 | 257 | -10.8% | 288 | 257 | -10.8% |
+| coherent | 32 | 63 | 71 | **+12.7%** | 153 | 164 | +7.2% |
+| coherent | 128 | 156 | 164 | +5.1% | 156 | 164 | +5.1% |
+| coherent | 224 | 249 | 257 | +3.2% | 249 | 257 | +3.2% |
+
+**The same instruction is a 75% saving and a 13% tax**, and what decides which is
+whether the threads were already sorted. A coherent block has nothing to gain and
+still pays for the sort — reordering is not a thing to switch on, it is a thing
+to reach for when the key is known to be scattered.
+
+**The scattered rows converge from above.** At 32 takers the reorder empties
+seven warps of the branch entirely; at 224 there is only one warp's worth of
+non-takers to gather, and the saving shrinks to what that is worth.
+
+### And what follows it
+
+Half the block taking a scattered branch, by how long the branch is.
+
+| Branch | Warp steps | reordered | change | Cycles | reordered | change |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 48 | 44 | -8.3% | 48 | 44 | -8.3% |
+| 8 | 96 | 68 | -29.2% | 96 | 68 | -29.2% |
+| 32 | 288 | 164 | -43.1% | 288 | 164 | -43.1% |
+| 128 | 1,056 | 548 | **-48.1%** | 1,056 | 548 | **-48.1%** |
+
+**The sort is a fixed cost against a saving that grows with the stretch it
+protects.** Two instructions barely repay it; 128 approach the ceiling, which is
+half — a warp that visited both arms visiting one.
+
+### What this can and cannot say
+
+The regroup is **within a block**. Hardware reorders across an SM's resident
+warps, which is a wider pool; a block here is at most 8 warps, so these figures
+are the pessimistic end of what the mechanism can do.
+
+And the keys are synthetic. What this repository has that a real reordering
+workload has is the ray tracer's hit-and-miss divergence, measured at 10-21%,
+against a rasteriser's 1-7%. Neither has the thing SER was built for — many
+distinct materials behind one intersection, so that lanes diverge into *different
+shaders* rather than into two arms. That needs a BVH and a material table, which
+is `[g]`, and this measurement is meant to be repeated there rather than to stand
+in for it.
+
+---
+
 ## A matrix unit against the arithmetic pipe
 
 `V_MMA_16X16X16_F32` has the warp compute a whole 16x16x16 product at once —
