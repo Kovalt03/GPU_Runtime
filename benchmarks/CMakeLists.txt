@@ -27,3 +27,7 @@ target_link_libraries(model_bench PRIVATE gpurt project_warnings)
 # each other on one.
 add_executable(occupancy_bench occupancy_bench.cpp)
 target_link_libraries(occupancy_bench PRIVATE gpurt project_warnings)
+
+# The first benchmark to hand the machine two kernels at once.
+add_executable(stream_bench stream_bench.cpp)
+target_link_libraries(stream_bench PRIVATE gpurt project_warnings)
