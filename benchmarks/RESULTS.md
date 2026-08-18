@@ -963,6 +963,52 @@ cheaply than the first.
 
 ---
 
+## A uniform, rather than a constant folded in
+
+Pass 1 baked its view-projection into the instruction stream as sixteen moves.
+That is not a uniform — it is constant folding, and it means **a program serves
+one matrix**: an object with a transform of its own needs its own build. It is
+the thing standing between this and drawing two objects.
+
+`V_LD_CONST_MAT4_F32` reads the matrix from a window the launch points at.
+
+```
+cmake --build build -j8
+./build/kernels/mesh_render
+```
+
+| Mesh | steps, baked | window | change | lane ops, baked | window | change |
+|---|---:|---:|---:|---:|---:|---:|
+| tetrahedron | 44 | 29 | **-34.1%** | 792 | 312 | -60.6% |
+| cube | 44 | 29 | **-34.1%** | 880 | 400 | -54.5% |
+| grid | 132 | 87 | **-34.1%** | 3,894 | 2,454 | -37.0% |
+| sphere | 264 | 174 | **-34.1%** | 8,228 | 5,348 | -35.0% |
+
+**The same -34.1% on every mesh**, because what goes away is fifteen
+instructions every warp runs whatever it is drawing. The lane-op column moves by
+different amounts only because the meshes have different numbers of vertices to
+divide it over.
+
+**The saving is not why it is here.** A weighted total barely notices — the
+vertex stage spends its capacity on global loads, and sixteen moves against one
+load is 2.8% of it. What the window buys is that **the program stops depending on
+the matrix**, and the test that says so launches one program twice against two
+windows and checks the two pictures differ.
+
+### Charged once for the warp
+
+The address comes from a register the launch seeds, so it is warp-uniform by
+construction — a lane cannot contribute to it. That is what lets the cost model
+charge the whole instruction what one access costs, and it is the only opcode
+here charged that way.
+
+Nothing stopped a kernel keeping its uniforms in global memory, and under
+`Coalesced` a warp reading one address was already one transaction. What the
+space adds is that it **cannot be anything else**: an address that varies by lane
+cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
 ## A memory system with a ceiling
 
 Every figure in this file before this one was taken with transactions counted and

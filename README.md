@@ -75,7 +75,7 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   43 opcodes, 8 bytes each                       │
+  │   41 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
   │   V_LD_GLOBAL_F32 / V_CP_ASYNC_SHARED_GLOBAL_F32 │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
@@ -500,6 +500,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Coalescing | modelled: a warp's 32 addresses are charged by the distinct lines they touch. Transaction counts, not bandwidth contention |
 | DRAM, bandwidth saturation | **absent** — transactions never queue for a shared resource |
 | Shared memory + barrier | modelled: 4096 floats a block, `BARRIER`, a load costing 8 |
+| Constant window | modelled: `V_LD_CONST_F32` and a matrix form, addressed from a register the launch seeds so the address is warp-uniform by construction — charged once for the warp rather than once a lane, which is the only such opcode here |
 | Register file | modelled: 256 per thread, and running out throws |
 
 ### Scheduling
