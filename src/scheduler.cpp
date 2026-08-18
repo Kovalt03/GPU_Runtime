@@ -1083,6 +1083,17 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
     });
 }
 
+// One grid, which is a stream of one.
+void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
+                             size_t shared_bytes, const NextBlock& next_block)
+{
+    GridLaunch only;
+    only.program = &program;
+    only.next_block = next_block;
+    only.shared_bytes = shared_bytes;
+    run_streams({only}, global, nullptr);
+}
+
 // The residency loop, and the only place warps are chosen.
 //
 // One loop serves both latency models: Ignored is Modelled with every latency at
@@ -1093,14 +1104,20 @@ void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan g
 // A cycle is one instruction an SM. They issue in parallel, which is the whole
 // of what several SMs buy: the same work retires in fewer cycles while the
 // counters that measure work do not move at all.
-void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
-                             size_t shared_bytes, const NextBlock& next_block)
+//
+// It serves one launch and several the same way, because an SM does: a slot is
+// filled from whichever queue has a block ready for it, and nothing below asks
+// which kernel a warp came from except to say who to charge.
+void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
+                                DeviceSpan global,
+                                std::vector<SchedulerStats>* per_launch)
 {
     struct Slot {
         std::unique_ptr<ThreadBlock> block;
         std::vector<bool> live;
         size_t remaining = 0;
         size_t cursor = 0;
+        size_t launch = 0;
 
         bool occupied() const
         {
@@ -1111,7 +1128,41 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
     struct Unit {
         std::vector<Slot> slots;
         size_t cursor = 0;
+
+        // What the resident blocks have taken of the SM. Kept as running totals
+        // rather than as a block count, because with two kernels on one SM the
+        // blocks are no longer alike and a count would not say what is left.
+        uint32_t warps_resident = 0;
+        size_t shared_resident = 0;
     };
+
+    // A launch's own state: what it has yet to hand out, and what of it is still
+    // running. A stream reads the second to know when its next launch may start.
+    struct Pending {
+        // Built to learn its shape before there is anywhere to put it. A block
+        // has to exist before its warp count can be weighed against what an SM
+        // has left, and the one that does not fit now will fit later.
+        std::unique_ptr<ThreadBlock> peeked;
+
+        uint32_t warps = 0;
+        size_t resident = 0;
+        bool exhausted = false;
+
+        bool finished() const
+        {
+            return exhausted && resident == 0 && peeked == nullptr;
+        }
+    };
+
+    if (launches.empty()) {
+        return;
+    }
+
+    std::vector<Pending> pending(launches.size());
+    const bool charging = per_launch != nullptr;
+    if (charging) {
+        per_launch->assign(launches.size(), SchedulerStats{});
+    }
 
     // Sized here rather than in the constructor, so that set_cache_lines and
     // set_sm_config can be called in either order and neither has to know about
@@ -1123,31 +1174,82 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
     }
 
     std::vector<Unit> units(l1s_.size());
-    bool grid_exhausted = false;
-    bool loaded_any = false;  // a slot took a block this cycle
-    uint32_t per_sm = 0;      // decided by the first block, every block being alike
+    bool loaded_any = false;   // a slot took a block this cycle
+    size_t launch_cursor = 0;  // which queue give_one asks first
 
-    // One block into one free slot, if the grid still has one to give.
-    const auto give_one = [&](Unit& unit) {
-        if (grid_exhausted || unit.slots.size() >= per_sm) {
-            return false;
+    // Whether launch i may place a block yet: every earlier launch of its stream
+    // has to have finished. Ordering is what a stream is, and the queues are
+    // otherwise unaware of each other.
+    const auto stream_clear = [&](size_t i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (launches[j].stream == launches[i].stream && !pending[j].finished()) {
+                return false;
+            }
         }
-        auto block = std::make_unique<ThreadBlock>();
-        if (!next_block(*block)) {
-            grid_exhausted = true;
-            return false;
-        }
-        Slot slot;
-        slot.live.assign(block->warps.size(), true);
-        slot.remaining = block->warps.size();
-        for (Warp& warp : block->warps) {
-            warp.at_barrier = false;
-            warp.ready_at = 0;
-        }
-        slot.block = std::move(block);
-        unit.slots.push_back(std::move(slot));
-        loaded_any = true;
         return true;
+    };
+
+    // What the SM has room for. The three limits are the ones GPUSpec::residency
+    // takes the smallest of, asked one block at a time instead: a homogeneous
+    // grid reaches the same number, and a mixed one has no single number to
+    // reach. An empty SM takes any block, so a kernel asking for more than the
+    // machine holds runs alone rather than not at all.
+    const auto fits = [&](const Unit& unit, size_t i) {
+        if (unit.slots.empty()) {
+            return true;
+        }
+        return unit.slots.size() < spec_.sms.blocks_per_sm &&
+               unit.warps_resident + pending[i].warps <= spec_.sms.warp_slots_per_sm &&
+               unit.shared_resident + launches[i].shared_bytes <=
+                   spec_.sms.shared_bytes_per_sm;
+    };
+
+    // One block into one free slot, from whichever launch can give one.
+    const auto give_one = [&](Unit& unit) {
+        for (size_t n = 0; n < launches.size(); ++n) {
+            const size_t i = (launch_cursor + n) % launches.size();
+            Pending& p = pending[i];
+            if (p.finished() || (p.exhausted && p.peeked == nullptr)) {
+                continue;
+            }
+            if (!stream_clear(i)) {
+                continue;
+            }
+            if (!p.peeked) {
+                auto block = std::make_unique<ThreadBlock>();
+                if (!launches[i].next_block(*block)) {
+                    p.exhausted = true;
+                    continue;
+                }
+                p.warps = static_cast<uint32_t>(block->warps.size());
+                p.peeked = std::move(block);
+            }
+            if (!fits(unit, i)) {
+                continue;
+            }
+
+            Slot slot;
+            slot.launch = i;
+            slot.live.assign(p.peeked->warps.size(), true);
+            slot.remaining = p.peeked->warps.size();
+            for (Warp& warp : p.peeked->warps) {
+                warp.at_barrier = false;
+                warp.ready_at = 0;
+            }
+            slot.block = std::move(p.peeked);
+            unit.slots.push_back(std::move(slot));
+            unit.warps_resident += p.warps;
+            unit.shared_resident += launches[i].shared_bytes;
+            ++p.resident;
+            loaded_any = true;
+
+            // Round-robin across the queues, for the same reason the SMs are
+            // filled breadth first: asking one launch until it runs dry would
+            // hand the machine to whichever stream was declared first.
+            launch_cursor = (i + 1) % launches.size();
+            return true;
+        }
+        return false;
     };
 
     // Breadth first: every SM gets its first block before any gets its second.
@@ -1166,25 +1268,6 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
             }
         }
     };
-
-    // The first block decides residency, so it has to exist before the slots do.
-    {
-        auto first = std::make_unique<ThreadBlock>();
-        if (!next_block(*first)) {
-            return;  // an empty grid runs no cycles
-        }
-        per_sm =
-            spec_.residency(static_cast<uint32_t>(first->warps.size()), shared_bytes);
-        Slot slot;
-        slot.live.assign(first->warps.size(), true);
-        slot.remaining = first->warps.size();
-        for (Warp& warp : first->warps) {
-            warp.at_barrier = false;
-            warp.ready_at = 0;
-        }
-        slot.block = std::move(first);
-        units[0].slots.push_back(std::move(slot));
-    }
     fill_all();
 
     // A kernel that meets the budget throws, and run()'s caller still owns its
@@ -1211,6 +1294,21 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
         }
     } handback{units, last_block_};
 
+    // Who was on the machine this cycle, and who watched an SM of theirs send
+    // nothing. Held across the issue pass because time is charged only once the
+    // cycle is known to have happened.
+    std::vector<uint8_t> cycle_resident(launches.size(), 0);
+    std::vector<uint32_t> cycle_idle(launches.size(), 0);
+
+    const auto charge_time = [&](uint64_t gap) {
+        for (size_t i = 0; i < launches.size(); ++i) {
+            if (cycle_resident[i]) {
+                (*per_launch)[i].cycles += gap;
+            }
+            (*per_launch)[i].stall_steps += cycle_idle[i] * gap;
+        }
+    };
+
     uint64_t now = 0;
     while (true) {
         if (now > cycle_budget_) {
@@ -1227,6 +1325,10 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
         bool anything_resident = false;
         bool released_any = false;
         loaded_any = false;
+        if (charging) {
+            std::fill(cycle_resident.begin(), cycle_resident.end(), uint8_t{0});
+            std::fill(cycle_idle.begin(), cycle_idle.end(), uint32_t{0});
+        }
 
         for (size_t u = 0; u < units.size(); ++u) {
             Unit& unit = units[u];
@@ -1254,8 +1356,9 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
                         continue;
                     }
 
-                    const uint64_t before = stats_.warp_steps;
-                    if (!step_warp(program, warp, *slot.block, global)) {
+                    const SchedulerStats before = stats_;
+                    if (!step_warp(*launches[slot.launch].program, warp, *slot.block,
+                                   global)) {
                         if (!warp.at_barrier) {
                             slot.live[i] = false;
                             --slot.remaining;
@@ -1268,8 +1371,16 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
                     // no time, so the SM looks for another rather than spending
                     // its turn on the discovery. One that arrived at a barrier
                     // did issue the BARRIER and does spend it.
-                    if (stats_.warp_steps == before) {
+                    if (stats_.warp_steps == before.warp_steps) {
                         continue;
+                    }
+                    if (charging) {
+                        // Work belongs to whoever issued it, whatever else was
+                        // resident. This is the half of the statistics that
+                        // partitions.
+                        SchedulerStats delta = stats_;
+                        delta -= before;
+                        (*per_launch)[slot.launch] += delta;
                     }
                     slot.cursor = (i + 1) % warps;
                     ++issued;
@@ -1315,9 +1426,25 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
                 }
             }
 
+            if (charging) {
+                for (const Slot& slot : unit.slots) {
+                    if (!slot.occupied()) {
+                        continue;
+                    }
+                    cycle_resident[slot.launch] = 1;
+                    if (!stepped) {
+                        ++cycle_idle[slot.launch];
+                    }
+                }
+            }
+
             // Retire the blocks that finished, and pull the next in.
             for (Slot& slot : unit.slots) {
                 if (slot.occupied() && slot.remaining == 0) {
+                    unit.warps_resident -=
+                        static_cast<uint32_t>(slot.block->warps.size());
+                    unit.shared_resident -= launches[slot.launch].shared_bytes;
+                    --pending[slot.launch].resident;
                     last_block_ = std::move(slot.block);
                     slot.live.clear();
                     slot.cursor = 0;
@@ -1336,25 +1463,36 @@ void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
             // Every SM that had nothing to send this cycle wasted an issue slot,
             // which is what occupancy exists to keep from happening.
             stats_.stall_steps += idle;
+            if (charging) {
+                charge_time(1);
+            }
             ++now;
             continue;
         }
 
         if (!anything_resident) {
-            break;  // every block retired and the grid is exhausted
+            break;  // every block retired and every grid is exhausted
         }
 
-        if (soonest != UINT64_MAX && soonest > now) {
+        if (!loaded_any && soonest != UINT64_MAX && soonest > now) {
             // Nobody can issue and somebody will be able to. Time moves to them,
             // and the gap is charged to the SMs that sat through it holding work.
             // Not to all of them: an SM with no block is unemployed rather than
             // stalled, and counting it would make a machine wider than its grid
             // look busier than one that fits.
+            //
+            // A block that arrived this cycle is why loaded_any is asked first:
+            // it can issue at once, and jumping over it would charge a wait to a
+            // machine that had work in hand.
             uint32_t waiting_units = 0;
             for (const Unit& unit : units) {
                 waiting_units += unit.slots.empty() ? 0u : 1u;
             }
-            stats_.stall_steps += (soonest - now) * waiting_units;
+            const uint64_t gap = soonest - now;
+            stats_.stall_steps += gap * waiting_units;
+            if (charging) {
+                charge_time(gap);
+            }
             now = soonest;
             continue;
         }

@@ -75,93 +75,190 @@ const GPUSpec& MyGPURuntime::myrt_spec() const
     return scheduler_->spec();
 }
 
+void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
+                              uint32_t block_id, uint32_t warps) const
+{
+    const dim3 grid = launch.grid;
+    const dim3 block = launch.block;
+    const uint32_t threads_per_block = block.volume();
+
+    const uint32_t bx = block_id % grid.x;
+    const uint32_t by = (block_id / grid.x) % grid.y;
+    const uint32_t bz = block_id / (grid.x * grid.y);
+
+    tb = make_block(warps, block_id);
+    for (uint32_t t = 0; t < warps * WARP_SIZE; t++) {
+        Thread& th = tb.warps[t / WARP_SIZE].threads[t % WARP_SIZE];
+        // Rounding the warp count up leaves a tail past the end of the launch.
+        // Retiring those lanes is what stops them from running with coordinate 0
+        // and rewriting thread 0's output.
+        if (t >= threads_per_block) {
+            th.active = false;
+            continue;
+        }
+        const uint32_t tx = t % block.x;
+        const uint32_t ty = (t / block.x) % block.y;
+        const uint32_t tz = t / (block.x * block.y);
+
+        th.regs[REG_GLOBAL_ID_X] = float(bx * block.x + tx);
+        th.regs[REG_GLOBAL_ID_Y] = float(by * block.y + ty);
+        th.regs[REG_GLOBAL_ID_Z] = float(bz * block.z + tz);
+
+        // Same for every thread of the block, and not recoverable from the
+        // coordinates above without an integer divide.
+        th.regs[REG_BLOCK_ID_X] = float(bx);
+        th.regs[REG_BLOCK_ID_Y] = float(by);
+        th.regs[REG_BLOCK_ID_Z] = float(bz);
+    }
+}
+
 void MyGPURuntime::myrt_launch(KernelFunc kernel, const LaunchConfig& config, void** args)
 {
-    const dim3 grid = config.grid;
-    const dim3 block = config.block;
-    if (grid.volume() == 0 || block.volume() == 0) {
+    // Queued and drained at once, which is what makes it synchronous. Anything
+    // already waiting goes with it: a launch that returns having run means the
+    // machine is idle behind it, and leaving another stream's blocks queued would
+    // make that untrue.
+    myrt_launch_async(std::move(kernel), config, args, DEFAULT_STREAM);
+    drain();
+}
+
+void MyGPURuntime::myrt_launch_async(KernelFunc kernel, const LaunchConfig& config,
+                                     void** args, StreamId stream)
+{
+    if (config.grid.volume() == 0 || config.block.volume() == 0) {
         throw std::runtime_error("myrt_launch: grid and block must both be non-empty");
     }
+    QueuedLaunch launch;
+    launch.grid = config.grid;
+    launch.block = config.block;
+    launch.shared_bytes = config.shared_bytes;
+    launch.stream = stream;
 
     // Called once for the whole launch, not once per thread: every thread runs
-    // these same instructions, and only their registers differ.
-    const Program program = kernel(args);
+    // these same instructions, and only their registers differ. Called here
+    // rather than at the drain so that args may die with the calling scope.
+    launch.program = kernel(args);
+    enqueue(std::move(launch));
+}
 
-    const uint32_t threads_per_block = block.volume();
-    const uint32_t warps = (threads_per_block + WARP_SIZE - 1) / WARP_SIZE;
-    const uint32_t blocks = grid.volume();
+void MyGPURuntime::enqueue(QueuedLaunch launch)
+{
+    if (launch.stream >= stream_stats_.size()) {
+        throw std::runtime_error("myrt_launch: no such stream");
+    }
+    queue_.push_back(std::move(launch));
+}
 
-    // Built as the SMs ask for them rather than all at once. A warp is 32 KB, so
-    // a 256x256 launch would otherwise materialise tens of megabytes of blocks
-    // before the first instruction issued.
-    uint32_t next_id = 0;
-    const auto build = [&](ThreadBlock& tb) {
-        if (next_id >= blocks) {
-            return false;
-        }
-        const uint32_t block_id = next_id++;
-        const uint32_t bx = block_id % grid.x;
-        const uint32_t by = (block_id / grid.x) % grid.y;
-        const uint32_t bz = block_id / (grid.x * grid.y);
+void MyGPURuntime::myrt_wait()
+{
+    drain();
+}
 
-        tb = make_block(warps, block_id);
-        for (uint32_t t = 0; t < warps * WARP_SIZE; t++) {
-            Thread& th = tb.warps[t / WARP_SIZE].threads[t % WARP_SIZE];
-            // Rounding the warp count up leaves a tail past the end of the
-            // launch. Retiring those lanes is what stops them from running with
-            // coordinate 0 and rewriting thread 0's output.
-            if (t >= threads_per_block) {
-                th.active = false;
-                continue;
-            }
-            const uint32_t tx = t % block.x;
-            const uint32_t ty = (t / block.x) % block.y;
-            const uint32_t tz = t / (block.x * block.y);
+StreamId MyGPURuntime::myrt_stream_create()
+{
+    stream_stats_.emplace_back();
+    return ++next_stream_;
+}
 
-            th.regs[REG_GLOBAL_ID_X] = float(bx * block.x + tx);
-            th.regs[REG_GLOBAL_ID_Y] = float(by * block.y + ty);
-            th.regs[REG_GLOBAL_ID_Z] = float(bz * block.z + tz);
+const SchedulerStats& MyGPURuntime::myrt_stream_stats(StreamId stream) const
+{
+    if (stream >= stream_stats_.size()) {
+        throw std::runtime_error("myrt_stream_stats: no such stream");
+    }
+    return stream_stats_[stream];
+}
 
-            // Same for every thread of the block, and not recoverable from the
-            // coordinates above without an integer divide.
-            th.regs[REG_BLOCK_ID_X] = float(bx);
-            th.regs[REG_BLOCK_ID_Y] = float(by);
-            th.regs[REG_BLOCK_ID_Z] = float(bz);
-        }
-        return true;
+void MyGPURuntime::drain()
+{
+    if (queue_.empty()) {
+        return;
+    }
+
+    // Where each launch has got to. Held apart from the queue because a builder
+    // is called by the scheduler, whenever a slot comes free, and has to remember
+    // between calls what it has already handed out.
+    struct Cursor {
+        uint32_t next = 0;
+        uint32_t blocks = 0;
+        uint32_t warps = 0;
+        bool resolved = false;
     };
+    std::vector<Cursor> cursors(queue_.size());
 
-    // Once for the launch, where it used to be once a block. Blocks overlap when
+    std::vector<GridLaunch> launches(queue_.size());
+    for (size_t i = 0; i < queue_.size(); ++i) {
+        launches[i].program = &queue_[i].program;
+        launches[i].shared_bytes = queue_[i].shared_bytes;
+        launches[i].stream = queue_[i].stream;
+
+        // Built as the SMs ask for them rather than all at once. A warp is 32 KB,
+        // so a 256x256 launch would otherwise materialise tens of megabytes of
+        // blocks before the first instruction issued.
+        launches[i].next_block = [this, i, &cursors](ThreadBlock& tb) {
+            const QueuedLaunch& launch = queue_[i];
+            Cursor& cursor = cursors[i];
+            if (!cursor.resolved) {
+                cursor.blocks = launch.grid.volume();
+                cursor.warps = (launch.block.volume() + WARP_SIZE - 1) / WARP_SIZE;
+                cursor.resolved = true;
+            }
+            if (cursor.next >= cursor.blocks) {
+                return false;
+            }
+            seed_block(tb, launch, cursor.next++, cursor.warps);
+            return true;
+        };
+    }
+
+    // Once for the drain, where it used to be once a block. Blocks overlap when
     // there is more than one SM, so their clocks cannot be added — and the
     // counters that can be added are added here, in one place.
     scheduler_->reset_stats();
 
+    // Attribution costs a snapshot a warp step, so it is asked for only when
+    // there is something to attribute. One launch owns everything the drain did.
+    std::vector<SchedulerStats> per_launch;
+    const bool split = queue_.size() > 1;
+
     // steady_clock, not high_resolution_clock, which is permitted to be
     // non-monotonic and could yield a negative interval.
     const auto t0 = std::chrono::steady_clock::now();
-    scheduler_->run_grid(program, DeviceSpan{mem_->device_base(), mem_->device_size()},
-                         config.shared_bytes, build);
+    scheduler_->run_streams(launches,
+                            DeviceSpan{mem_->device_base(), mem_->device_size()},
+                            split ? &per_launch : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
 
     elapsed_seconds_ += std::chrono::duration<double>(t1 - t0).count();
     stats_ += scheduler_->stats();
+    if (split) {
+        for (size_t i = 0; i < queue_.size(); ++i) {
+            stream_stats_[queue_[i].stream] += per_launch[i];
+        }
+    } else {
+        stream_stats_[queue_[0].stream] += scheduler_->stats();
+    }
+
+    queue_.clear();
 }
 
 void MyGPURuntime::myrt_sync(bool report)
 {
-    // Nothing to wait for: execution is synchronous. Reporting and clearing is
-    // what makes this the natural end of a kernel run. Both fields reset
-    // together, or the next launch would divide its work by carried-over time.
+    // Everything queued runs here, which is the only thing a sync waits for.
+    // Reporting and clearing is what makes this the natural end of a kernel run.
+    // Both fields reset together, or the next launch would divide its work by
+    // carried-over time.
     //
     // Counters only. The scheduler's caches survive, as L2 does across kernel
     // launches on hardware — draw_walk and its neighbours call this between their
     // two passes, and clearing here would stop pass 2 from finding anything pass 1
     // had read.
+    drain();
     if (report) {
         print_stats();
     }
     stats_ = SchedulerStats{};
     elapsed_seconds_ = 0.0;
+    stream_stats_.assign(stream_stats_.size(), SchedulerStats{});
 }
 
 // Totals spanning several launches answer the same question a single run's do,

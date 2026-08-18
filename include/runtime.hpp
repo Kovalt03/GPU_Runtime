@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <vector>
 
 #include "isa.hpp"        // Program, for KernelFunc
 #include "memory.hpp"     // MemoryManager, Direction
@@ -33,6 +34,17 @@ struct LaunchConfig {
     dim3 block;
     size_t shared_bytes = 0;
 };
+
+// Which queue a launch waits in. Launches sharing one run in order; launches in
+// different ones are unordered, and the machine interleaves their blocks.
+//
+// A plain integer rather than an opaque handle: there is no per-stream state to
+// hold, ordering being decided at the drain from the order things were enqueued.
+using StreamId = uint32_t;
+
+// The stream a launch uses when it names none, and the one every synchronous
+// launch uses.
+inline constexpr StreamId DEFAULT_STREAM = 0;
 
 // A kernel is a function that produces an instruction sequence, mirroring the
 // compile step a real toolchain performs ahead of a launch. It is called once
@@ -102,6 +114,37 @@ public:
     // forget rather than easy to see.
     void myrt_launch(KernelFunc kernel, const LaunchConfig& config, void** args);
 
+    // Queues a launch and returns at once. Nothing runs until a sync or a
+    // synchronous launch drains the queue.
+    //
+    // args need not outlive the call: the kernel is built here, and a Program
+    // carries its constants. What must outlive it is the device memory the
+    // program addresses.
+    //
+    // Two launches on one stream run in order — the second's first block waits
+    // for the first's last. Two on different streams do not, and that is what
+    // buys anything: a grid too small to fill the machine leaves slots the other
+    // stream's blocks take.
+    void myrt_launch_async(KernelFunc kernel, const LaunchConfig& config, void** args,
+                           StreamId stream = DEFAULT_STREAM);
+
+    // A fresh stream id. Ordered against nothing, including the default stream.
+    StreamId myrt_stream_create();
+
+    // What one stream's launches came to, since construction or the last
+    // myrt_sync. Two halves, and they behave differently: the work counters
+    // partition the total exactly, while cycles and stall_steps are what that
+    // stream saw of the machine's time — two streams both see a cycle they
+    // overlapped in, so those add up to more than the total. The surplus is the
+    // overlap.
+    const SchedulerStats& myrt_stream_stats(StreamId stream) const;
+
+    // Runs whatever is queued and returns. Every counter stands afterwards,
+    // which is what a caller wanting to read them does instead of syncing: a
+    // queued launch has nowhere else to be run, and myrt_sync clears the
+    // statistics it just finished gathering.
+    void myrt_wait();
+
     // The machine the next launch runs on. Defaults to one SM holding one block,
     // which is what every figure in benchmarks/ was taken on.
     void myrt_set_sm_config(const SMConfig& config);
@@ -111,9 +154,9 @@ public:
     // not stated beside it cannot be reproduced.
     const GPUSpec& myrt_spec() const;
 
-    // Nothing to wait for in a synchronous simulator; this reports the
-    // statistics gathered since the last call and clears them, which is what
-    // makes it the natural place to end a kernel run.
+    // Runs whatever is queued, then reports the statistics gathered since the
+    // last call and clears them, which is what makes it the natural place to end
+    // a kernel run.
     // report=false still waits and still clears the counters, but prints
     // nothing. For a sync in the middle of a draw, which ends a pass rather
     // than a kernel run — and for a benchmark making fifteen of them.
@@ -168,6 +211,35 @@ private:
 
     SchedulerStats stats_;
     double elapsed_seconds_ = 0.0;
+
+    // A launch that has been built but not yet run. The Program is held by value
+    // because the caller's args are gone by now; the grid may still be unknown,
+    // which is what indirect means.
+    struct QueuedLaunch {
+        Program program;
+        dim3 grid;
+        dim3 block;
+        size_t shared_bytes = 0;
+        StreamId stream = DEFAULT_STREAM;
+    };
+
+    std::vector<QueuedLaunch> queue_;
+    StreamId next_stream_ = DEFAULT_STREAM;
+
+    // Indexed by stream id, which is why the ids are dense. Cleared with the
+    // totals, by myrt_sync.
+    std::vector<SchedulerStats> stream_stats_{1};
+
+    void enqueue(QueuedLaunch launch);
+
+    // Everything queued, on the machine at once. One timing around the whole of
+    // it: overlapping launches share cycles, and timing them separately would
+    // count the same wall-clock second once a stream.
+    void drain();
+
+    // Seeds one block's threads with the coordinates a kernel reads.
+    void seed_block(ThreadBlock& tb, const QueuedLaunch& launch, uint32_t block_id,
+                    uint32_t warps) const;
 
     // "[STATS] divergence: X.X%, throughput: X.X GIOPS"
     void print_stats() const;

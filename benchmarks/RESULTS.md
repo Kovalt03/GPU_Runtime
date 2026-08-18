@@ -704,13 +704,13 @@ cache and latency modelled.
 | SMs | blocks an SM | issued work | cycles | vs 1x1 | stalls |
 |---:|---:|---:|---:|---:|---:|
 | 1 | 1 | 1,718,778 | 567,142 | 1.00x | 507,020 |
-| 1 | 8 | 1,718,778 | 76,490 | **7.41x** | 16,368 |
+| 1 | 8 | 1,718,778 | 76,484 | **7.42x** | 16,362 |
 | 2 | 1 | 1,718,932 | 284,166 | 2.00x | 508,210 |
-| 4 | 1 | 1,719,240 | 142,759 | 3.97x | 510,800 |
-| 8 | 1 | 1,719,856 | 71,998 | 7.88x | 515,520 |
-| 8 | 8 | 1,719,856 | 10,553 | **53.74x** | 23,498 |
-| 16 | 8 | 1,721,088 | 9,446 | **60.04x** | 88,921 |
-| 32 | 8 | 1,723,552 | 9,967 | 56.90x | 244,621 |
+| 4 | 1 | 1,719,240 | 142,710 | 3.97x | 510,590 |
+| 8 | 1 | 1,719,856 | 71,982 | 7.88x | 515,350 |
+| 8 | 8 | 1,719,856 | 10,553 | **53.74x** | 23,170 |
+| 16 | 8 | 1,721,088 | 9,347 | **60.68x** | 88,628 |
+| 32 | 8 | 1,723,552 | 9,593 | 59.12x | 244,259 |
 | 64 | 1 | 1,728,480 | 10,095 | 56.18x | 581,990 |
 
 **The work does not move.** 1,718,778 against 1,728,480 across the whole table,
@@ -722,13 +722,13 @@ to catch.
 **The two axes do different things.** More SMs divides the time — 2.00x, 3.97x,
 7.88x, almost exactly linear — and leaves the stalls alone: each SM still holds
 one warp, which still waits by itself. More blocks an SM removes the waiting:
-stalls collapse from 507,020 to 16,368 while the same single SM does the work.
+stalls collapse from 507,020 to 16,362 while the same single SM does the work.
 Parallelism splits the time; occupancy stops wasting it.
 
 **And they trade against each other once the grid runs out.** The best row is 16
 SMs of 8 blocks, not 32 of 8: sixty-four blocks spread over thirty-two SMs is two
 apiece, and two warps cover less of a wait than eight do. Stalls say the same
-thing louder — 88,921 against 244,621. A machine can be too wide for its work in
+thing louder — 88,628 against 244,259. A machine can be too wide for its work in
 a way that shows up as waiting rather than as idleness.
 
 ### The residue: an SM keeps its own L1
@@ -761,9 +761,9 @@ The same sweep, one SM, all three raster routes. Cycles, so lower is better.
 | blocks an SM | walk | tiled | shared |
 |---:|---:|---:|---:|
 | 1 | 567,142 | 15,463 | 19,356 |
-| 2 | 283,962 | 11,557 | 19,356 |
-| 4 | 143,477 | 10,730 | 19,356 |
-| 8 | 76,490 | 10,714 | 19,356 |
+| 2 | 284,185 | 11,557 | 19,356 |
+| 4 | 143,332 | 10,730 | 19,356 |
+| 8 | 76,484 | 10,714 | 19,356 |
 | 16 | 60,548 | 10,714 | 19,356 |
 | 32 | 60,124 | 10,714 | 19,356 |
 
@@ -789,8 +789,12 @@ memory it traded for is the resource occupancy is made of.
 
 ### How the blocks are handed out decides where the ceiling sits
 
-They go breadth first, one to each SM before any gets a second. Filling each SM
-to capacity first looks equivalent and is not: `sphere.obj` at 128x64 is 256
+They go breadth first, one to each SM before any gets a second — from an empty
+machine, which is newer than it sounds: the block that used to decide residency was
+placed before the fill began, so SM 0 received a second before SM 1 had its first.
+Residency is counted a block at a time now, and that prologue went with it.
+
+Filling each SM to capacity first looks equivalent and is not: `sphere.obj` at 128x64 is 256
 blocks, and on 108 SMs holding 32 each the greedy order lands all of them on the
 first eight while a hundred sit out — 80x against the 250x spreading gives.
 Hardware's work distributor spreads for the same reason.

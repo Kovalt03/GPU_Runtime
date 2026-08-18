@@ -60,6 +60,22 @@ struct SchedulerStats {
     // Wasted fraction of issued capacity, 0.0 to 1.0. Zero when nothing ran.
     double divergence_rate() const;
 
+    // What happened between two readings. Used to charge a step's work to the
+    // launch that issued it, where taking the difference of the whole struct is
+    // what keeps a counter added later from being left out of the attribution.
+    SchedulerStats& operator-=(const SchedulerStats& other)
+    {
+        warp_steps -= other.warp_steps;
+        active_lane_ops -= other.active_lane_ops;
+        weighted_lane_ops -= other.weighted_lane_ops;
+        stall_steps -= other.stall_steps;
+        cycles -= other.cycles;
+        l1_hits -= other.l1_hits;
+        l2_hits -= other.l2_hits;
+        cache_misses -= other.cache_misses;
+        return *this;
+    }
+
     // A Scheduler only ever knows about the run it is performing, so totals
     // spanning several launches are folded together by the caller.
     SchedulerStats& operator+=(const SchedulerStats& other)
@@ -196,6 +212,27 @@ struct GlobalAccess {
 // Returns false when the grid is exhausted.
 using NextBlock = std::function<bool(ThreadBlock&)>;
 
+// One grid waiting for a machine, and which queue it waits in.
+//
+// The program is held by pointer rather than by value because a launch is
+// queued, not copied: the caller keeps the Program it built and this names it.
+// It must outlive run_streams.
+struct GridLaunch {
+    const Program* program = nullptr;
+    NextBlock next_block;
+
+    // What the kernel declares it will use of a block's scratchpad. Per launch
+    // rather than per machine, since two kernels sharing an SM need not agree
+    // about it.
+    size_t shared_bytes = 0;
+
+    // Launches carrying the same id run in order: none of this one's blocks is
+    // placed until every block of the one before it has retired. Different ids
+    // are unordered with respect to each other, which is the whole of what a
+    // stream is — the machine is free to interleave them, and does.
+    uint32_t stream = 0;
+};
+
 class WarpScheduler {
 public:
     // How many cycles a *launch* may take before run_grid gives up.
@@ -284,6 +321,25 @@ public:
     // sit on an SM at once, which is what it decides on hardware.
     void run_grid(const Program& program, DeviceSpan global, size_t shared_bytes,
                   const NextBlock& next_block);
+
+    // Several grids at once, ordered within a stream and free across streams.
+    //
+    // The blocks of concurrent launches compete for the same slots, warp slots
+    // and shared memory, which is where a stream earns anything: a grid too
+    // small to fill the machine leaves room another kernel's blocks can take.
+    //
+    // per_launch, when given, is filled with one entry a launch, in the order
+    // they were handed in. What it holds divides in two:
+    //
+    //   work   warp_steps, the lane counts and the cache counts. Charged to
+    //          whichever launch the warp belonged to, so they partition the
+    //          totals exactly — the parts add up to stats().
+    //   time   cycles and stall_steps. Charged to every launch resident while
+    //          they passed, so two overlapping launches are both charged for
+    //          the same cycle and the parts add up to *more* than the whole.
+    //          The surplus is the overlap, and measuring it is the point.
+    void run_streams(const std::vector<GridLaunch>& launches, DeviceSpan global,
+                     std::vector<SchedulerStats>* per_launch = nullptr);
 
     // The machine this scheduler runs on. Defaults to the one every figure in
     // benchmarks/ was taken on: one SM holding one block.
