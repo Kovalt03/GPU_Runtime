@@ -52,6 +52,7 @@ template Reg<Scalar> IRBuilder::alloc<Scalar>();
 template Reg<Vec3> IRBuilder::alloc<Vec3>();
 template Reg<Vec4> IRBuilder::alloc<Vec4>();
 template Reg<Mat4> IRBuilder::alloc<Mat4>();
+template Reg<Frag> IRBuilder::alloc<Frag>();
 
 template <typename Shape>
 Reg<Scalar> Reg<Shape>::component(uint32_t index) const
@@ -71,6 +72,7 @@ template Reg<Scalar> Reg<Scalar>::component(uint32_t) const;
 template Reg<Scalar> Reg<Vec3>::component(uint32_t) const;
 template Reg<Scalar> Reg<Vec4>::component(uint32_t) const;
 template Reg<Scalar> Reg<Mat4>::component(uint32_t) const;
+template Reg<Scalar> Reg<Frag>::component(uint32_t) const;
 
 void IRBuilder::emit(Instruction instr)
 {
@@ -331,6 +333,11 @@ void IRBuilder::load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset)
     emit(make_v_ld_global_f32(dst.first(), address.first(), offset));
 }
 
+void IRBuilder::load_shared_into(Reg<Scalar> dst, Reg<Scalar> address, float offset)
+{
+    emit(make_v_ld_shared_f32(dst.first(), address.first(), offset));
+}
+
 Reg<Vec3> IRBuilder::load_vec3(Reg<Scalar> address, float offset)
 {
     const Reg<Vec3> dst = alloc<Vec3>();
@@ -410,6 +417,13 @@ void IRBuilder::reorder(Reg<Scalar> key)
 void IRBuilder::barrier_cluster()
 {
     emit(make_barrier_cluster());
+}
+
+void IRBuilder::mma(Reg<Frag> accumulator, Reg<Frag> a, Reg<Frag> b)
+{
+    // Every lane of the warp, always: the shape needs all of them, and the
+    // scheduler refuses a mask that names fewer.
+    emit(make_v_mma_16x16x16_f32(accumulator.first(), a.first(), b.first(), 0xFFFFFFFFu));
 }
 
 Reg<Scalar> IRBuilder::load_cluster(Reg<Scalar> address, Reg<Scalar> rank, float offset)

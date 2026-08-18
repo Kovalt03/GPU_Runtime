@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "isa.hpp"
+#include "thread.hpp"
 
 // An IR builder over the instruction set: the layer a real stack puts between a
 // language and its machine code. Without it a kernel is written the way
@@ -35,6 +36,14 @@ struct Vec4 {
 
 struct Mat4 {
     static constexpr uint32_t REGISTERS = 16;
+    static constexpr uint32_t ALIGNMENT = 4;
+};
+
+// A lane's eighth of a 16x16 tile, which is what V_MMA_16X16X16_F32 reads and
+// writes. Eight registers because a warp is 32 lanes and a tile is 256 elements —
+// the shape is the instruction's, not a choice.
+struct Frag {
+    static constexpr uint32_t REGISTERS = MMA_FRAGMENT_REGISTERS;
     static constexpr uint32_t ALIGNMENT = 4;
 };
 
@@ -116,6 +125,10 @@ public:
     {
         return alloc<Mat4>();
     }
+    Reg<Frag> fragment()
+    {
+        return alloc<Frag>();
+    }
 
     uint32_t registers_used() const
     {
@@ -161,6 +174,10 @@ public:
     Reg<Vec3> normalize(Reg<Vec3> v);
 
     Reg<Vec4> transform(Reg<Mat4> m, Reg<Vec4> v);
+
+    // accumulator += a * b, over a 16x16x16 tile, by the whole warp. In place,
+    // which is what lets a K loop carry its answer in registers.
+    void mma(Reg<Frag> accumulator, Reg<Frag> a, Reg<Frag> b);
 
     // Accumulates in place, matching V_FMA_F32: acc += a * b.
     void fma(Reg<Scalar> acc, Reg<Scalar> a, Reg<Scalar> b);
@@ -210,6 +227,11 @@ public:
     // As load, into a register the caller already holds — the counterpart to
     // set(), and what fills the first three slots of a VEC4 in place.
     void load_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
+
+    // The same for shared memory. A fragment is assembled a register at a time,
+    // and each has to land in a chosen one — an allocating load would hand back
+    // eight registers that are not consecutive.
+    void load_shared_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
     void load_vec3_into(Reg<Vec3> dst, Reg<Scalar> address, float offset = 0.0f);
 
     // The block's own scratchpad. Addresses are byte offsets, as the global
