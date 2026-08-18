@@ -1,4 +1,4 @@
-// Summing across a warp, two ways.
+// Summing across a warp, four ways.
 //
 // Before V_SHUFFLE_F32 the only route was shared memory: every lane stores, the
 // block synchronises, every lane loads its partner's value. The exchange does it
@@ -13,11 +13,18 @@
 // weighted total is turned around to ask how expensive a shuffle would have to
 // be before the two routes came level.
 //
+// The two atomic routes came later, with V_ATOM_ADD_GLOBAL_F32, and they answer
+// a slightly different question: they leave the total in memory, where the two
+// above leave it in a register. That is the form anything summing across warps
+// or blocks needs, and it is where the choice between them actually arises —
+// one atomic a lane against one a warp, with the reduction in front.
+//
 //   ./build/benchmarks/reduction_bench            benchmarks/result/reduction.{md,csv}
 //   ./build/benchmarks/reduction_bench --out dir  writes into that directory
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -39,8 +46,9 @@ constexpr uint8_t R_OFFSET = 3;
 constexpr uint8_t R_WIDTH = 4;    // WARP_SIZE, for the wrap
 constexpr uint8_t R_WRAPPED = 5;  // 1.0 when partner ran off the end
 constexpr uint8_t R_NEG_WIDTH = 6;
-constexpr uint8_t R_TAKEN = 7;  // the partner's value
-constexpr uint8_t R_ADDR = 8;   // R_LANE and R_PARTNER as byte addresses
+constexpr uint8_t R_TAKEN = 7;     // the partner's value
+constexpr uint8_t R_ADDR = 8;      // R_LANE and R_PARTNER as byte addresses
+constexpr uint8_t R_SUM_ZERO = 9;  // 0.0, for the lane-0 test
 
 // partner = (lane + offset) mod WARP_SIZE, without a branch.
 //
@@ -110,11 +118,55 @@ Program shuffle_reduction()
     return p;
 }
 
+// Every lane adds its own value to one counter. Thirty-two lanes on one address
+// is thirty-two operations the atomic unit performs one after another, and no
+// coalescing can merge them — which is the arithmetic the two routes above exist
+// to avoid.
+Program atomic_per_lane_reduction()
+{
+    Program p;
+    emit_preamble(p);
+    p.push_back(make_v_mov_f32(R_ADDR, 0.0f));
+    p.push_back(make_v_atom_add_global_f32(R_TAKEN, R_ADDR, R_SUM));
+    p.push_back(make_ret());
+    return p;
+}
+
+// The exchange first, then one atomic from one lane. The reduction costs five
+// rounds in registers and leaves the total in every lane; the atomic then carries
+// it out of the warp, once, with nothing to collide with.
+Program shuffle_then_atomic_reduction()
+{
+    Program p;
+    emit_preamble(p);
+    for (uint32_t offset = WARP_SIZE / 2; offset >= 1; offset /= 2) {
+        emit_partner(p, offset);
+        p.push_back(make_v_shuffle_f32(R_TAKEN, R_SUM, R_PARTNER, ALL_LANES));
+        p.push_back(make_v_add_f32(R_SUM, R_SUM, R_TAKEN));
+    }
+
+    // Lane 0 alone. The others branch to the RET, so the atomic is issued with
+    // one lane active and the collision depth is one.
+    //
+    // The zero is emitted here rather than in the preamble the four routes
+    // share: adding an instruction there would move the two figures the
+    // shared-against-exchange comparison already published.
+    p.push_back(make_v_mov_f32(R_SUM_ZERO, 0.0f));
+    p.push_back(make_v_cmp_f32(R_WRAPPED, R_LANE, R_SUM_ZERO, CmpOp::GT));
+    p.push_back(make_bra_div(R_WRAPPED, 4));
+    p.push_back(make_v_mov_f32(R_ADDR, 0.0f));
+    p.push_back(make_v_atom_add_global_f32(R_TAKEN, R_ADDR, R_SUM));
+    p.push_back(make_bra(1));
+    p.push_back(make_ret());
+    return p;
+}
+
 struct Reading {
     size_t instructions = 0;
     uint64_t warp_steps = 0;
     uint64_t active_lane_ops = 0;
     uint64_t weighted = 0;
+    uint64_t cycles = 0;
     float answer = 0.0f;
 };
 
@@ -130,6 +182,13 @@ Reading measure(const Program& p, uint32_t warps)
     }
 
     WarpScheduler scheduler;
+
+    // Cycles, because what an atomic costs is mostly waiting: the collisions are
+    // worked through one at a time and the issue count cannot see that. The
+    // instruction and step counts are the same under every model.
+    scheduler.set_latency_model(LatencyModel::Modelled);
+    scheduler.set_memory_model(MemoryModel::Coalesced);
+
     std::vector<uint8_t> global(64, 0);
     scheduler.run(p, block, DeviceSpan{global.data(), global.size()});
 
@@ -138,7 +197,13 @@ Reading measure(const Program& p, uint32_t warps)
     r.warp_steps = scheduler.stats().warp_steps;
     r.active_lane_ops = scheduler.stats().active_lane_ops;
     r.weighted = scheduler.stats().weighted_lane_ops;
-    r.answer = block.warps[0].threads[0].regs[R_SUM];
+    r.cycles = scheduler.stats().cycles;
+
+    // The register routes leave the total in every lane; the atomic ones leave it
+    // at byte 0. Whichever this program filled is the answer.
+    float in_memory = 0.0f;
+    std::memcpy(&in_memory, global.data(), sizeof(float));
+    r.answer = in_memory != 0.0f ? in_memory : block.warps[0].threads[0].regs[R_SUM];
     return r;
 }
 
@@ -157,31 +222,43 @@ int main(int argc, char** argv)
 
     const Program shared = shared_memory_reduction();
     const Program shuffled = shuffle_reduction();
+    const Program per_lane = atomic_per_lane_reduction();
+    const Program then_atomic = shuffle_then_atomic_reduction();
 
     // 0 + 1 + ... + 31, which every lane ends up holding.
     constexpr float EXPECTED = WARP_SIZE * (WARP_SIZE - 1) / 2.0f;
 
-    std::printf("\n[BENCH] summing a warp, shared memory against the exchange\n\n");
-    std::printf("  %-8s %14s %12s %12s %14s %10s\n", "warps", "route", "instrs",
-                "warp steps", "lane ops", "answer");
+    std::printf("\n[BENCH] summing a warp: shared memory, the exchange, and atomics\n\n");
+    std::printf("  %-8s %16s %12s %12s %14s %10s %10s\n", "warps", "route", "instrs",
+                "warp steps", "lane ops", "cycles", "answer");
 
     struct Row {
         uint32_t warps;
         Reading shared;
         Reading shuffled;
+        Reading per_lane;
+        Reading then_atomic;
     };
     std::vector<Row> rows;
     for (const uint32_t warps : {1u, 2u, 4u, 8u}) {
-        Row row{warps, measure(shared, warps), measure(shuffled, warps)};
+        Row row{warps, measure(shared, warps), measure(shuffled, warps),
+                measure(per_lane, warps), measure(then_atomic, warps)};
         rows.push_back(row);
 
-        std::printf("  %-8u %14s %12zu %12llu %14llu %10.0f\n", warps, "shared",
-                    row.shared.instructions, (unsigned long long)row.shared.warp_steps,
-                    (unsigned long long)row.shared.active_lane_ops, row.shared.answer);
-        std::printf(
-            "  %-8s %14s %12zu %12llu %14llu %10.0f\n", "", "shuffle",
-            row.shuffled.instructions, (unsigned long long)row.shuffled.warp_steps,
-            (unsigned long long)row.shuffled.active_lane_ops, row.shuffled.answer);
+        const std::pair<const char*, const Reading*> routes[] = {
+            {"shared", &row.shared},
+            {"shuffle", &row.shuffled},
+            {"atomic a lane", &row.per_lane},
+            {"shuffle+atomic", &row.then_atomic}};
+        bool first_row = true;
+        for (const auto& [name, r] : routes) {
+            std::printf("  %-8s %16s %12zu %12llu %14llu %10llu %10.0f\n",
+                        first_row ? std::to_string(warps).c_str() : "", name,
+                        r->instructions, (unsigned long long)r->warp_steps,
+                        (unsigned long long)r->active_lane_ops,
+                        (unsigned long long)r->cycles, r->answer);
+            first_row = false;
+        }
     }
 
     if (rows[0].shared.answer != EXPECTED || rows[0].shuffled.answer != EXPECTED) {
@@ -223,37 +300,59 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "reduction_bench: cannot write %s.csv\n", prefix.c_str());
         return 1;
     }
-    csv << "warps,route,instructions,warp_steps,active_lane_ops,weighted_lane_ops\n";
+    csv << "warps,route,instructions,warp_steps,active_lane_ops,weighted_lane_ops,"
+           "cycles\n";
     for (const Row& r : rows) {
         const std::pair<const char*, const Reading*> routes[] = {
-            {"shared", &r.shared}, {"shuffle", &r.shuffled}};
+            {"shared", &r.shared},
+            {"shuffle", &r.shuffled},
+            {"atomic a lane", &r.per_lane},
+            {"shuffle+atomic", &r.then_atomic}};
         for (const auto& [name, reading] : routes) {
             csv << r.warps << ',' << name << ',' << reading->instructions << ','
                 << reading->warp_steps << ',' << reading->active_lane_ops << ','
-                << reading->weighted << '\n';
+                << reading->weighted << ',' << reading->cycles << '\n';
         }
     }
 
     std::ofstream md(prefix + ".md");
-    char buf[320];
+    char buf[512];
     md << "<!-- generated by benchmarks/reduction_bench; do not edit by hand -->\n\n"
        << "## Summing a warp\n\n"
-       << "| Warps | Route | Instructions | Warp steps | Lane ops |\n"
-       << "|---|---|---:|---:|---:|\n";
+       << "The two atomic routes leave the total in memory rather than in a "
+          "register, so\ntheir answer accumulates across the block's warps where "
+          "the other two do not.\nThat is the reason to reach for one, and the "
+          "cycles are the price.\n\n"
+       << "| Warps | Route | Instructions | Warp steps | Lane ops | Cycles |\n"
+       << "|---|---|---:|---:|---:|---:|\n";
     for (const Row& r : rows) {
-        std::snprintf(buf, sizeof(buf), "| %u | shared | %zu | %llu | %llu |\n", r.warps,
-                      r.shared.instructions, (unsigned long long)r.shared.warp_steps,
-                      (unsigned long long)r.shared.active_lane_ops);
-        md << buf;
-        std::snprintf(buf, sizeof(buf), "| %u | shuffle | %zu | %llu | %llu |\n", r.warps,
-                      r.shuffled.instructions, (unsigned long long)r.shuffled.warp_steps,
-                      (unsigned long long)r.shuffled.active_lane_ops);
-        md << buf;
+        const std::pair<const char*, const Reading*> routes[] = {
+            {"shared", &r.shared},
+            {"shuffle", &r.shuffled},
+            {"atomic a lane", &r.per_lane},
+            {"shuffle+atomic", &r.then_atomic}};
+        for (const auto& [name, reading] : routes) {
+            std::snprintf(buf, sizeof(buf), "| %u | %s | %zu | %llu | %llu | %llu |\n",
+                          r.warps, name, reading->instructions,
+                          (unsigned long long)reading->warp_steps,
+                          (unsigned long long)reading->active_lane_ops,
+                          (unsigned long long)reading->cycles);
+            md << buf;
+        }
     }
     std::snprintf(buf, sizeof(buf),
-                  "\nPriced at %u, a shuffle would have to reach %.0f before the two "
-                  "routes came level.\n",
-                  priced_at, break_even);
+                  "\nPriced at %u, a shuffle would have to reach %.0f before shared "
+                  "memory and the\nexchange came level.\n\nOne warp: an atomic a lane "
+                  "is %zu instructions against %zu and %llu cycles\nagainst %llu. The "
+                  "issue count says it wins and the clock says it loses by\n%.1fx — "
+                  "thirty-two lanes on one address are thirty-two operations, worked\n"
+                  "through one at a time.\n",
+                  priced_at, break_even, rows[0].per_lane.instructions,
+                  rows[0].then_atomic.instructions,
+                  (unsigned long long)rows[0].per_lane.cycles,
+                  (unsigned long long)rows[0].then_atomic.cycles,
+                  static_cast<double>(rows[0].per_lane.cycles) /
+                      static_cast<double>(rows[0].then_atomic.cycles));
     md << buf;
 
     std::printf("\nwrote %s.md and %s.csv\n", prefix.c_str(), prefix.c_str());
