@@ -54,6 +54,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_LD_SHARED_F32:  return "V_LD_SHARED_F32";
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
+    case Opcode::V_ATOM_ADD_GLOBAL_F32: return "V_ATOM_ADD_GLOBAL_F32";
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
     case Opcode::BRA_DIV:          return "BRA_DIV";
@@ -209,6 +210,12 @@ Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset)
     return {Opcode::V_ST_SHARED_F32, 0, addr_reg, src, offset};
 }
 
+Instruction make_v_atom_add_global_f32(uint8_t dst, uint8_t addr_reg, uint8_t src,
+                                       float offset)
+{
+    return {Opcode::V_ATOM_ADD_GLOBAL_F32, dst, addr_reg, src, offset};
+}
+
 // Two addresses and no value, so both operand slots are sources and dst is
 // unused — the only memory instruction here whose destination is not a register
 // or the value in src1.
@@ -342,6 +349,12 @@ uint32_t instruction_cost(Opcode op)
     // saves in time is the wait, and that is not on this line.
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return 100;
 
+    // A read and a write that nothing may come between, performed where the
+    // caches meet rather than in a lane. Priced above a load because it is one
+    // — what it costs beyond that depends on how many lanes want the same
+    // address, and that is atomic_access rather than this line.
+    case Opcode::V_ATOM_ADD_GLOBAL_F32: return 120;
+
     // Three floats, so three times a float. What the wide load saves is
     // transactions rather than bytes, and a charge per lane cannot see it —
     // global_transaction_cost is where the two part company.
@@ -408,6 +421,11 @@ uint32_t instruction_latency(Opcode op)
     // different thing again.
     case Opcode::V_ST_GLOBAL_F32:
     case Opcode::V_ST_SHARED_F32: return 0;
+
+    // Not answered here, for the reason the loads are not: what an atomic costs
+    // in time is decided by how many lanes collide, which is a property of the
+    // addresses rather than of the opcode.
+    case Opcode::V_ATOM_ADD_GLOBAL_F32: return 0;
 
     // Not answered here either, and for a stronger reason than the loads: the
     // copy's latency is never the warp's. It is recorded against the copy and

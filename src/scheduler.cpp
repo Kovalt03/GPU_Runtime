@@ -444,6 +444,24 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // Read, add, write back. Indivisible by construction: the lane loop runs one
+    // lane at a time, so two lanes on one address see each other's result rather
+    // than both reading the same old value.
+    //
+    // The order they run in is the lane order, which hardware does not promise.
+    // Nothing here depends on it — addition commutes, and a lane's own answer is
+    // its position in the queue rather than a particular number.
+    case Opcode::V_ATOM_ADD_GLOBAL_F32: {
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_ATOM_ADD_GLOBAL_F32");
+        const float old =
+            load_f32(global.base, global.size, addr, "V_ATOM_ADD_GLOBAL_F32");
+        store_f32(global.base, global.size, addr, old + thread.regs[instr.src1],
+                  "V_ATOM_ADD_GLOBAL_F32");
+        thread.regs[instr.dst] = old;
+        break;
+    }
+
     // Warp state, and handled before the lane loop is reached. Named here so
     // that -Wswitch keeps watching this switch for the next opcode.
     case Opcode::S_CP_ASYNC_WAIT: break;
@@ -677,6 +695,42 @@ GlobalAccess WarpScheduler::cache_lookup(size_t line, const Instruction& instr)
 }
 
 // What a warp's global load or store costs, given where its lanes are pointing.
+GlobalAccess WarpScheduler::atomic_access(const Warp& warp, const Instruction& instr)
+{
+    // Every lane pays in full. A load lets 32 lanes share a line and a
+    // transaction; an atomic gives the unit 32 read-modify-writes to perform,
+    // and putting them in one line does not make them one operation.
+    const uint64_t lanes = active_lane_count(warp);
+
+    // How deep the deepest pile of lanes on one address is. That is what the
+    // warp waits for: the collisions are worked through one after another, and
+    // the last lane's answer is only right once every earlier one has landed.
+    std::array<size_t, WARP_SIZE> addresses{};
+    uint32_t n = 0;
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        if (!is_active(warp, lane)) {
+            continue;
+        }
+        addresses[n++] = decode_address(warp.threads[lane].regs[instr.src0] + instr.imm,
+                                        "atomic access");
+    }
+    std::sort(addresses.begin(), addresses.begin() + n);
+
+    uint32_t deepest = 0;
+    uint32_t run = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        run = (i > 0 && addresses[i] == addresses[i - 1]) ? run + 1 : 1;
+        deepest = std::max(deepest, run);
+    }
+
+    // L2 rather than memory: an atomic is performed where the caches meet, which
+    // is also why it does not populate L1 and why no level of the hierarchy is
+    // asked about it here.
+    const uint32_t latency =
+        deepest == 0 ? 0 : L2_HIT_LATENCY + (deepest - 1) * ATOMIC_CONFLICT_LATENCY;
+    return {lanes * instruction_cost(instr.op), latency};
+}
+
 GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& instr)
 {
     // A store is fire-and-forget, so nothing waits on it whatever it cost.
@@ -1106,8 +1160,10 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
                                   issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
                                   issued.op == Opcode::V_ST_GLOBAL_F32 ||
                                   issued.op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32;
-    const GlobalAccess access =
-        addresses_memory ? global_access(warp, issued) : GlobalAccess{};
+    const bool is_atomic = issued.op == Opcode::V_ATOM_ADD_GLOBAL_F32;
+    const GlobalAccess access = addresses_memory ? global_access(warp, issued)
+                                : is_atomic      ? atomic_access(warp, issued)
+                                                 : GlobalAccess{};
 
     // Skipping the masked lanes is what divergence costs: they are paid for by
     // the step and produce nothing. Advancing pc before execute() is what lets a
@@ -1158,7 +1214,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         return true;
     }
 
-    if (addresses_memory) {
+    if (addresses_memory || is_atomic) {
         stats_.weighted_lane_ops += access.cost;
         issued_latency_ = access.latency;
     } else {

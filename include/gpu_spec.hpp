@@ -55,6 +55,17 @@ inline constexpr size_t L2_LINES = 65536;
 inline constexpr uint32_t L1_HIT_COST = 8;
 inline constexpr uint32_t L2_HIT_COST = 30;
 
+// What lanes colliding on one address cost each other.
+//
+// An atomic executes where the caches meet, not in a lane, and two lanes naming
+// the same address cannot be served at once — the unit does them one after
+// another. So a warp-wide atomic to a single counter is 32 operations deep, and
+// to 32 separate counters is one deep.
+//
+// The step is the cost of one more collision, and it is a chosen ratio like the
+// prices around it. Set at an L2 hit, which is where the operation happens.
+inline constexpr uint32_t ATOMIC_CONFLICT_LATENCY = 30;
+
 inline constexpr uint32_t L1_HIT_LATENCY = 30;
 inline constexpr uint32_t L2_HIT_LATENCY = 200;
 inline constexpr uint32_t MEMORY_LATENCY = 400;

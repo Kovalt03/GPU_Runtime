@@ -355,6 +355,13 @@ void IRBuilder::store(Reg<Scalar> address, Reg<Scalar> value, float offset)
     emit(make_v_st_global_f32(address.first(), value.first(), offset));
 }
 
+Reg<Scalar> IRBuilder::atomic_add(Reg<Scalar> address, Reg<Scalar> value, float offset)
+{
+    const Reg<Scalar> old = alloc<Scalar>();
+    emit(make_v_atom_add_global_f32(old.first(), address.first(), value.first(), offset));
+    return old;
+}
+
 void IRBuilder::cp_async(Reg<Scalar> shared_address, Reg<Scalar> global_address,
                          float offset)
 {

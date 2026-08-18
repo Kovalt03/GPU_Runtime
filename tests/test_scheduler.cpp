@@ -2157,3 +2157,96 @@ TEST(Scheduler, AnAsynchronousCopyCostsWhatALoadCostsAndNoStore)
     // The shared store is 8 a lane over 32 lanes; the wait is 1 a lane.
     EXPECT_EQ(weighted(false) - weighted(true), (8 - 1) * WARP_SIZE);
 }
+
+// ---------------------------------------------------------------------------
+// Atomics — the one instruction whose answer depends on what the other lanes
+// are doing at the same instant
+// ---------------------------------------------------------------------------
+
+TEST(Scheduler, EveryLanesAdditionLands)
+{
+    Fixture f;
+    f.poke(0, 0.0f);
+
+    // 32 lanes, each adding one to the same counter.
+    f.run(Program{
+        make_v_mov_f32(1, 0.0f),
+        make_v_mov_f32(2, 1.0f),
+        make_v_atom_add_global_f32(3, 1, 2),
+        make_ret(),
+    });
+
+    EXPECT_FLOAT_EQ(f.peek(0), 32.0f) << "a lost update would leave fewer";
+}
+
+TEST(Scheduler, EachLaneIsHandedADifferentSlot)
+{
+    // What makes an atomic more than a combine, and the whole of how a
+    // compaction pass gives every surviving item somewhere to go.
+    Fixture f;
+    f.poke(0, 0.0f);
+
+    f.run(Program{
+        make_v_mov_f32(1, 0.0f),
+        make_v_mov_f32(2, 1.0f),
+        make_v_atom_add_global_f32(3, 1, 2),
+        make_ret(),
+    });
+
+    std::vector<bool> seen(WARP_SIZE, false);
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        const float slot = f.lane(lane).regs[3];
+        ASSERT_GE(slot, 0.0f);
+        ASSERT_LT(slot, static_cast<float>(WARP_SIZE));
+        const auto index = static_cast<size_t>(slot);
+        EXPECT_FALSE(seen[index]) << "two lanes were handed slot " << index;
+        seen[index] = true;
+    }
+}
+
+TEST(Scheduler, CollidingLanesWaitForEachOtherAndScatteredOnesDoNot)
+{
+    // The measurement the instruction exists to make: an atomic is performed
+    // where the caches meet, and two lanes on one address cannot be served at
+    // once. Thirty-two on one address is thirty-two deep.
+    const auto cycles = [](bool collide) {
+        Fixture f;
+        f.sched.set_latency_model(LatencyModel::Modelled);
+        f.sched.set_memory_model(MemoryModel::Coalesced);
+
+        // Either every lane at byte 0, or each at its own float.
+        Program prog{make_v_mov_f32(1, 4.0f), make_v_mul_f32(2, REG_GLOBAL_ID_X, 1),
+                     make_v_mov_f32(3, 0.0f), make_v_mov_f32(4, 1.0f)};
+        prog.push_back(make_v_atom_add_global_f32(5, collide ? 3 : 2, 4));
+        prog.push_back(make_ret());
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            f.lane(lane).regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+        }
+        f.run(prog);
+        return f.sched.stats().cycles;
+    };
+
+    EXPECT_GT(cycles(true), cycles(false))
+        << "colliding lanes are worked through one at a time";
+}
+
+TEST(Scheduler, CoalescingCannotHelpAnAtomic)
+{
+    // A load of one address by 32 lanes is one transaction. An atomic is 32
+    // operations however they are laid out, and the memory model does not get a
+    // say — which is the arithmetic behind preferring a reduction.
+    const auto weighted = [](MemoryModel model) {
+        Fixture f;
+        f.sched.set_memory_model(model);
+        f.run(Program{
+            make_v_mov_f32(1, 0.0f),
+            make_v_mov_f32(2, 1.0f),
+            make_v_atom_add_global_f32(3, 1, 2),
+            make_ret(),
+        });
+        return f.sched.stats().weighted_lane_ops;
+    };
+
+    EXPECT_EQ(weighted(MemoryModel::Flat), weighted(MemoryModel::Coalesced));
+    EXPECT_EQ(weighted(MemoryModel::Flat), weighted(MemoryModel::Cached));
+}

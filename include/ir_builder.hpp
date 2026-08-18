@@ -222,6 +222,14 @@ public:
     void store(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
     void store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset = 0.0f);
 
+    // Adds to one address indivisibly and hands back what was there before.
+    //
+    // The return is the point as much as the addition: 32 lanes adding one to a
+    // counter get 32 different numbers back, and that is how a compaction pass
+    // hands each surviving item a slot of its own. Lanes naming the same address
+    // are served one at a time, which is what a warp reduction exists to avoid.
+    Reg<Scalar> atomic_add(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
+
     // Global to shared without a register in between, and without waiting.
     //
     // Arguments read as the assignment does — destination, then source — and

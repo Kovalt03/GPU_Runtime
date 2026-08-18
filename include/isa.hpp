@@ -84,6 +84,19 @@ enum class Opcode : uint8_t {
     // charge every access the same way, and it outranks reading order.
     V_CP_ASYNC_SHARED_GLOBAL_F32,  // shared[reg[src1]] = global[reg[src0] + imm]
 
+    // Read, add, write back, indivisibly, and hand the lane what was there
+    // before. The fourth memory verb, and the only one whose answer depends on
+    // what the other lanes are doing at the same instant.
+    //
+    // dst carries the old value because that is what makes it more than a
+    // combine: a lane that gets 7 back from a counter owns slot 7, and nothing
+    // else in this ISA can hand 32 lanes 32 different answers from one address.
+    // Compaction, and so GPU-driven culling, is that idiom.
+    //
+    // Lanes naming the same address serialise, which the memory model charges
+    // for — see atomic_access. It is the reason a warp reduction exists.
+    V_ATOM_ADD_GLOBAL_F32,  // reg[dst] = global[reg[src0]]; global[...] += reg[src1]
+
     // Control flow — warp state only, hence no V_ prefix.
     BRA,      // pc += (int32_t)imm                       (unconditional)
     BRA_DIV,  // if (reg[src0] != 0.0f) pc += (int32_t)imm
@@ -188,6 +201,15 @@ Instruction make_v_ld_global_vec3_f32(uint8_t dst, uint8_t addr_reg, float offse
 Instruction make_v_st_global_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
 Instruction make_v_ld_shared_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
+
+// address, then the value to add. dst takes what was there before.
+//
+// Only add, and only global. min is the other one hardware offers that this
+// machine would have a use for — a depth buffer whose pixels are not owned by
+// one thread each — and the scheme leaves V_ATOM_MIN_GLOBAL_F32 for it rather
+// than being widened now for a scene that does not exist yet.
+Instruction make_v_atom_add_global_f32(uint8_t dst, uint8_t addr_reg, uint8_t src,
+                                       float offset = 0.0f);
 
 // The copy takes two addresses and no value, which is what it is for: the
 // destination is in shared memory, the source in global, and neither passes

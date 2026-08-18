@@ -403,6 +403,12 @@ private:
     // a property of the 32 addresses rather than of the opcode.
     GlobalAccess global_access(const Warp& warp, const Instruction& instr);
 
+    // The same question for an atomic, which answers it differently: lanes
+    // naming one address are served one at a time rather than merged into a
+    // transaction. Coalescing helps a load and cannot help this, so the memory
+    // model is not consulted — what decides the cost is how many lanes collide.
+    GlobalAccess atomic_access(const Warp& warp, const Instruction& instr);
+
     // What one line came to, given where it was found. Mutable because a lookup
     // changes what is resident.
     GlobalAccess cache_lookup(size_t line, const Instruction& instr);

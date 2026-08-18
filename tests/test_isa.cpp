@@ -75,10 +75,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 33 opcodes, 0-indexed → RET == 32
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 32);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 31);
-    EXPECT_EQ(OPCODE_COUNT, 33);
+    // 34 opcodes, 0-indexed → RET == 33
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 33);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 32);
+    EXPECT_EQ(OPCODE_COUNT, 34);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -89,7 +89,7 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 23);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 24);
 }
 
 // ---------------------------------------------------------------------------
@@ -160,12 +160,13 @@ TEST(Isa, MemoryOpcodesCarryAddressSpace)
 
     for (const Opcode op : mem_ops) {
         const std::string_view name = opcode_name(op);
-        // Three verbs, not two. A copy moves bytes between two spaces without a
-        // register at either end, so V_LD_ and V_ST_ cannot name it — and both
-        // spaces appear, destination first as in PTX's cp.async.shared.global.
+        // Four verbs. A copy moves bytes between two spaces without a register
+        // at either end, so V_LD_ and V_ST_ cannot name it — and both spaces
+        // appear, destination first as in PTX's cp.async.shared.global. An
+        // atomic reads and writes one address indivisibly and is neither.
         EXPECT_TRUE(starts_with(name, "V_LD_") || starts_with(name, "V_ST_") ||
-                    starts_with(name, "V_CP_"))
-            << name << ": memory opcode must start with V_LD_, V_ST_ or V_CP_";
+                    starts_with(name, "V_CP_") || starts_with(name, "V_ATOM_"))
+            << name << ": memory opcode must start with V_LD_, V_ST_, V_CP_ or V_ATOM_";
         EXPECT_TRUE(has_space_token(name))
             << name << ": memory opcode must name its address space";
     }
