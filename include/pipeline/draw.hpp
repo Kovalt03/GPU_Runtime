@@ -233,6 +233,26 @@ void release(MyGPURuntime& rt, DeviceFrame& frame);
 // Diffuse is the walk's alone. The tiled pair read their triangles from tile
 // lists that carry screen positions only, and would need those lists to grow by
 // a world position a vertex and a normal a triangle; they refuse it instead.
+// Fills the frame's colour and depth, which is what a frame needs before
+// anything can be drawn into it rather than over it.
+//
+// Every mode but DepthUse::Test starts a pixel empty and ends by overwriting it,
+// so none of them ever needed this — a thread owned its pixel outright and the
+// frame's previous contents were nobody's business. A depth-tested draw reads
+// what is there, and what is there has to have been put there.
+//
+// depth defaults beyond the far plane, so the first covering triangle wins.
+void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                 Float3 colour = Float3{0.0f, 0.0f, 0.0f}, float depth = 2.0f);
+
+// A draw that lands in the frame rather than over it: the depth buffer decides,
+// and a pixel this draw does not cover keeps what the last one left.
+//
+// clear_frame first, or the frame starts from whatever the allocation held.
+std::vector<Float3> draw_depth_tested(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                      const DeviceFrame& frame, const DrawTarget& target,
+                                      const Shading& shading = Shading{});
+
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
                               const DeviceFrame& frame, const DrawTarget& target,
                               bool predicated = false,

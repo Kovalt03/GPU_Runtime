@@ -3,6 +3,7 @@
 #include <utility>
 #include <vector>
 
+#include "ir_builder.hpp"
 #include "math3d.hpp"
 #include "pipeline/draw.hpp"
 #include "pipeline/raster.hpp"
@@ -318,6 +319,85 @@ void release(MyGPURuntime& rt, DeviceFrame& frame)
 }
 
 // --- the routes over what is already there -----------------------------------
+
+void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                 Float3 colour, float depth)
+{
+    // One thread a pixel, four stores each. A kernel rather than a memcpy from
+    // the host because a frame that has to be cleared every frame is device work
+    // — and because the depth and the colour are two buffers, so a host clear
+    // would be two transfers of the thing the device is about to overwrite.
+    struct ClearArgs {
+        size_t framebuffer_offset = 0;
+        size_t depth_offset = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        Float3 colour;
+        float depth = 2.0f;
+    };
+    ClearArgs args;
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.depth_offset = rt.myrt_device_offset(frame.depth);
+    args.width = target.width;
+    args.height = target.height;
+    args.colour = colour;
+    args.depth = depth;
+
+    const auto build = [](void** raw) {
+        const ClearArgs& a = *static_cast<const ClearArgs*>(raw[0]);
+        IRBuilder k;
+        const Reg<Scalar> px = k.thread_x();
+        const Reg<Scalar> py = k.thread_y();
+        k.if_(k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+                    k.lt(py, k.constant(static_cast<float>(a.height)))),
+              [&] {
+                  const Reg<Scalar> pixel =
+                      k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
+                  const Reg<Scalar> at =
+                      k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
+                  const float base = static_cast<float>(a.framebuffer_offset);
+                  k.store(at, k.constant(a.colour.x), base + 0.0f);
+                  k.store(at, k.constant(a.colour.y), base + 4.0f);
+                  k.store(at, k.constant(a.colour.z), base + 8.0f);
+
+                  const Reg<Scalar> depth_at =
+                      k.add(k.constant(static_cast<float>(a.depth_offset)),
+                            k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
+                  k.store(depth_at, k.constant(a.depth), 0.0f);
+              });
+        return k.build();
+    };
+
+    const dim3 block{WARP_SIZE, 1, 1};
+    const dim3 grid{(target.width + WARP_SIZE - 1) / WARP_SIZE, target.height, 1};
+    void* raw[] = {&args};
+    rt.myrt_launch(build, grid, block, raw);
+    rt.myrt_sync(false);
+}
+
+std::vector<Float3> draw_depth_tested(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                      const DeviceFrame& frame, const DrawTarget& target,
+                                      const Shading& shading)
+{
+    run_pass_one(rt, geometry, target);
+
+    RasterStageArgs args;
+    args.screen_offset = rt.myrt_device_offset(geometry.screen);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = geometry.triangle_count;
+    args.indexed = geometry.indexed();
+    args.index_offset = geometry.indexed() ? rt.myrt_device_offset(geometry.index) : 0;
+    args.shading = shading;
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.normal_offset =
+        geometry.normals != nullptr ? rt.myrt_device_offset(geometry.normals) : 0;
+    args.depth = DepthUse::Test;
+    args.depth_offset = rt.myrt_device_offset(frame.depth);
+    run_raster_stage(rt, args);
+    return download(rt, frame);
+}
 
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
                               const DeviceFrame& frame, const DrawTarget& target,

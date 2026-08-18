@@ -2079,3 +2079,110 @@ TEST(Pipeline, AUniformIsChargedOnceForTheWarpRatherThanOncePerLane)
                   WARP_SIZE * instruction_cost(Opcode::RET))
         << "a broadcast is one access, not 32";
 }
+
+// ---------------------------------------------------------------------------
+// Accumulation — a draw that lands in a frame rather than over it
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A triangle at a chosen depth, big enough to cover part of a small frame.
+std::vector<Float3> triangle_at(float z, float shift)
+{
+    return {Float3{-0.6f + shift, -0.4f, z}, Float3{0.6f + shift, -0.4f, z},
+            Float3{0.0f + shift, 0.6f, z}};
+}
+
+}  // namespace
+
+TEST(Pipeline, AClearedFrameHoldsWhatItWasClearedTo)
+{
+    const DrawTarget target = default_target(16, 8);
+    MyGPURuntime rt(1u << 22);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    clear_frame(rt, frame, target, Float3{0.25f, 0.5f, 0.75f}, 1.0f);
+    const std::vector<Float3> pixels = read_back(rt, frame);
+
+    ASSERT_EQ(pixels.size(), static_cast<size_t>(target.width) * target.height);
+    for (size_t i = 0; i < pixels.size(); ++i) {
+        EXPECT_FLOAT_EQ(pixels[i].x, 0.25f) << "pixel " << i;
+        EXPECT_FLOAT_EQ(pixels[i].y, 0.5f) << "pixel " << i;
+        EXPECT_FLOAT_EQ(pixels[i].z, 0.75f) << "pixel " << i;
+    }
+    release(rt, frame);
+}
+
+TEST(Pipeline, TwoDepthTestedDrawsMakeTheFrameOneDrawWouldHave)
+{
+    // The whole of what accumulation means. Two triangles at different depths,
+    // drawn one after the other into a cleared frame, against a single draw of
+    // both — pixel for pixel, including where they overlap.
+    const std::vector<Float3> near_triangle = triangle_at(0.5f, 0.0f);
+    const std::vector<Float3> far_triangle = triangle_at(2.0f, 0.3f);
+    std::vector<Float3> both = near_triangle;
+    both.insert(both.end(), far_triangle.begin(), far_triangle.end());
+
+    const DrawTarget target = default_target(16, 8);
+
+    MyGPURuntime stacked_rt(1u << 22);
+    DeviceGeometry first = upload(stacked_rt, near_triangle);
+    DeviceGeometry second = upload(stacked_rt, far_triangle);
+    DeviceFrame frame = allocate_frame(stacked_rt, target);
+    clear_frame(stacked_rt, frame, target);
+    draw_depth_tested(stacked_rt, first, frame, target);
+    const std::vector<Float3> stacked =
+        draw_depth_tested(stacked_rt, second, frame, target);
+
+    MyGPURuntime once_rt(1u << 22);
+    DeviceGeometry all = upload(once_rt, both);
+    DeviceFrame once_frame = allocate_frame(once_rt, target);
+    const std::vector<Float3> once = draw_walk(once_rt, all, once_frame, target);
+
+    ASSERT_EQ(stacked.size(), once.size());
+    uint32_t lit = 0;
+    for (size_t i = 0; i < once.size(); ++i) {
+        EXPECT_FLOAT_EQ(stacked[i].x, once[i].x) << "pixel " << i;
+        EXPECT_FLOAT_EQ(stacked[i].y, once[i].y) << "pixel " << i;
+        EXPECT_FLOAT_EQ(stacked[i].z, once[i].z) << "pixel " << i;
+        if (once[i].x + once[i].y + once[i].z > 0.0f) {
+            ++lit;
+        }
+    }
+    EXPECT_GT(lit, 0u) << "two blank frames agree about nothing";
+
+    release(stacked_rt, frame);
+    release(stacked_rt, second);
+    release(stacked_rt, first);
+    release(once_rt, once_frame);
+    release(once_rt, all);
+}
+
+TEST(Pipeline, ADrawLeavesThePixelsItDoesNotCover)
+{
+    // The other half of accumulating: a pixel this draw misses keeps what the
+    // last one left, which is what makes the store at the end safe to make
+    // unconditional.
+    const DrawTarget target = default_target(16, 8);
+    MyGPURuntime rt(1u << 22);
+    DeviceGeometry triangle = upload(rt, triangle_at(0.5f, 0.0f));
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    clear_frame(rt, frame, target, Float3{0.1f, 0.2f, 0.3f}, 2.0f);
+    const std::vector<Float3> drawn = draw_depth_tested(rt, triangle, frame, target);
+
+    uint32_t kept = 0;
+    uint32_t covered = 0;
+    for (const Float3& pixel : drawn) {
+        if (pixel.x == 0.1f && pixel.y == 0.2f && pixel.z == 0.3f) {
+            ++kept;
+        } else {
+            ++covered;
+        }
+    }
+    EXPECT_GT(kept, 0u) << "the clear colour is gone from every pixel";
+    EXPECT_GT(covered, 0u) << "the triangle drew nothing";
+
+    release(rt, frame);
+    release(rt, triangle);
+}

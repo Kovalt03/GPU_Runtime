@@ -65,7 +65,10 @@ Program build_raster_program(void** args)
         // owns one pixel outright, so nothing is shared and no atomic is needed.
         // A thread per triangle would have required both.
         //
-        // Started beyond the far plane so the first covering triangle takes it.
+        // Started beyond the far plane so the first covering triangle takes it —
+        // except under Test, where it starts from the buffer and the first
+        // covering triangle has to beat what is already drawn. That is set below,
+        // once the depth address exists.
         const Reg<Scalar> best_z = k.constant(2.0f);
 
         // The pixel this thread owns, which both buffers are addressed by. Costs
@@ -90,10 +93,35 @@ Program build_raster_program(void** args)
             visible_z =
                 a.depth == DepthUse::EarlyZ ? k.load(depth_addr) : k.constant(2.0f);
         }
+
+        // Where the pixel starts. Every mode but Test starts it empty, because a
+        // thread owns its pixel outright and whatever was there is its own from
+        // an earlier frame.
+        //
+        // Test starts from the buffer: the depth so that a triangle behind what
+        // is already drawn loses, and the colour so that the store at the end can
+        // be unconditional. Reading the colour back costs three loads a pixel and
+        // buys a walk with no branch around its store — the alternative is a
+        // conditional write, which is a branch on a value every lane computed
+        // differently.
+        const Reg<Scalar> colour_addr =
+            k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
+        const float frame_base = static_cast<float>(a.framebuffer_offset);
+
+        if (a.depth == DepthUse::Test) {
+            k.load_into(best_z, depth_addr, 0.0f);
+        }
+
         const Reg<Vec3> best = k.vec3();
-        k.set(best.component(0), 0.0f);
-        k.set(best.component(1), 0.0f);
-        k.set(best.component(2), 0.0f);
+        if (a.depth == DepthUse::Test) {
+            k.load_into(best.component(0), colour_addr, frame_base + 0.0f);
+            k.load_into(best.component(1), colour_addr, frame_base + 4.0f);
+            k.load_into(best.component(2), colour_addr, frame_base + 8.0f);
+        } else {
+            k.set(best.component(0), 0.0f);
+            k.set(best.component(1), 0.0f);
+            k.set(best.component(2), 0.0f);
+        }
 
         // The cursor walks the buffer, the counter ends the loop. Both advance
         // through fma, the only opcode that accumulates in place.
@@ -327,13 +355,16 @@ Program build_raster_program(void** args)
         if (a.depth == DepthUse::Prepass) {
             k.store(depth_addr, best_z, 0.0f);
         } else {
-            const Reg<Scalar> addr =
-                k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
+            k.store(colour_addr, best.component(0), frame_base + 0.0f);
+            k.store(colour_addr, best.component(1), frame_base + 4.0f);
+            k.store(colour_addr, best.component(2), frame_base + 8.0f);
 
-            const float frame_base = static_cast<float>(a.framebuffer_offset);
-            k.store(addr, best.component(0), frame_base + 0.0f);
-            k.store(addr, best.component(1), frame_base + 4.0f);
-            k.store(addr, best.component(2), frame_base + 8.0f);
+            // And the depth, so that the draw after this one can lose to it.
+            // Written unconditionally like the colour: best_z is what the buffer
+            // held if nothing here won.
+            if (a.depth == DepthUse::Test) {
+                k.store(depth_addr, best_z, 0.0f);
+            }
         }
     });
 

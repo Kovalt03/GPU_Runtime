@@ -110,6 +110,14 @@ enum class DepthUse {
 
     // Read it, and shade only the triangle that owns the pixel.
     EarlyZ,
+
+    // Start from what the buffer holds and write back what wins, colour and
+    // depth together. The standard depth-tested draw, and the only mode where a
+    // second draw can land in a frame the first one already wrote.
+    //
+    // A thread no longer owns its pixel outright, which is the whole difference:
+    // the three modes above start from an empty pixel and this one does not.
+    Test,
 };
 
 // One float a pixel. Separate from the colour buffer rather than a fourth
