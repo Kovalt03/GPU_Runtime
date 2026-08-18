@@ -533,13 +533,12 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**Narrow types.** The tiled matrix multiply is here, and the three instructions
-built for it come to 11.6x end to end: 78% off the cycles for the matrix unit, 33%
-for staging a tile ahead, 42% for loading a fragment in one instruction rather
-than eight. What is still missing is the other half of what a tensor core is —
-`f16` and `bf16` inputs, where much of hardware's advantage lives. Every type
-token in this ISA reads `F32`, and the scheme has left the others empty since the
-first commit.
+**Bandwidth.** Named first above and still the largest gap: transactions are
+counted, never queued, so nothing here saturates. Everything the matrix multiply
+measures — 13.1x end to end from four instructions — is issue capacity and
+latency against a memory system with no ceiling. A kernel that would be bandwidth
+bound on hardware is not bandwidth bound here, and no figure in this repository
+would notice.
 
 ---
 

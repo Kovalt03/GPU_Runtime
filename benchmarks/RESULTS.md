@@ -978,17 +978,18 @@ cmake --build build -j8
 C[64x256] = A × B, a block of four warps holding a 16×64 strip of C in registers
 for the whole K loop, staging one A tile and four B tiles a step. Cycles.
 
-| K | fma, sync | mma, sync | change | mma, staged ahead | change | + wide fragments | change |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 32 | 202,556 | 44,220 | **-78.2%** | 33,056 | **-25.2%** | 20,256 | **-38.7%** |
-| 64 | 401,734 | 85,062 | **-78.8%** | 62,340 | **-26.7%** | 36,746 | **-41.1%** |
-| 128 | 812,660 | 179,316 | **-77.9%** | 120,977 | **-32.5%** | 69,809 | **-42.3%** |
+| K | fma, sync | mma, sync | change | mma, staged ahead | change | + wide fragments | change | + halves | change |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 202,928 | 44,592 | **-78.0%** | 33,418 | **-25.1%** | 20,618 | **-38.3%** | 18,579 | -9.9% |
+| 64 | 402,478 | 85,806 | **-78.7%** | 63,070 | **-26.5%** | 37,470 | **-40.6%** | 33,171 | -11.5% |
+| 128 | 814,196 | 180,852 | **-77.8%** | 122,425 | **-32.3%** | 71,225 | **-41.8%** | 62,355 | **-12.5%** |
 
-Issued work at K = 128: 27,145,216, then 5,960,704, then 4,762,624 — and 4,762,624
-again. **The last two are equal to the lane-op**, which is the whole of what the
-fragment load is: eight floats are eight floats however they are asked for.
+Issued work at K = 128: 27,194,368, then 6,009,856, then 4,811,776 — and 4,811,776
+again, then 3,096,064. **The middle three are the same kernel**: a fragment is
+eight floats however it is asked for, and what the wide load removes is the seven
+waits. The last is four floats and a multiply priced at half.
 
-End to end, the last column is 11.6x the first.
+End to end, the last column is 13.1x the first.
 
 **cp.async is worth 33% here and was worth 1.8% in the renderer.** Same
 instruction, same double buffering, same scheduler. What changed is the ratio the
@@ -1023,6 +1024,29 @@ eight round trips to shared memory are eight waits with nothing between them; on
 is one. That is 42% of the cycles at K = 128, with the issued work identical to
 the lane-op — the sharpest separation in this file between what a kernel costs
 and how long it takes.
+
+### And the half that was left
+
+`V_MMA_16X16X16_F16` takes the same tile with half-precision operands and keeps
+the accumulator in single, which is the arrangement every tensor core makes: the
+width is saved where the inputs are and kept where the sum is. Two operand
+registers do the work of four, a tile in memory is half the bytes, and the
+multiply is priced at half.
+
+It is worth another 12.5%, and 36% of the issued work. Less than the price
+suggests, because by now the multiply is not what the loop is spending on — the
+same reason the matrix unit itself came in under its own instruction count.
+
+**And the answer changes.** The half route computes the rounded product *exactly*:
+element for element, it equals what the host reference gives when its inputs are
+converted first. The test states that as an equality rather than a tolerance, and
+then checks that the two references differ at all — with operands that are
+representable in half, the whole thing would pass while measuring nothing.
+
+Nothing on the device converts. A kernel multiplying halves reads them already
+packed, as it does on hardware, so `f32_to_f16` lives on the host and there is no
+`V_CVT` in this ISA. The type token was reserved in the first commit and this is
+what filled it.
 
 ### What the shape of the kernel had to work around
 
