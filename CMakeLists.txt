@@ -41,6 +41,7 @@ add_library(gpurt STATIC
     src/mesh.cpp
     src/app_run.cpp
     src/pipeline/vertex.cpp
+    src/pipeline/clip.cpp
     src/pipeline/draw.cpp
     src/pipeline/raster.cpp
     src/pipeline/raster_tiled.cpp

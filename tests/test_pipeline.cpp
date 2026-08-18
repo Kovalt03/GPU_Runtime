@@ -7,6 +7,7 @@
 
 #include "math3d.hpp"
 #include "mesh.hpp"
+#include "pipeline/clip.hpp"
 #include "pipeline/draw.hpp"
 #include "pipeline/raster.hpp"
 #include "pipeline/raster_tiled.hpp"
@@ -2185,4 +2186,134 @@ TEST(Pipeline, ADrawLeavesThePixelsItDoesNotCover)
 
     release(rt, frame);
     release(rt, triangle);
+}
+
+// ---------------------------------------------------------------------------
+// Clipping — the pass that runs before anything is projected
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct ClipRun {
+    uint32_t out_count = 0;
+    std::vector<Float3> triangles;
+};
+
+// Clips a triangle list against a camera's near plane and reads back what
+// survived. The counter starts at zero, as the stage requires.
+ClipRun clip(const std::vector<Float3>& world, const Camera& camera)
+{
+    MyGPURuntime rt(1u << 22);
+    const auto count = static_cast<uint32_t>(world.size() / 3);
+
+    void* in = rt.myrt_malloc(world.size() * sizeof(Float3));
+    void* out = rt.myrt_malloc(world.size() * CLIP_WORST_CASE * sizeof(Float3));
+    void* counter = rt.myrt_malloc(sizeof(float));
+    void* plane = rt.myrt_malloc(4 * sizeof(float));
+
+    rt.myrt_memcpy(in, world.data(), world.size() * sizeof(Float3),
+                   Direction::HostToDevice);
+    const float zero = 0.0f;
+    rt.myrt_memcpy(counter, &zero, sizeof(float), Direction::HostToDevice);
+    const Float4 near = near_plane_of(camera);
+    rt.myrt_memcpy(plane, &near, 4 * sizeof(float), Direction::HostToDevice);
+
+    ClipStageArgs args;
+    args.world_offset = rt.myrt_device_offset(in);
+    args.output_offset = rt.myrt_device_offset(out);
+    args.counter_offset = rt.myrt_device_offset(counter);
+    args.plane_offset = rt.myrt_device_offset(plane);
+    args.triangle_count = count;
+    run_clip_stage(rt, args);
+
+    ClipRun run;
+    float survivors = 0.0f;
+    rt.myrt_memcpy(&survivors, counter, sizeof(float), Direction::DeviceToHost);
+    run.out_count = static_cast<uint32_t>(survivors);
+    run.triangles.resize(static_cast<size_t>(run.out_count) * 3);
+    if (!run.triangles.empty()) {
+        rt.myrt_memcpy(run.triangles.data(), out, run.triangles.size() * sizeof(Float3),
+                       Direction::DeviceToHost);
+    }
+    return run;
+}
+
+Camera looking_down_negative_z()
+{
+    Camera camera;
+    camera.eye = Float3{0.0f, 0.0f, 0.0f};
+    camera.target = Float3{0.0f, 0.0f, -1.0f};
+    camera.near_z = 0.1f;
+    return camera;
+}
+
+}  // namespace
+
+TEST(Pipeline, ClippingKeepsWhatIsInFrontAndDropsWhatIsBehind)
+{
+    const Camera camera = looking_down_negative_z();
+    const std::vector<Float3> world{
+        // In front of the near plane.
+        {-1, -1, -2},
+        {1, -1, -2},
+        {0, 1, -2},
+        // Behind the eye entirely.
+        {-1, -1, 1},
+        {1, -1, 1},
+        {0, 1, 1},
+    };
+
+    const ClipRun run = clip(world, camera);
+    ASSERT_EQ(run.out_count, 1u) << "one in front, one behind";
+    for (uint32_t i = 0; i < 3; ++i) {
+        EXPECT_FLOAT_EQ(run.triangles[i].z, world[i].z) << "the survivor was altered";
+    }
+}
+
+TEST(Pipeline, ATriangleCrossingThePlaneComesBackSplitAtIt)
+{
+    const Camera camera = looking_down_negative_z();
+
+    // Two vertices in front, one behind: the quadrilateral that is left becomes
+    // two triangles.
+    const std::vector<Float3> two_in{{-1, -1, -2}, {0, 1, -2}, {1, -1, 1}};
+    const ClipRun pair = clip(two_in, camera);
+    EXPECT_EQ(pair.out_count, 2u);
+
+    // One in front, two behind: one triangle.
+    const std::vector<Float3> one_in{{0, 1, -2}, {-1, -1, 1}, {1, -1, 1}};
+    const ClipRun single = clip(one_in, camera);
+    EXPECT_EQ(single.out_count, 1u);
+
+    // Every vertex that is not one of the originals sits on the plane, and
+    // nothing at all sits behind it. That is what clipping means, and it is
+    // checked rather than the coordinates, which depend on which edge crossed.
+    for (const ClipRun* run : {&pair, &single}) {
+        for (const Float3& vertex : run->triangles) {
+            EXPECT_LE(vertex.z, -camera.near_z + 1e-5f)
+                << "a vertex came back in front of the eye";
+        }
+    }
+}
+
+TEST(Pipeline, TheSurvivorsAreCompactedRatherThanScattered)
+{
+    // The atomic hands out slots, so the output has no holes: a reader takes the
+    // count and walks that many. Alternating triangles, so a stage that wrote in
+    // place would leave every other slot untouched.
+    const Camera camera = looking_down_negative_z();
+    std::vector<Float3> world;
+    for (uint32_t i = 0; i < 8; ++i) {
+        const float z = (i % 2 == 0) ? -2.0f : 1.0f;
+        world.push_back(Float3{-1, -1, z});
+        world.push_back(Float3{1, -1, z});
+        world.push_back(Float3{0, 1, z});
+    }
+
+    const ClipRun run = clip(world, camera);
+    ASSERT_EQ(run.out_count, 4u) << "half of them are behind the eye";
+    for (const Float3& vertex : run.triangles) {
+        EXPECT_FLOAT_EQ(vertex.z, -2.0f)
+            << "a slot nobody wrote came back among the survivors";
+    }
 }
