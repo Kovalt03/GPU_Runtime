@@ -87,3 +87,15 @@ std::string timestamped_run_dir()
     std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H%M%S", &local);
     return std::string("benchmarks/result/") + stamp;
 }
+
+std::string Args::text_flag(const std::string& name, const std::string& fallback) const
+{
+    const auto found = flags.find(name);
+    return found == flags.end() ? fallback : found->second;
+}
+
+GPUSpec machine_from(const Args& args)
+{
+    const std::string path = args.text_flag("machine", "");
+    return path.empty() ? GPUSpec{} : load_spec(path);
+}

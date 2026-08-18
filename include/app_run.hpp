@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "gpu_spec.hpp"
+
 // Shared by the executables, not by the library: where a run puts its files and
 // how long the run took. Nothing here touches the simulated device.
 
@@ -29,9 +31,18 @@ struct Args {
     uint32_t number(size_t index, uint32_t fallback) const;
     std::string text(size_t index, const std::string& fallback) const;
     uint32_t flag(const std::string& name, uint32_t fallback) const;
+    std::string text_flag(const std::string& name, const std::string& fallback) const;
 };
 
 Args parse_args(int argc, char** argv);
+
+// The machine a run was asked for: --machine <path>, or the defaults when no
+// path was given. Every benchmark takes it, and every benchmark prints what it
+// got — a table whose machine is not stated beside it cannot be reproduced.
+//
+// Throws std::runtime_error if the file names a field that does not exist or one
+// that is fixed rather than configured.
+GPUSpec machine_from(const Args& args);
 
 // A directory named for the moment it was made:
 // benchmarks/result/YYYY-MM-DD_HHMMSS.

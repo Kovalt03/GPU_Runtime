@@ -56,9 +56,11 @@ struct Reading {
 using Route = std::function<std::vector<Float3>(MyGPURuntime&, const std::vector<Float3>&,
                                                 const DrawTarget&)>;
 
-Reading measure(const Route& route, const std::vector<Float3>& world)
+Reading measure(const Route& route, const std::vector<Float3>& world,
+                const GPUSpec& machine)
 {
     MyGPURuntime rt(1u << 26);
+    rt.myrt_set_spec(machine);
     Reading r;
     try {
         route(rt, world, target());
@@ -114,6 +116,12 @@ int main(int argc, char** argv)
     const Args args = parse_args(argc, argv);
     const std::string prefix = args.out_dir + "render_bench";
 
+    // --machine machines/a100.spec, or the defaults. Written into the run
+    // directory beside the tables, so a result carries the machine that made it.
+    const GPUSpec machine = machine_from(args);
+    std::ofstream machine_file(args.out_dir + "machine.spec");
+    machine_file << machine.to_text();
+
     const std::vector<std::pair<std::string, std::vector<Float3>>> scenes = {
         {"small, spread over the frame", spread(2)},
         {"small, spread over the frame", spread(4)},
@@ -136,23 +144,28 @@ int main(int argc, char** argv)
         Row r;
         r.scene = name;
         r.triangles = static_cast<uint32_t>(world.size() / 3);
-        r.walk = measure(route(draw_walk, false), world);
-        r.tiled = measure(route(draw_tiled, false), world);
-        r.shared = measure(route(draw_shared, false), world);
+        r.walk = measure(route(draw_walk, false), world, machine);
+        r.tiled = measure(route(draw_tiled, false), world, machine);
+        r.shared = measure(route(draw_shared, false), world, machine);
         r.ray = measure([](MyGPURuntime& rt, const std::vector<Float3>& w,
                            const DrawTarget& t) { return draw_raytrace(rt, w, t); },
-                        world);
-        r.walk_pred = measure(route(draw_walk, true), world);
-        r.tiled_pred = measure(route(draw_tiled, true), world);
+                        world, machine);
+        r.walk_pred = measure(route(draw_walk, true), world, machine);
+        r.tiled_pred = measure(route(draw_tiled, true), world, machine);
         r.ray_pred = measure(
             [](MyGPURuntime& rt, const std::vector<Float3>& w, const DrawTarget& t) {
                 return draw_raytrace(rt, w, t, Shading{}, true);
             },
-            world);
+            world, machine);
         rows.push_back(r);
     }
 
     std::printf("\n[BENCH] four routes to one frame — %ux%u\n\n", WIDTH, HEIGHT);
+
+    // Which machine, stated where the numbers are. The scenes were committed to
+    // code for the same reason: a figure nobody can reproduce is a figure nobody
+    // can check — and machines/ holds the files this flag takes.
+    std::printf("%s\n", machine.describe().c_str());
     std::printf("  %-30s %5s %13s %13s %9s %13s %9s %13s %9s\n", "scene", "tris", "walk",
                 "tiled", "vs walk", "shared", "vs walk", "raytrace", "vs walk");
     for (const Row& r : rows) {

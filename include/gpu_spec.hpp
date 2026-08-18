@@ -96,8 +96,29 @@ struct GPUSpec {
     // the configured ones so that a reader can see which is which.
     std::string describe() const;
 
+    // The knobs alone, as `name = value` lines that parse_spec reads back. Kept
+    // apart from describe() because a machine file may only hold what a machine
+    // file can change: WARP_SIZE and the register count size a std::array, and a
+    // file that appeared to set them would be lying.
+    std::string to_text() const;
+
     // How many blocks fit on one SM, for a kernel with this many warps a block
     // and this much declared shared memory. The arithmetic an occupancy table is
     // made of, so that a benchmark need not rediscover it.
     uint32_t residency(uint32_t warps_per_block, size_t shared_bytes) const;
 };
+
+// A machine from `name = value` lines. Blank lines and `#` comments are skipped,
+// spaces around the `=` are not required, and the order of the fields does not
+// matter.
+//
+// An unknown name is an error rather than a warning, and so is one of the fixed
+// constants: a run configured from a file nobody checked is worth less than a run
+// that refused to start. The message names the field.
+//
+// Throws std::runtime_error on a name it does not know, a value it cannot read,
+// or a line with no `=` in it.
+GPUSpec parse_spec(const std::string& text);
+
+// The same, from a file. Throws if it cannot be opened.
+GPUSpec load_spec(const std::string& path);

@@ -51,6 +51,12 @@
 
 namespace {
 
+// The machine this run was asked for, set in main before anything measures.
+// A file-scope value rather than an argument threaded through every helper:
+// it is a property of the run, and a helper that could be handed a different
+// one would let two rows of one table come from two machines.
+GPUSpec MACHINE;
+
 constexpr uint32_t WIDTH = 64;
 constexpr uint32_t HEIGHT = 32;
 
@@ -125,6 +131,7 @@ Reading measure(Route route, const std::vector<Float3>& world, MemoryModel model
     // between two unrelated ones.
     MyGPURuntime rt(1u << 29);
     rt.myrt_set_memory_model(model);
+    rt.myrt_set_spec(MACHINE);
     if (scaled) {
         rt.myrt_set_cache_lines(SCALED_L1, SCALED_L2);
     }
@@ -166,6 +173,7 @@ Reading measure_mesh(const Mesh& mesh, size_t l1_lines, bool tiled = false)
     MyGPURuntime rt(1u << 29);
     rt.myrt_set_memory_model(MemoryModel::Cached);
     rt.myrt_set_latency_model(LatencyModel::Modelled);
+    rt.myrt_set_spec(MACHINE);
     rt.myrt_set_cache_lines(l1_lines, SCALED_L2);
 
     if (tiled) {
@@ -230,6 +238,13 @@ int main(int argc, char** argv)
 {
     const Args args = parse_args(argc, argv);
     const std::string prefix = args.out_dir + "cache";
+
+    // --machine machines/a100.spec, or the defaults. Written beside the tables so
+    // that a result carries the machine that made it.
+    MACHINE = machine_from(args);
+    std::ofstream machine_file(args.out_dir + "machine.spec");
+    machine_file << MACHINE.to_text();
+    std::printf("%s\n", MACHINE.describe().c_str());
 
     const std::pair<const char*, Route> routes[] = {
         {"walk", draw_walk}, {"tiled", draw_tiled}, {"shared", draw_shared}};
@@ -403,6 +418,7 @@ int main(int argc, char** argv)
         MyGPURuntime rt(1u << 29);
         rt.myrt_set_memory_model(MemoryModel::Cached);
         rt.myrt_set_latency_model(LatencyModel::Modelled);
+        rt.myrt_set_spec(MACHINE);
         if (scaled) {
             rt.myrt_set_cache_lines(SCALED_L1, SCALED_L2);
         }

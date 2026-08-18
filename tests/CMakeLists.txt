@@ -26,7 +26,8 @@ function(add_layer_test name)
     # assets/ is found by an absolute path baked in at configure time: ctest
     # runs the binaries from the build tree, where a relative one would miss.
     target_compile_definitions(${name} PRIVATE
-        GPURT_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets")
+        GPURT_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets"
+        GPURT_MACHINES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../machines")
     gtest_discover_tests(${name})
 endfunction()
 

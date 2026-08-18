@@ -98,6 +98,80 @@ TEST(Runtime, EachThreadSeesItsOwnGlobalIndex)
     rt.myrt_free(out);
 }
 
+TEST(Runtime, AMachineSpecRoundTrips)
+{
+    // A run writes its machine beside its tables, and a later run reads it back
+    // to reproduce them. That only means anything if the two agree exactly.
+    GPUSpec spec;
+    spec.sms.sm_count = 108;
+    spec.sms.blocks_per_sm = 32;
+    spec.sms.warp_slots_per_sm = 48;
+    spec.sms.shared_bytes_per_sm = 167936;
+    spec.l1_lines = 512;
+    spec.l2_lines = 327680;
+
+    const GPUSpec back = parse_spec(spec.to_text());
+    EXPECT_EQ(back.sms.sm_count, spec.sms.sm_count);
+    EXPECT_EQ(back.sms.blocks_per_sm, spec.sms.blocks_per_sm);
+    EXPECT_EQ(back.sms.warp_slots_per_sm, spec.sms.warp_slots_per_sm);
+    EXPECT_EQ(back.sms.shared_bytes_per_sm, spec.sms.shared_bytes_per_sm);
+    EXPECT_EQ(back.l1_lines, spec.l1_lines);
+    EXPECT_EQ(back.l2_lines, spec.l2_lines);
+}
+
+TEST(Runtime, AMachineSpecReadsWhatAPersonWouldWrite)
+{
+    // Comments, blank lines, ragged spacing, any order. A file people are meant
+    // to keep in the repository has to tolerate being written by hand.
+    const GPUSpec spec = parse_spec(R"(
+# Ampere-ish
+l2_lines = 327680
+
+  sm_count=108      # inline comment
+blocks_per_sm       =   32
+)");
+    EXPECT_EQ(spec.sms.sm_count, 108u);
+    EXPECT_EQ(spec.sms.blocks_per_sm, 32u);
+    EXPECT_EQ(spec.l2_lines, 327680u);
+
+    // Anything the file did not mention keeps the default rather than becoming
+    // zero, which is what makes a two-line file a legitimate machine.
+    EXPECT_EQ(spec.sms.warp_slots_per_sm, SMConfig{}.warp_slots_per_sm);
+    EXPECT_EQ(spec.l1_lines, L1_LINES);
+}
+
+TEST(Runtime, AMachineSpecRefusesWhatItCannotChange)
+{
+    // A field that does not exist is a typo, and a fixed one is a
+    // misunderstanding worth correcting: WARP_SIZE sizes an array, so a file
+    // that appeared to set it would be describing a machine nobody ran.
+    EXPECT_THROW(parse_spec("sm_kount = 4"), std::runtime_error);
+    EXPECT_THROW(parse_spec("warp_size = 64"), std::runtime_error);
+    EXPECT_THROW(parse_spec("regs_per_thread = 128"), std::runtime_error);
+    EXPECT_THROW(parse_spec("sm_count = plenty"), std::runtime_error);
+    EXPECT_THROW(parse_spec("sm_count 4"), std::runtime_error);
+    EXPECT_THROW(load_spec("machines/there-is-no-such-machine.spec"), std::runtime_error);
+}
+
+TEST(Runtime, TheMachinesInTheRepositoryParse)
+{
+    // The files are documentation as much as configuration, and documentation
+    // that does not load is worse than none. GPURT_MACHINES_DIR is baked in at
+    // configure time, ctest running from the build tree.
+    for (const char* name : {"default", "one-sm", "v100", "a100"}) {
+        const std::string path = std::string(GPURT_MACHINES_DIR) + "/" + name + ".spec";
+        GPUSpec spec;
+        ASSERT_NO_THROW(spec = load_spec(path)) << path;
+        EXPECT_GT(spec.sms.sm_count, 0u) << path;
+        EXPECT_GT(spec.sms.blocks_per_sm, 0u) << path;
+    }
+
+    // default.spec has to *be* the default, or the file that claims to describe
+    // every figure in benchmarks/ describes something else.
+    const GPUSpec written = load_spec(std::string(GPURT_MACHINES_DIR) + "/default.spec");
+    EXPECT_EQ(written.to_text(), GPUSpec{}.to_text());
+}
+
 TEST(Runtime, AnUploadForgetsTheLinesItOverwrote)
 {
     // The caches hold tags and no data, so an upload is invisible to them unless

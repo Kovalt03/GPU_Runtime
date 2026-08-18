@@ -43,6 +43,12 @@
 
 namespace {
 
+// The machine this run was asked for, set in main before anything measures.
+// A file-scope value rather than an argument threaded through every helper:
+// it is a property of the run, and a helper that could be handed a different
+// one would let two rows of one table come from two machines.
+GPUSpec MACHINE;
+
 // The four rulers, in the order the project acquired them. Cycles only mean
 // anything in the last, where a warp that has issued waits for its result.
 struct Model {
@@ -75,6 +81,7 @@ Reading measure(const Draw& draw, const Model& model)
 {
     MyGPURuntime rt(1u << 27);
     rt.myrt_set_memory_model(model.memory);
+    rt.myrt_set_spec(MACHINE);
     rt.myrt_set_latency_model(model.latency);
 
     Reading r;
@@ -180,6 +187,13 @@ int main(int argc, char** argv)
 {
     const Args args = parse_args(argc, argv);
     const std::string prefix = args.out_dir + "models";
+
+    // --machine machines/a100.spec, or the defaults. Written beside the tables so
+    // that a result carries the machine that made it.
+    MACHINE = machine_from(args);
+    std::ofstream machine_file(args.out_dir + "machine.spec");
+    machine_file << MACHINE.to_text();
+    std::printf("%s\n", MACHINE.describe().c_str());
 
     std::printf("\n[BENCH] the flat model's conclusions, put to the others — %ux%u\n",
                 BENCH_WIDTH, BENCH_HEIGHT);
