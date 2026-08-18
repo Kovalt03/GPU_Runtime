@@ -38,6 +38,15 @@ struct Thread {
 // a lane's: real hardware counts its predicate registers in single digits too.
 inline constexpr uint32_t WARP_MASK_REGISTERS = 4;
 
+// How many copies a warp may have in flight at once.
+//
+// Sizes the array above, so it is a constant rather than a knob. Hardware has a
+// queue here too and stalls the warp when it is full; this does the same, and 8
+// is a chosen number in the way instruction_cost's numbers are chosen — deep
+// enough that a double-buffered kernel never meets it, shallow enough that a
+// kernel issuing copies in a loop without waiting does.
+inline constexpr size_t CP_ASYNC_QUEUE_DEPTH = 8;
+
 struct Warp {
     std::array<Thread, WARP_SIZE> threads{};
     uint32_t pc = 0;
@@ -57,6 +66,22 @@ struct Warp {
     // throughout while latency is ignored, which is what makes that model's
     // scheduling identical to the one every measurement was taken under.
     uint64_t ready_at = 0;
+
+    // Copies issued and not yet waited for, oldest first.
+    //
+    // On the warp because cp.async is issued and awaited by the warp: every lane
+    // hands over its own float, and S_CP_ASYNC_WAIT waits for the batch rather
+    // than for a lane. The destination range is kept so that a shared load can be
+    // refused while the bytes under it are still in flight — hardware would hand
+    // back whatever was there, and a simulator that did the same would let a
+    // kernel pass its tests by luck.
+    struct InFlightCopy {
+        uint64_t ready_at = 0;
+        uint32_t first_byte = 0;
+        uint32_t last_byte = 0;
+    };
+    std::array<InFlightCopy, CP_ASYNC_QUEUE_DEPTH> copies{};
+    uint32_t copies_in_flight = 0;
 
     // Where WarpPolicy::Independent left off, so the next turn can go to a
     // different pc. Unused under LowestPc, which needs no memory of its own —

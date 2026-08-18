@@ -355,6 +355,18 @@ void IRBuilder::store(Reg<Scalar> address, Reg<Scalar> value, float offset)
     emit(make_v_st_global_f32(address.first(), value.first(), offset));
 }
 
+void IRBuilder::cp_async(Reg<Scalar> shared_address, Reg<Scalar> global_address,
+                         float offset)
+{
+    emit(make_v_cp_async_shared_global_f32(shared_address.first(), global_address.first(),
+                                           offset));
+}
+
+void IRBuilder::cp_async_wait(uint32_t outstanding)
+{
+    emit(make_s_cp_async_wait(outstanding));
+}
+
 void IRBuilder::store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset)
 {
     for (uint32_t i = 0; i < Vec3::REGISTERS; ++i) {

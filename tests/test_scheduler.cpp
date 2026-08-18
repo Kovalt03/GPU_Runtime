@@ -1973,3 +1973,187 @@ TEST(Scheduler, TheCycleBudgetCoversTimeSpentWaiting)
     EXPECT_THROW(scheduler.run(p, block, DeviceSpan{memory.data(), memory.size()}),
                  std::runtime_error);
 }
+
+// ---------------------------------------------------------------------------
+// Asynchronous copy — global to shared without the register file, and without
+// the warp waiting. What is new is not where the bytes go but when the warp is
+// told they arrived.
+// ---------------------------------------------------------------------------
+
+TEST(Scheduler, AnAsynchronousCopyDeliversWhatASynchronousOneWould)
+{
+    Fixture f;
+    f.poke(64, 7.5f);
+
+    // r1 = 64 (global source), r2 = 0 (shared destination)
+    f.run(Program{
+        make_v_mov_f32(1, 64.0f),
+        make_v_mov_f32(2, 0.0f),
+        make_v_cp_async_shared_global_f32(2, 1),
+        make_s_cp_async_wait(0),
+        make_v_ld_shared_f32(3, 2),
+        make_ret(),
+    });
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[3], 7.5f);
+    EXPECT_FLOAT_EQ(f.block.shared_mem[0], 7.5f);
+}
+
+TEST(Scheduler, ReadingACopyBeforeWaitingIsRefused)
+{
+    // Hardware hands back whatever was in shared memory, so a kernel that forgot
+    // the wait passes its tests by luck. This says so instead.
+    Fixture f;
+    f.poke(64, 1.0f);
+
+    EXPECT_THROW(f.run(Program{
+                     make_v_mov_f32(1, 64.0f),
+                     make_v_mov_f32(2, 0.0f),
+                     make_v_cp_async_shared_global_f32(2, 1),
+                     make_v_ld_shared_f32(3, 2),
+                     make_ret(),
+                 }),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, ACopyStillInFlightDoesNotBlockTheOtherHalfOfTheBuffer)
+{
+    // The refusal is by destination range, which is what makes double buffering
+    // expressible: the tile being filled is out of bounds, the tile being read
+    // is not.
+    Fixture f;
+    f.poke(64, 3.0f);
+    f.block.shared_mem[64] = 9.0f;  // byte 256, filled by an earlier pass
+
+    f.sched.set_latency_model(LatencyModel::Modelled);
+    f.run(Program{
+        make_v_mov_f32(1, 64.0f),
+        make_v_mov_f32(2, 0.0f),
+        make_v_cp_async_shared_global_f32(2, 1),  // fills byte 0
+        make_v_mov_f32(4, 256.0f),
+        make_v_ld_shared_f32(5, 4),  // reads byte 256, which is not in flight
+        make_s_cp_async_wait(0),
+        make_ret(),
+    });
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[5], 9.0f);
+}
+
+TEST(Scheduler, TheWarpDoesNotWaitForACopyUntilItAsksTo)
+{
+    // The measurement the instruction exists for. Same bytes moved either way;
+    // what differs is how many cycles the warp spent not issuing.
+    const auto cycles = [](bool asynchronous) {
+        Fixture f;
+        f.sched.set_latency_model(LatencyModel::Modelled);
+        f.sched.set_memory_model(MemoryModel::Coalesced);
+        for (uint32_t i = 0; i < 4; ++i) {
+            f.poke(64 + i * CACHE_LINE_BYTES, static_cast<float>(i));
+        }
+
+        Program prog{make_v_mov_f32(1, 64.0f), make_v_mov_f32(2, 0.0f)};
+        for (uint32_t i = 0; i < 4; ++i) {
+            const float from = static_cast<float>(i * CACHE_LINE_BYTES);
+            const float to = static_cast<float>(i * sizeof(float));
+            if (asynchronous) {
+                prog.push_back(make_v_mov_f32(3, to));
+                prog.push_back(make_v_cp_async_shared_global_f32(3, 1, from));
+            } else {
+                prog.push_back(make_v_ld_global_f32(4, 1, from));
+                prog.push_back(make_v_mov_f32(3, to));
+                prog.push_back(make_v_st_shared_f32(3, 4));
+            }
+        }
+        if (asynchronous) {
+            prog.push_back(make_s_cp_async_wait(0));
+        }
+        prog.push_back(make_ret());
+        f.run(prog);
+
+        // Whatever the route, the four floats have to be there.
+        for (uint32_t i = 0; i < 4; ++i) {
+            EXPECT_FLOAT_EQ(f.block.shared_mem[i], static_cast<float>(i))
+                << "float " << i;
+        }
+        return f.sched.stats().cycles;
+    };
+
+    const uint64_t synchronous = cycles(false);
+    const uint64_t asynchronous = cycles(true);
+    EXPECT_LT(asynchronous, synchronous)
+        << "four loads waited on one at a time against four issued and awaited once";
+}
+
+TEST(Scheduler, AFullCopyQueueStallsTheWarpUntilTheOldestLands)
+{
+    // Hardware has a queue here and stalls when it is full. A kernel that issues
+    // copies in a loop and never waits is asking for unbounded storage, and this
+    // is where the request is answered.
+    Fixture f;
+    f.sched.set_latency_model(LatencyModel::Modelled);
+
+    Program prog{make_v_mov_f32(1, 64.0f), make_v_mov_f32(2, 0.0f)};
+    const uint32_t issued = CP_ASYNC_QUEUE_DEPTH + 4;
+    for (uint32_t i = 0; i < issued; ++i) {
+        prog.push_back(make_v_mov_f32(3, static_cast<float>(i * sizeof(float))));
+        prog.push_back(make_v_cp_async_shared_global_f32(3, 1));
+    }
+    prog.push_back(make_s_cp_async_wait(0));
+    prog.push_back(make_ret());
+    f.run(prog);
+
+    // The queue is a bound on what is outstanding, not on what may be issued:
+    // everything went out, and the ones past the depth waited their turn.
+    EXPECT_GT(f.sched.stats().cycles, issued);
+    EXPECT_EQ(f.warp().copies_in_flight, 0u) << "the wait drains the queue";
+}
+
+TEST(Scheduler, WaitingForAllButOneLeavesTheMostRecentOutstanding)
+{
+    // The form double buffering is written in: work on what has landed while the
+    // next one is still on its way.
+    Fixture f;
+    f.sched.set_latency_model(LatencyModel::Modelled);
+    f.poke(64, 2.0f);
+    f.poke(128, 4.0f);
+
+    f.run(Program{
+        make_v_mov_f32(1, 64.0f),
+        make_v_mov_f32(2, 0.0f),
+        make_v_cp_async_shared_global_f32(2, 1),  // first, into byte 0
+        make_v_mov_f32(3, 4.0f),
+        make_v_mov_f32(4, 128.0f),
+        make_v_cp_async_shared_global_f32(3, 4),  // second, into byte 4
+        make_s_cp_async_wait(1),                  // only the first has to have landed
+        make_v_ld_shared_f32(5, 2),               // legal: the first landed
+        make_ret(),
+    });
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[5], 2.0f);
+    EXPECT_EQ(f.warp().copies_in_flight, 1u)
+        << "a copy leaves the queue when it is waited for, and the second was not";
+}
+
+TEST(Scheduler, AnAsynchronousCopyCostsWhatALoadCostsAndNoStore)
+{
+    // One trip to memory, priced by the lines it touches like any global access,
+    // and nothing for the shared store it replaces.
+    const auto weighted = [](bool asynchronous) {
+        Fixture f;
+        f.sched.set_memory_model(MemoryModel::Coalesced);
+        Program prog{make_v_mov_f32(1, 64.0f), make_v_mov_f32(2, 0.0f)};
+        if (asynchronous) {
+            prog.push_back(make_v_cp_async_shared_global_f32(2, 1));
+            prog.push_back(make_s_cp_async_wait(0));
+        } else {
+            prog.push_back(make_v_ld_global_f32(4, 1));
+            prog.push_back(make_v_st_shared_f32(2, 4));
+        }
+        prog.push_back(make_ret());
+        f.run(prog);
+        return f.sched.stats().weighted_lane_ops;
+    };
+
+    // The shared store is 8 a lane over 32 lanes; the wait is 1 a lane.
+    EXPECT_EQ(weighted(false) - weighted(true), (8 - 1) * WARP_SIZE);
+}

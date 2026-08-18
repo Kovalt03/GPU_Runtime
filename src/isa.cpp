@@ -53,6 +53,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_ST_GLOBAL_F32:  return "V_ST_GLOBAL_F32";
     case Opcode::V_LD_SHARED_F32:  return "V_LD_SHARED_F32";
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
+    case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
     case Opcode::BRA_DIV:          return "BRA_DIV";
@@ -61,6 +62,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::S_ANY:            return "S_ANY";
     case Opcode::S_ALL:            return "S_ALL";
     case Opcode::S_SYNCWARP:       return "S_SYNCWARP";
+    case Opcode::S_CP_ASYNC_WAIT:  return "S_CP_ASYNC_WAIT";
     case Opcode::V_SHUFFLE_F32:    return "V_SHUFFLE_F32";
     // SYNC
     case Opcode::BARRIER:          return "BARRIER";
@@ -207,6 +209,20 @@ Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset)
     return {Opcode::V_ST_SHARED_F32, 0, addr_reg, src, offset};
 }
 
+// Two addresses and no value, so both operand slots are sources and dst is
+// unused — the only memory instruction here whose destination is not a register
+// or the value in src1.
+//
+// Arguments read in the order the mnemonic does, destination first, and the
+// encoding puts the global address in src0 because that is the one the memory
+// model prices. The two orders differ, so neither is left to be inferred.
+Instruction make_v_cp_async_shared_global_f32(uint8_t shared_addr_reg,
+                                              uint8_t global_addr_reg, float offset)
+{
+    return {Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32, 0, global_addr_reg, shared_addr_reg,
+            offset};
+}
+
 // ---------------------------------------------------------------------------
 // CONTROL FLOW
 // ---------------------------------------------------------------------------
@@ -244,6 +260,14 @@ Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants)
 Instruction make_s_syncwarp(uint32_t participants)
 {
     return {Opcode::S_SYNCWARP, 0, 0, 0, encode_lane_mask(participants)};
+}
+
+// A count rather than a lane mask, so it goes in imm as the whole number it is.
+// Every lane of the warp issued the copies together and they land together;
+// there is no set of participants to name.
+Instruction make_s_cp_async_wait(uint32_t outstanding)
+{
+    return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
 Instruction make_v_shuffle_f32(uint8_t dst, uint8_t src0, uint8_t src1,
@@ -312,6 +336,12 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::V_LD_GLOBAL_F32:
     case Opcode::V_ST_GLOBAL_F32: return 100;
 
+    // The same trip to memory as a global load, and that is the whole of it: no
+    // register is written and no shared store follows, so the pair this replaces
+    // cost 108 between them. What it saves in issue capacity is the 8; what it
+    // saves in time is the wait, and that is not on this line.
+    case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return 100;
+
     // Three floats, so three times a float. What the wide load saves is
     // transactions rather than bytes, and a charge per lane cannot see it —
     // global_transaction_cost is where the two part company.
@@ -328,6 +358,10 @@ uint32_t instruction_cost(Opcode op)
     // level down.
     case Opcode::BARRIER:
     case Opcode::S_SYNCWARP: return 1;
+
+    // Likewise: waiting for a copy costs the wait, which shows as the warp not
+    // issuing. The instruction that expresses the wait is free.
+    case Opcode::S_CP_ASYNC_WAIT: return 1;
 
     // A crossbar across the warp rather than a lane's own arithmetic, and priced
     // like the shared-memory traffic it replaces: hardware runs the exchange
@@ -375,12 +409,18 @@ uint32_t instruction_latency(Opcode op)
     case Opcode::V_ST_GLOBAL_F32:
     case Opcode::V_ST_SHARED_F32: return 0;
 
+    // Not answered here either, and for a stronger reason than the loads: the
+    // copy's latency is never the warp's. It is recorded against the copy and
+    // becomes a wait only where S_CP_ASYNC_WAIT asks for it.
+    case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return 0;
+
     // Warp state rather than a result, and the waiting they cause is the
     // scheduler's own — a barrier is not an instruction whose answer arrives late.
     case Opcode::BRA:
     case Opcode::BRA_DIV:
     case Opcode::BARRIER:
     case Opcode::S_SYNCWARP:
+    case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::RET: return 0;
 
     // A crossbar across the warp, priced like the shared-memory traffic it

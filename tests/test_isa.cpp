@@ -16,11 +16,12 @@ constexpr int OPCODE_COUNT = static_cast<int>(Opcode::RET) + 1;
 bool is_control_flow(Opcode op)
 {
     return op == Opcode::BRA || op == Opcode::BRA_DIV || op == Opcode::BARRIER ||
-           op == Opcode::RET || op == Opcode::S_SYNCWARP;
+           op == Opcode::RET || op == Opcode::S_SYNCWARP || op == Opcode::S_CP_ASYNC_WAIT;
 }
 
-// Warp-uniform: one result, the same in every lane. S_SYNCWARP carries the
-// prefix but produces nothing at all, so it is grouped with control flow above.
+// Warp-uniform: one result, the same in every lane. S_SYNCWARP and
+// S_CP_ASYNC_WAIT carry the prefix but produce nothing at all, so they are
+// grouped with control flow above — both are waits.
 bool is_warp_uniform(Opcode op)
 {
     return op == Opcode::S_BALLOT || op == Opcode::S_ANY || op == Opcode::S_ALL;
@@ -74,10 +75,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 31 opcodes, 0-indexed → RET == 30
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 30);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 29);
-    EXPECT_EQ(OPCODE_COUNT, 31);
+    // 33 opcodes, 0-indexed → RET == 32
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 32);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 31);
+    EXPECT_EQ(OPCODE_COUNT, 33);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -88,7 +89,7 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 22);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 23);
 }
 
 // ---------------------------------------------------------------------------
@@ -107,8 +108,10 @@ TEST(Isa, OpcodeNamesFollowScheme)
         const std::string_view name = opcode_name(op);
 
         if (is_control_flow(op)) {
-            // Control flow writes no register and only mutates warp state
-            // → no V_ prefix, no type suffix.
+            // Writes no register and only mutates warp state → no V_ prefix, no
+            // type suffix. The waits that carry S_ are in this group too: the
+            // prefix says the warp acts as one, and the absence of a type says
+            // nothing was computed.
             EXPECT_FALSE(starts_with(name, "V_"))
                 << name << ": control flow must not carry the V_ prefix";
             EXPECT_FALSE(has_type_suffix(name))
@@ -150,14 +153,19 @@ TEST(Isa, ShapeTokensAreFromTheAllowedSet)
 
 TEST(Isa, MemoryOpcodesCarryAddressSpace)
 {
-    const Opcode mem_ops[] = {Opcode::V_LD_GLOBAL_F32, Opcode::V_LD_GLOBAL_VEC3_F32,
-                              Opcode::V_ST_GLOBAL_F32, Opcode::V_LD_SHARED_F32,
-                              Opcode::V_ST_SHARED_F32};
+    const Opcode mem_ops[] = {
+        Opcode::V_LD_GLOBAL_F32, Opcode::V_LD_GLOBAL_VEC3_F32,
+        Opcode::V_ST_GLOBAL_F32, Opcode::V_LD_SHARED_F32,
+        Opcode::V_ST_SHARED_F32, Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32};
 
     for (const Opcode op : mem_ops) {
         const std::string_view name = opcode_name(op);
-        EXPECT_TRUE(starts_with(name, "V_LD_") || starts_with(name, "V_ST_"))
-            << name << ": memory opcode must start with V_LD_ or V_ST_";
+        // Three verbs, not two. A copy moves bytes between two spaces without a
+        // register at either end, so V_LD_ and V_ST_ cannot name it — and both
+        // spaces appear, destination first as in PTX's cp.async.shared.global.
+        EXPECT_TRUE(starts_with(name, "V_LD_") || starts_with(name, "V_ST_") ||
+                    starts_with(name, "V_CP_"))
+            << name << ": memory opcode must start with V_LD_, V_ST_ or V_CP_";
         EXPECT_TRUE(has_space_token(name))
             << name << ": memory opcode must name its address space";
     }

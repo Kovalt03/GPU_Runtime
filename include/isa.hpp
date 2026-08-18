@@ -70,6 +70,20 @@ enum class Opcode : uint8_t {
     V_LD_SHARED_F32,  // reg[dst] = shared[reg[src0] + imm]       (src1 unused)
     V_ST_SHARED_F32,  // shared[reg[src0] + imm] = reg[src1]      (dst unused)
 
+    // Global to shared without the register file in between, and without the
+    // warp waiting for it. Ampere's cp.async, and the scheme's third memory
+    // verb: it is neither a load nor a store, so V_LD_ / V_ST_ cannot name it.
+    // Spaces read destination first, as PTX's cp.async.shared.global does.
+    //
+    // The warp issues it and carries on. Nothing may read the destination until
+    // S_CP_ASYNC_WAIT says it has landed, and reading it early is refused
+    // rather than answered with bytes that would be garbage on hardware.
+    //
+    // The global address is src0 even though the name reads shared first: the
+    // rule that the priced address sits in src0 is what lets the memory model
+    // charge every access the same way, and it outranks reading order.
+    V_CP_ASYNC_SHARED_GLOBAL_F32,  // shared[reg[src1]] = global[reg[src0] + imm]
+
     // Control flow — warp state only, hence no V_ prefix.
     BRA,      // pc += (int32_t)imm                       (unconditional)
     BRA_DIV,  // if (reg[src0] != 0.0f) pc += (int32_t)imm
@@ -82,6 +96,14 @@ enum class Opcode : uint8_t {
     S_ANY,       // reg[dst] = mask[src0] != 0,           in every participant
     S_ALL,       // reg[dst] = mask[src0] == participants, in every participant
     S_SYNCWARP,  // wait until every participant has arrived    (dst/src unused)
+
+    // Wait until at most imm copies are still in flight for this warp. Zero
+    // waits for all of them; one leaves the most recent outstanding, which is
+    // what lets a kernel work on the tile it has while the next one arrives.
+    //
+    // Warp state rather than a lane result, hence S_ and no type suffix — the
+    // copies were issued by the warp and land for the warp.
+    S_CP_ASYNC_WAIT,  // wait until in-flight copies <= imm    (dst/src unused)
 
     // The lane exchange, and the only way a value crosses between lanes without
     // going through memory. src1 holds a lane number rather than a value, and a
@@ -166,6 +188,19 @@ Instruction make_v_ld_global_vec3_f32(uint8_t dst, uint8_t addr_reg, float offse
 Instruction make_v_st_global_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
 Instruction make_v_ld_shared_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
+
+// The copy takes two addresses and no value, which is what it is for: the
+// destination is in shared memory, the source in global, and neither passes
+// through a register. offset is added to the global address, matching the loads.
+Instruction make_v_cp_async_shared_global_f32(uint8_t shared_addr_reg,
+                                              uint8_t global_addr_reg,
+                                              float offset = 0.0f);
+
+// outstanding is how many copies may still be in flight when the warp goes on.
+// Spelled at every call site for the reason make_s_syncwarp's participants is:
+// the useful values are 0 and 1, and which one a kernel means is the whole
+// difference between waiting for everything and keeping one load ahead.
+Instruction make_s_cp_async_wait(uint32_t outstanding);
 
 // CONTROL FLOW
 Instruction make_bra(int32_t offset);

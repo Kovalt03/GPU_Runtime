@@ -75,9 +75,9 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   31 opcodes, 8 bytes each                       │
+  │   33 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
-  │   V_LD_GLOBAL_F32 / V_LD_GLOBAL_VEC3_F32         │
+  │   V_LD_GLOBAL_F32 / V_CP_ASYNC_SHARED_GLOBAL_F32 │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
   │   V_CMP_F32 / BRA_DIV / BARRIER / RET            │
   └──────┬───────────────────────────────────────────┘

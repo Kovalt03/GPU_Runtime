@@ -425,6 +425,29 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // The bytes move here, at issue, though the warp is told they arrive later.
+    //
+    // A cache with no data behind it would have to be told what a half-arrived
+    // copy reads as, and there is no honest answer: hardware gives whatever was
+    // in shared memory before. Moving them now and refusing to read the
+    // destination until the wait (step_warp does that) keeps the model to one
+    // claim — that the *timing* is asynchronous — instead of two.
+    case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: {
+        const size_t from = decode_address(thread.regs[instr.src0] + instr.imm,
+                                           "V_CP_ASYNC_SHARED_GLOBAL_F32 source");
+        const size_t to = decode_address(thread.regs[instr.src1],
+                                         "V_CP_ASYNC_SHARED_GLOBAL_F32 destination");
+        store_f32(shared_bytes(block), SHARED_MEM_BYTES, to,
+                  load_f32(global.base, global.size, from,
+                           "V_CP_ASYNC_SHARED_GLOBAL_F32 source"),
+                  "V_CP_ASYNC_SHARED_GLOBAL_F32 destination");
+        break;
+    }
+
+    // Warp state, and handled before the lane loop is reached. Named here so
+    // that -Wswitch keeps watching this switch for the next opcode.
+    case Opcode::S_CP_ASYNC_WAIT: break;
+
     // decode_cmp_op(instr.imm) recovers the condition. The result is written as
     // 1.0f or 0.0f so that BRA_DIV, which only tests against zero, can consume
     // it. A switch over CmpOp with no default keeps -Wswitch watching this one
@@ -713,8 +736,19 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
 }
 
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
-                              DeviceSpan global)
+                              DeviceSpan global, uint64_t now)
 {
+    // A copy leaves the queue when it is waited for, not when enough time has
+    // passed. Time decides when the warp may go on; the wait decides when the
+    // bytes may be read, and PTX draws the line the same way — cp.async.wait_group
+    // is what makes a copy visible, and no amount of waiting around replaces it.
+    const auto drop_oldest = [&warp](uint32_t count) {
+        for (uint32_t i = count; i < warp.copies_in_flight; ++i) {
+            warp.copies[i - count] = warp.copies[i];
+        }
+        warp.copies_in_flight -= count;
+    };
+
     // Thread::pc is the source of truth. The instruction to issue is the lowest
     // pc still live, and no live thread at all means the warp has finished —
     // reported without counting a step, since nothing was issued.
@@ -787,6 +821,78 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
 
         warp.at_barrier = true;
         return false;
+    }
+
+    if (program[warp.pc].op == Opcode::S_CP_ASYNC_WAIT) {
+        // How many copies may still be in flight when the warp goes on. The
+        // landed ones are already gone, so what is left is genuinely in flight.
+        const auto allowed = static_cast<uint32_t>(program[warp.pc].imm);
+
+        if (warp.copies_in_flight > allowed) {
+            // The last one that has to land lands at a time this scheduler
+            // already knows, so the wait is expressed as a latency rather than
+            // as turns taken and refused: the warp steps past the instruction
+            // now and cannot issue again until then.
+            const uint32_t must_land = warp.copies_in_flight - allowed;
+            const uint64_t until = warp.copies[must_land - 1].ready_at;
+            issued_latency_ = static_cast<uint32_t>(until > now ? until - now : 0);
+            drop_oldest(must_land);
+        } else {
+            issued_latency_ = 0;
+        }
+
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (is_active(warp, lane)) {
+                ++warp.threads[lane].pc;
+            }
+        }
+        const uint64_t waiting = active_lane_count(warp);
+        stats_.warp_steps += 1;
+        stats_.active_lane_ops += waiting;
+        stats_.weighted_lane_ops += waiting * instruction_cost(Opcode::S_CP_ASYNC_WAIT);
+        return true;
+    }
+
+    if (program[warp.pc].op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32 &&
+        warp.copies_in_flight == CP_ASYNC_QUEUE_DEPTH) {
+        // The queue is full. Hardware stalls here too — a kernel issuing copies
+        // in a loop without ever waiting is asking for unbounded storage, and
+        // this is where that request is answered.
+        if (warp.copies[0].ready_at > now) {
+            // It takes no turn and issues nothing: the SM spends its cycle on a
+            // warp that can, which is the whole reason the others are resident.
+            issued_latency_ = static_cast<uint32_t>(warp.copies[0].ready_at - now);
+            return true;
+        }
+        // Landed, so the slot is reclaimed the way hardware reclaims it. The
+        // guard below can no longer refuse a read of those bytes, and by now it
+        // should not: they are there.
+        drop_oldest(1);
+    }
+
+    if (program[warp.pc].op == Opcode::V_LD_SHARED_F32) {
+        // Reading bytes a copy has not delivered. Hardware hands back whatever
+        // was there, which is a kernel that passes its tests by luck; this
+        // refuses instead. The range is the copy's own destination bytes, so a
+        // double-buffered kernel reading the half it waited for is untouched.
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (!is_active(warp, lane)) {
+                continue;
+            }
+            const size_t addr = decode_address(
+                warp.threads[lane].regs[program[warp.pc].src0] + program[warp.pc].imm,
+                "V_LD_SHARED_F32");
+            for (uint32_t i = 0; i < warp.copies_in_flight; ++i) {
+                if (addr >= warp.copies[i].first_byte &&
+                    addr <= warp.copies[i].last_byte) {
+                    throw std::runtime_error(
+                        "V_LD_SHARED_F32 at pc " + std::to_string(warp.pc) + ": byte " +
+                        std::to_string(addr) +
+                        " is still in flight from a cp.async — S_CP_ASYNC_WAIT "
+                        "has to come first");
+                }
+            }
+        }
     }
 
     if (program[warp.pc].op == Opcode::S_SYNCWARP) {
@@ -998,7 +1104,8 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     const Instruction& issued = program[warp.pc];
     const bool addresses_memory = issued.op == Opcode::V_LD_GLOBAL_F32 ||
                                   issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
-                                  issued.op == Opcode::V_ST_GLOBAL_F32;
+                                  issued.op == Opcode::V_ST_GLOBAL_F32 ||
+                                  issued.op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32;
     const GlobalAccess access =
         addresses_memory ? global_access(warp, issued) : GlobalAccess{};
 
@@ -1019,6 +1126,37 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     const uint64_t lanes = active_lane_count(warp);
     stats_.warp_steps += 1;
     stats_.active_lane_ops += lanes;
+
+    if (issued.op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32) {
+        // The copy's cost is a global access like any other. Its latency is not
+        // the warp's — that is the whole instruction — so it goes on the queue
+        // and becomes a wait only where S_CP_ASYNC_WAIT asks for one.
+        stats_.weighted_lane_ops += access.cost;
+        issued_latency_ = 0;
+
+        Warp::InFlightCopy& copy = warp.copies[warp.copies_in_flight++];
+        copy.ready_at = now + (latency_ == LatencyModel::Ignored ? 0 : access.latency);
+        copy.first_byte = UINT32_MAX;
+        copy.last_byte = 0;
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (!is_active(warp, lane)) {
+                continue;
+            }
+            // Read after execute() rather than before, as the address register
+            // cannot be the destination of a copy: this instruction writes no
+            // register, so nothing it did can have moved the address.
+            const auto to = static_cast<uint32_t>(
+                decode_address(warp.threads[lane].regs[issued.src1],
+                               "V_CP_ASYNC_SHARED_GLOBAL_F32 destination"));
+            copy.first_byte = std::min(copy.first_byte, to);
+            copy.last_byte = std::max(copy.last_byte, to + 3);
+        }
+        if (copy.first_byte == UINT32_MAX) {
+            copy.first_byte = 0;  // no active lane, so nothing is in flight
+            copy.last_byte = 0;
+        }
+        return true;
+    }
 
     if (addresses_memory) {
         stats_.weighted_lane_ops += access.cost;
@@ -1273,16 +1411,16 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
     // A kernel that meets the budget throws, and run()'s caller still owns its
     // block — the deadlock tests read the wreck afterwards to say *which* failure
     // it was. Whatever is resident goes back before the exception leaves.
+    // Armed for the whole call rather than disarmed at the end: a launch can also
+    // stop with a block resident and no exception — a warp waiting on something
+    // that will not arrive — and the caller's block would be lost the same way.
+    // On an ordinary finish every slot is empty and this does nothing.
     struct Handback {
         std::vector<Unit>& units;
         std::unique_ptr<ThreadBlock>& out;
-        bool armed = true;
 
         ~Handback()
         {
-            if (!armed) {
-                return;
-            }
             for (Unit& unit : units) {
                 for (Slot& slot : unit.slots) {
                     if (slot.occupied()) {
@@ -1358,7 +1496,7 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
 
                     const SchedulerStats before = stats_;
                     if (!step_warp(*launches[slot.launch].program, warp, *slot.block,
-                                   global)) {
+                                   global, now)) {
                         if (!warp.at_barrier) {
                             slot.live[i] = false;
                             --slot.remaining;
@@ -1372,6 +1510,13 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                     // its turn on the discovery. One that arrived at a barrier
                     // did issue the BARRIER and does spend it.
                     if (stats_.warp_steps == before.warp_steps) {
+                        // It may have parked itself instead: a full copy queue
+                        // says exactly when it will not be full. The check above
+                        // ran before the step, so this is the only place that can
+                        // see a wait the step itself decided on.
+                        if (warp.ready_at > now) {
+                            soonest = std::min(soonest, warp.ready_at);
+                        }
                         continue;
                     }
                     if (charging) {
@@ -1510,7 +1655,6 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         // cycles equal to issues, nothing ever waiting.
     }
 
-    handback.armed = false;
     stats_.cycles += now;
     active_l1_ = nullptr;
 }

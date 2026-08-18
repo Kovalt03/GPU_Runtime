@@ -222,6 +222,23 @@ public:
     void store(Reg<Scalar> address, Reg<Scalar> value, float offset = 0.0f);
     void store_vec3(Reg<Scalar> address, Reg<Vec3> value, float offset = 0.0f);
 
+    // Global to shared without a register in between, and without waiting.
+    //
+    // Arguments read as the assignment does — destination, then source — and
+    // the offset belongs to the source, as it does for load(). What it replaces
+    // is store_shared(dst, load(src)): two instructions, a register, and a warp
+    // that waits out the load before it can issue the store.
+    //
+    // Nothing may read the destination until cp_async_wait has been passed, and
+    // the scheduler refuses a read that comes early rather than answering it.
+    void cp_async(Reg<Scalar> shared_address, Reg<Scalar> global_address,
+                  float offset = 0.0f);
+
+    // Wait until at most `outstanding` copies are still in flight. Zero waits
+    // for all of them; one leaves the most recent, which is how a kernel keeps
+    // working on what it has while the next arrives.
+    void cp_async_wait(uint32_t outstanding);
+
     // --- control flow -------------------------------------------------------
     Label label();
     void place(Label target);

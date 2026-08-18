@@ -413,8 +413,10 @@ private:
 
     // Returns false when the warp will not take another turn — retired, or now
     // waiting at a barrier. run() tells the two apart by Warp::at_barrier.
+    // now is the cycle being issued on, which only the asynchronous copy needs:
+    // it records when its bytes land, and every wait is answered against it.
     bool step_warp(const Program& program, Warp& warp, ThreadBlock& block,
-                   DeviceSpan global);
+                   DeviceSpan global, uint64_t now);
 
     // Every warp of the block has arrived, so let them all go.
     void release_barrier(ThreadBlock& block);
