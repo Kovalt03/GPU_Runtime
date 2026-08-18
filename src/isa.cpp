@@ -55,6 +55,8 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
     case Opcode::V_ATOM_ADD_GLOBAL_F32: return "V_ATOM_ADD_GLOBAL_F32";
+    case Opcode::V_LD_CONST_F32:   return "V_LD_CONST_F32";
+    case Opcode::V_LD_CONST_MAT4_F32: return "V_LD_CONST_MAT4_F32";
     case Opcode::V_LD_SHARED_16X16_F32: return "V_LD_SHARED_16X16_F32";
     case Opcode::V_LD_SHARED_16X16_F16: return "V_LD_SHARED_16X16_F16";
     case Opcode::V_LD_CLUSTER_F32: return "V_LD_CLUSTER_F32";
@@ -284,6 +286,16 @@ Instruction make_s_cp_async_wait(uint32_t outstanding)
     return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
+Instruction make_v_ld_const_f32(uint8_t dst, uint8_t addr_reg, float offset)
+{
+    return {Opcode::V_LD_CONST_F32, dst, addr_reg, 0, offset};
+}
+
+Instruction make_v_ld_const_mat4_f32(uint8_t dst, uint8_t addr_reg, float offset)
+{
+    return {Opcode::V_LD_CONST_MAT4_F32, dst, addr_reg, 0, offset};
+}
+
 Instruction make_v_ld_shared_16x16_f32(uint8_t dst, uint8_t addr_reg, float offset)
 {
     return {Opcode::V_LD_SHARED_16X16_F32, dst, addr_reg, 0, offset};
@@ -396,6 +408,17 @@ uint32_t instruction_cost(Opcode op)
     // precision, so the depth below is unchanged.
     case Opcode::V_MMA_16X16X16_F16: return 8;
 
+    // Answered once for the warp and broadcast, so this is the cost of the whole
+    // instruction rather than of a lane — the one place in this table where that
+    // is true, and the reason the space exists. Priced at a shared-memory access
+    // because that is where a constant cache sits.
+    case Opcode::V_LD_CONST_F32: return 8;
+
+    // Sixteen of them in one, and no discount: the window still hands over
+    // sixteen floats. What it saves is the sixteen instructions a baked matrix
+    // costs, and that shows in the issue count rather than here.
+    case Opcode::V_LD_CONST_MAT4_F32: return 16 * 8;
+
     // On-chip, so tens of cycles rather than hundreds.
     case Opcode::V_LD_SHARED_F32:
     case Opcode::V_ST_SHARED_F32: return 8;
@@ -494,6 +517,10 @@ uint32_t instruction_latency(Opcode op)
 
     // Shared memory is on-chip and an order below a cache hit.
     case Opcode::V_LD_SHARED_F32: return 30;
+
+    // The constant cache sits beside it and answers as quickly.
+    case Opcode::V_LD_CONST_F32:
+    case Opcode::V_LD_CONST_MAT4_F32: return 30;
 
     // Deeper than one float and far shallower than eight of them: the address is
     // computed once and the bank sequence runs once. A third again, chosen the way

@@ -113,6 +113,10 @@ void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
         // Which block of its cluster this is. Not recoverable from the block id
         // without an integer division, and a kernel reading a neighbour's shared
         // memory has to know which neighbour it is itself.
+        // Where this launch's uniforms are. Every thread sees the same number,
+        // which is what makes an address built from it warp-uniform.
+        th.regs[REG_CONST_BASE] = float(launch.const_offset);
+
         th.regs[REG_CLUSTER_RANK] =
             float(launch.cluster_size <= 1 ? 0 : block_id % launch.cluster_size);
     }
@@ -157,6 +161,7 @@ void MyGPURuntime::myrt_launch_async(KernelFunc kernel, const LaunchConfig& conf
     launch.grid = config.grid;
     launch.block = config.block;
     launch.shared_bytes = config.shared_bytes;
+    launch.const_offset = config.const_offset;
     launch.cluster_size = config.cluster_size;
     launch.stream = stream;
 
@@ -177,6 +182,7 @@ void MyGPURuntime::myrt_launch_indirect(KernelFunc kernel,
     QueuedLaunch launch;
     launch.block = config.block;
     launch.shared_bytes = config.shared_bytes;
+    launch.const_offset = config.const_offset;
     launch.stream = stream;
     launch.indirect = true;
     launch.grid_offset = config.grid_offset;

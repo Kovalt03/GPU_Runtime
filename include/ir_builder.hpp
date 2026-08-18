@@ -161,6 +161,11 @@ public:
     // collectively, such as the tile of the screen it covers — a global
     // coordinate cannot be divided back down to it.
     Reg<Scalar> cluster_rank() const;
+
+    // Where this launch's uniforms start. Every thread holds the same number, so
+    // an address built from it is warp-uniform — which is what the constant
+    // window's pricing rests on.
+    Reg<Scalar> const_base() const;
     Reg<Scalar> block_x() const;
     Reg<Scalar> block_y() const;
     Reg<Scalar> block_z() const;
@@ -252,6 +257,10 @@ public:
     // trips. The registers come back consecutive, which is what the matrix
     // instruction needs and what eight allocating loads could not promise.
     Reg<Frag> load_shared_fragment(Reg<Scalar> address, float offset = 0.0f);
+
+    // A uniform, and a matrix of them. Answered once for the warp and broadcast.
+    Reg<Scalar> load_const(Reg<Scalar> address, float offset = 0.0f);
+    Reg<Mat4> load_const_mat4(Reg<Scalar> address, float offset = 0.0f);
 
     // The same in half precision: four registers of packed halves, which nothing
     // but the F16 instructions may read.

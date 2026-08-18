@@ -465,6 +465,31 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // The constant window. Addressed from the register the launch seeded, so the
+    // address is the same in every lane by construction — which is what lets the
+    // cost model charge it once for the warp.
+    case Opcode::V_LD_CONST_F32: {
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_CONST_F32");
+        thread.regs[instr.dst] =
+            load_f32(global.base, global.size, addr, "V_LD_CONST_F32");
+        break;
+    }
+
+    // A matrix, in one. Checked like the other wide shapes.
+    case Opcode::V_LD_CONST_MAT4_F32: {
+        require_register_range(instr.dst, MAT4_REGISTERS, "V_LD_CONST_MAT4_F32 dst");
+        require_register_alignment(instr.dst, 4, "V_LD_CONST_MAT4_F32 dst");
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_CONST_MAT4_F32");
+        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+            thread.regs[instr.dst + i] =
+                load_f32(global.base, global.size, addr + i * sizeof(float),
+                         "V_LD_CONST_MAT4_F32");
+        }
+        break;
+    }
+
     // Eight consecutive floats into eight consecutive registers. Checked as a
     // VEC3 is and for the same reason: the range is implied by the opcode rather
     // than written at the call site.
@@ -1467,7 +1492,16 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         return true;
     }
 
-    if (addresses_memory || is_atomic) {
+    // Answered once for the warp and broadcast, so the whole instruction costs
+    // what one access does — the only opcode here charged that way, and the
+    // reason a constant window is worth having.
+    const bool is_constant =
+        issued.op == Opcode::V_LD_CONST_F32 || issued.op == Opcode::V_LD_CONST_MAT4_F32;
+
+    if (is_constant) {
+        stats_.weighted_lane_ops += lanes > 0 ? instruction_cost(issued.op) : 0;
+        issued_latency_ = instruction_latency(issued.op);
+    } else if (addresses_memory || is_atomic) {
         stats_.weighted_lane_ops += access.cost;
         issued_latency_ = access.latency;
     } else {

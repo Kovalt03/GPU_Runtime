@@ -270,6 +270,11 @@ Reg<Scalar> IRBuilder::cluster_rank() const
     return Reg<Scalar>(REG_CLUSTER_RANK);
 }
 
+Reg<Scalar> IRBuilder::const_base() const
+{
+    return Reg<Scalar>(REG_CONST_BASE);
+}
+
 Reg<Scalar> IRBuilder::block_x() const
 {
     return Reg<Scalar>(REG_BLOCK_ID_X);
@@ -344,6 +349,20 @@ Reg<Frag> IRBuilder::load_shared_fragment(Reg<Scalar> address, float offset)
 {
     const Reg<Frag> out = alloc<Frag>();
     emit(make_v_ld_shared_16x16_f32(out.first(), address.first(), offset));
+    return out;
+}
+
+Reg<Scalar> IRBuilder::load_const(Reg<Scalar> address, float offset)
+{
+    const Reg<Scalar> out = alloc<Scalar>();
+    emit(make_v_ld_const_f32(out.first(), address.first(), offset));
+    return out;
+}
+
+Reg<Mat4> IRBuilder::load_const_mat4(Reg<Scalar> address, float offset)
+{
+    const Reg<Mat4> out = alloc<Mat4>();
+    emit(make_v_ld_const_mat4_f32(out.first(), address.first(), offset));
     return out;
 }
 

@@ -38,6 +38,10 @@ struct Thread {
 // a lane's: real hardware counts its predicate registers in single digits too.
 inline constexpr uint32_t WARP_MASK_REGISTERS = 4;
 
+// A matrix, in registers. V_MATVEC_MAT4_F32 has always read sixteen of them and
+// V_LD_CONST_MAT4_F32 now writes sixteen; naming it once keeps the two agreeing.
+inline constexpr uint32_t MAT4_REGISTERS = 16;
+
 // The tile a V_MMA_16X16X16_F32 works on, and how it is spread over the warp.
 //
 // 16x16 is 256 elements and a warp is 32 lanes, so a fragment is eight registers

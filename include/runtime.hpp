@@ -34,6 +34,13 @@ struct LaunchConfig {
     dim3 block;
     size_t shared_bytes = 0;
 
+    // Where this launch's uniforms are, as a byte offset into device memory. The
+    // launch seeds it into REG_CONST_BASE, and V_LD_CONST_F32 reads from there.
+    //
+    // Zero means the window starts at the base of device memory, which is a
+    // legitimate place for it — a kernel that reads no uniform never looks.
+    size_t const_offset = 0;
+
     // How many blocks are placed together and can read each other's shared
     // memory. One is what everything before this declared, and it means no
     // cluster at all rather than a cluster of one — though a kernel written for
@@ -61,6 +68,7 @@ struct IndirectLaunchConfig {
     size_t grid_offset = 0;
     dim3 block;
     size_t shared_bytes = 0;
+    size_t const_offset = 0;
 };
 
 // Which queue a launch waits in. Launches sharing one run in order; launches in
@@ -94,6 +102,14 @@ using KernelFunc = std::function<Program(void**)>;
 inline constexpr uint8_t REG_GLOBAL_ID_X = 253;
 inline constexpr uint8_t REG_GLOBAL_ID_Y = 254;
 inline constexpr uint8_t REG_GLOBAL_ID_Z = 255;
+
+// Where the launch's constant window starts, as a byte offset into device memory.
+//
+// Seeded rather than baked so that a program outlives the values it reads: the
+// whole point of a uniform is that the same instructions serve a different
+// matrix, and an offset written into the instruction stream would be one more
+// thing that has to be rebuilt.
+inline constexpr uint8_t REG_CONST_BASE = 248;
 
 // Which block of its cluster this one is, seeded like the block ids below.
 //
@@ -270,6 +286,7 @@ private:
         dim3 grid;
         dim3 block;
         size_t shared_bytes = 0;
+        size_t const_offset = 0;
         uint32_t cluster_size = 1;
         StreamId stream = DEFAULT_STREAM;
         bool indirect = false;

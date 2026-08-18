@@ -83,10 +83,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 41 opcodes, 0-indexed → RET == 40
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 40);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 37);
-    EXPECT_EQ(OPCODE_COUNT, 41);
+    // 43 opcodes, 0-indexed → RET == 42
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 42);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 39);
+    EXPECT_EQ(OPCODE_COUNT, 43);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -97,7 +97,7 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 27);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 29);
 }
 
 // ---------------------------------------------------------------------------

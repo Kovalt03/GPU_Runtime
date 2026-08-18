@@ -84,6 +84,24 @@ enum class Opcode : uint8_t {
     // charge every access the same way, and it outranks reading order.
     V_CP_ASYNC_SHARED_GLOBAL_F32,  // shared[reg[src1]] = global[reg[src0] + imm]
 
+    // A value every thread reads the same way, out of the constant window.
+    //
+    // The address is warp-uniform by construction — it comes from the register
+    // the launch seeds, not from a lane — so hardware answers one access and
+    // broadcasts it. That is what this space is for and how it is priced: once a
+    // warp rather than once a lane.
+    //
+    // Nothing stops a kernel putting a uniform in global memory, and under
+    // Coalesced a warp reading one address is already one transaction. What the
+    // space adds is that it *cannot* be anything else: an address that varies by
+    // lane cannot be built here, so a uniform read cannot quietly become 32.
+    V_LD_CONST_F32,  // reg[dst] = const[reg[src0] + imm]        (src1 unused)
+
+    // Sixteen of them, which is a matrix — the shape a vertex stage wants and the
+    // reason this arrived when it did. One instruction against the sixteen moves
+    // that baking a matrix into the program costs.
+    V_LD_CONST_MAT4_F32,  // reg[dst..+15] = const[reg[src0] + imm ..+60]
+
     // A whole fragment out of shared memory: eight consecutive floats into the
     // eight consecutive registers V_MMA_16X16X16_F32 reads.
     //
@@ -316,6 +334,14 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// The constant window, whose base the launch seeds into REG_CONST_BASE. Offsets
+// are bytes from there, as everywhere else.
+Instruction make_v_ld_const_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
+
+// dst names the first of sixteen registers and starts on a multiple of four, as
+// V_MATVEC_MAT4_F32 requires of the matrix it reads.
+Instruction make_v_ld_const_mat4_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 
 // Four registers rather than eight, and the same rules otherwise.
 Instruction make_v_ld_shared_16x16_f16(uint8_t dst, uint8_t addr_reg,
