@@ -55,6 +55,18 @@ inline constexpr size_t L2_LINES = 65536;
 inline constexpr uint32_t L1_HIT_COST = 8;
 inline constexpr uint32_t L2_HIT_COST = 30;
 
+// How many cache lines the memory system delivers a cycle, device-wide.
+//
+// Everything else in this file prices a *request*; this is the first number that
+// prices the *system*, and it is what makes two requests interfere. Eight lines
+// of 128 bytes a cycle is about a kilobyte a cycle — the order an HBM stack
+// reaches at these clocks, and the ratio to MEMORY_LATENCY is what decides
+// whether a kernel is latency bound or bandwidth bound.
+//
+// A knob rather than a constant: the whole point of the model is to ask what
+// happens when it is smaller than a kernel wants.
+inline constexpr uint32_t MEMORY_LINES_A_CYCLE = 8;
+
 // What lanes colliding on one address cost each other.
 //
 // An atomic executes where the caches meet, not in a lane, and two lanes naming
@@ -96,6 +108,10 @@ struct SMConfig {
 // scenes were in a session rather than in the repository.
 struct GPUSpec {
     SMConfig sms;
+
+    // Lines the memory system can deliver a cycle. Only consulted under
+    // BandwidthModel::Modelled, where requests past it wait for the ones ahead.
+    uint32_t memory_lines_a_cycle = MEMORY_LINES_A_CYCLE;
 
     // Both caches, in lines. Shrunk by benchmarks that mean to reach a capacity:
     // filling L2 for real would take about 175,000 triangles.

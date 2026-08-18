@@ -327,6 +327,11 @@ void MyGPURuntime::myrt_set_latency_model(LatencyModel model)
     scheduler_->set_latency_model(model);
 }
 
+void MyGPURuntime::myrt_set_bandwidth_model(BandwidthModel model)
+{
+    scheduler_->set_bandwidth_model(model);
+}
+
 void MyGPURuntime::myrt_set_cache_lines(size_t l1, size_t l2)
 {
     scheduler_->set_cache_lines(l1, l2);

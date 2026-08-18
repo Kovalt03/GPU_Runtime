@@ -238,6 +238,11 @@ public:
     // Whether a result waits. Defaults to LatencyModel::Ignored, likewise.
     void myrt_set_latency_model(LatencyModel model);
 
+    // Whether the memory system has a ceiling. Defaults to
+    // BandwidthModel::Ignored, which is what every figure in benchmarks/ was
+    // taken under, and does nothing without a latency model to wait in.
+    void myrt_set_bandwidth_model(BandwidthModel model);
+
     // Cache capacities in lines, for a caller that means to reach one. The
     // hardware sizes are far larger than any scene here fills, so a benchmark
     // wanting to show what happens at capacity has to scale them down and say so.

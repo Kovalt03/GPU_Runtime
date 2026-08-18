@@ -2508,3 +2508,122 @@ TEST(Scheduler, ReorderingCostsTheWarpStepsItSaves)
     EXPECT_EQ(grouped.active_lane_ops - WARP_SIZE * 2, split.active_lane_ops)
         << "the same work, plus the reorder itself";
 }
+
+// ---------------------------------------------------------------------------
+// Bandwidth — the first thing in this machine that two warps can run out of
+// ---------------------------------------------------------------------------
+
+TEST(Scheduler, WithoutTheModelNothingSaturates)
+{
+    // The default, and what every figure in benchmarks/ was taken under: two
+    // warps missing at the same time are served as though the other were not
+    // there.
+    Fixture f;
+    f.global.resize(WARP_SIZE * CACHE_LINE_BYTES, 0);
+    f.sched.set_memory_model(MemoryModel::Cached);
+    f.sched.set_latency_model(LatencyModel::Modelled);
+
+    f.run(Program{make_v_mov_f32(1, 0.0f), make_v_ld_global_f32(2, 1),
+                  make_v_ld_global_f32(3, 1, 2.0f * CACHE_LINE_BYTES), make_ret()});
+
+    EXPECT_EQ(f.sched.stats().memory_queue_cycles, 0u);
+}
+
+TEST(Scheduler, RequestsPastTheCeilingWaitForTheOnesAhead)
+{
+    // Every lane at its own line, so one instruction asks for 32 of them. A
+    // system delivering one line a cycle then makes the last lane wait 31.
+    const auto queued = [](uint32_t lines_a_cycle) {
+        Fixture f;
+        f.global.resize(WARP_SIZE * CACHE_LINE_BYTES, 0);
+        GPUSpec spec;
+        spec.memory_lines_a_cycle = lines_a_cycle;
+        f.sched.set_spec(spec);
+        f.sched.set_memory_model(MemoryModel::Cached);
+        f.sched.set_latency_model(LatencyModel::Modelled);
+        f.sched.set_bandwidth_model(BandwidthModel::Modelled);
+
+        // lane * 128 bytes: one line each, none of them shared.
+        Program prog{make_v_mov_f32(1, static_cast<float>(CACHE_LINE_BYTES)),
+                     make_v_mul_f32(2, REG_GLOBAL_ID_X, 1), make_v_ld_global_f32(3, 2),
+                     make_ret()};
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            f.lane(lane).regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+        }
+        f.run(prog);
+        return f.sched.stats();
+    };
+
+    const SchedulerStats narrow = queued(1);
+    const SchedulerStats wide = queued(32);
+
+    EXPECT_GT(narrow.memory_queue_cycles, 0u);
+    EXPECT_LT(wide.memory_queue_cycles, narrow.memory_queue_cycles)
+        << "a wider memory system serves the same request sooner";
+    EXPECT_GT(narrow.cycles, wide.cycles) << "and the warp waits for the last line";
+}
+
+TEST(Scheduler, AHitDoesNotQueue)
+{
+    // Only the trips to memory are charged for the ceiling. A line already on
+    // chip is answered on chip, and giving those a ceiling too would be two
+    // claims where the measurement can support one.
+    Fixture f;
+    GPUSpec spec;
+    spec.memory_lines_a_cycle = 1;
+    f.sched.set_spec(spec);
+    f.sched.set_memory_model(MemoryModel::Cached);
+    f.sched.set_latency_model(LatencyModel::Modelled);
+    f.sched.set_bandwidth_model(BandwidthModel::Modelled);
+
+    // The same line eight times: one miss and seven hits.
+    Program prog{make_v_mov_f32(1, 0.0f)};
+    for (int i = 0; i < 8; ++i) {
+        prog.push_back(make_v_ld_global_f32(2, 1));
+    }
+    prog.push_back(make_ret());
+    f.run(prog);
+
+    EXPECT_EQ(f.sched.stats().cache_misses, 1u);
+    EXPECT_EQ(f.sched.stats().memory_queue_cycles, 0u)
+        << "the one miss arrived at an idle memory system, and the rest never went";
+}
+
+TEST(Scheduler, TheQueueIsEmptyWhenALaunchBegins)
+{
+    // A queue drains between launches where a cache's residency does not: one is
+    // a resource in use, the other is what it remembers.
+    Fixture f;
+    f.global.resize(WARP_SIZE * CACHE_LINE_BYTES, 0);
+    GPUSpec spec;
+    spec.memory_lines_a_cycle = 1;
+    f.sched.set_spec(spec);
+    f.sched.set_memory_model(MemoryModel::Cached);
+    f.sched.set_latency_model(LatencyModel::Modelled);
+    f.sched.set_bandwidth_model(BandwidthModel::Modelled);
+
+    Program prog{make_v_mov_f32(1, static_cast<float>(CACHE_LINE_BYTES)),
+                 make_v_mul_f32(2, REG_GLOBAL_ID_X, 1), make_v_ld_global_f32(3, 2),
+                 make_ret()};
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        f.lane(lane).regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+    }
+
+    f.run(prog);
+    const uint64_t first = f.sched.stats().memory_queue_cycles;
+
+    ThreadBlock again = make_block(1, 0);
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        again.warps[0].threads[lane].regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+    }
+    f.sched.reset_stats();
+
+    // Emptied, or the second launch would find every line resident and never
+    // reach memory at all — the caches outlive a launch on purpose, and this
+    // test is about the queue rather than about them.
+    f.sched.set_cache_lines(L1_LINES, L2_LINES);
+    f.sched.run(prog, again, f.span());
+
+    EXPECT_EQ(f.sched.stats().memory_queue_cycles, first)
+        << "the second launch did not inherit the first one's backlog";
+}

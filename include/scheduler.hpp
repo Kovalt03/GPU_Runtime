@@ -43,6 +43,11 @@ struct SchedulerStats {
     uint64_t l2_hits = 0;
     uint64_t cache_misses = 0;
 
+    // Cycles requests spent waiting for the memory system to be free, as against
+    // waiting for it to answer. Zero under BandwidthModel::Ignored, and what
+    // saturation looks like when it is not.
+    uint64_t memory_queue_cycles = 0;
+
     // active_lane_ops weighted by instruction_cost, so that throughput readings
     // distinguish a kernel full of global loads from one full of adds.
     uint64_t weighted_lane_ops = 0;
@@ -73,6 +78,7 @@ struct SchedulerStats {
         l1_hits -= other.l1_hits;
         l2_hits -= other.l2_hits;
         cache_misses -= other.cache_misses;
+        memory_queue_cycles -= other.memory_queue_cycles;
         return *this;
     }
 
@@ -88,6 +94,7 @@ struct SchedulerStats {
         l1_hits += other.l1_hits;
         l2_hits += other.l2_hits;
         cache_misses += other.cache_misses;
+        memory_queue_cycles += other.memory_queue_cycles;
         return *this;
     }
 };
@@ -156,6 +163,25 @@ enum class LatencyModel {
     // instruction_latency decides when a warp may issue again, so warps cover one
     // another's waiting — the reason they are batched, and what occupancy
     // measures.
+    Modelled,
+};
+
+// Whether the memory system has a ceiling.
+//
+// Independent of the other two, and the last of the three to arrive. MemoryModel
+// says what an access costs in issue capacity; LatencyModel says how long one
+// waits; this says what two of them do to each other.
+enum class BandwidthModel {
+    // Requests are counted and never queued. Two warps each needing four lines
+    // are served as though the other were not there, so nothing saturates — no
+    // shared resource, no ceiling. Every figure in benchmarks/ before this was
+    // taken here.
+    Ignored,
+
+    // The memory system delivers a fixed number of lines a cycle, and a request
+    // arriving while it is busy waits for the ones ahead of it. Latency is then
+    // a function of load rather than a constant, which is the difference between
+    // a kernel being latency bound and being bandwidth bound.
     Modelled,
 };
 
@@ -283,6 +309,13 @@ public:
         latency_ = model;
     }
 
+    // Defaults to Ignored, and does nothing without LatencyModel::Modelled: a
+    // queue nobody waits in is not a queue.
+    void set_bandwidth_model(BandwidthModel model)
+    {
+        bandwidth_ = model;
+    }
+
     // Shrunk by tests that mean to reach a capacity: filling L2 for real would
     // take about 175,000 triangles, so its eviction is otherwise a path no scene
     // reaches. Both caches are emptied, a capacity change making what is resident
@@ -385,6 +418,13 @@ private:
     WarpPolicy policy_ = WarpPolicy::LowestPc;
     MemoryModel memory_ = MemoryModel::Flat;
     LatencyModel latency_ = LatencyModel::Ignored;
+    BandwidthModel bandwidth_ = BandwidthModel::Ignored;
+
+    // When the memory system next has a line-slot free, in units of
+    // 1/memory_lines_a_cycle of a cycle so that a fractional service time stays
+    // exact integer arithmetic. Emptied when a launch begins, as the caches'
+    // residency is not: a queue drains, a cache does not.
+    uint64_t memory_free_at_ = 0;
 
     GPUSpec spec_;
 
@@ -405,7 +445,13 @@ private:
 
     // Separate from instruction_cost and instruction_latency because the answer is
     // a property of the 32 addresses rather than of the opcode.
-    GlobalAccess global_access(const Warp& warp, const Instruction& instr);
+    // now is the cycle the access is issued on, which only the bandwidth model
+    // needs: it decides whether the memory system is busy.
+    GlobalAccess global_access(const Warp& warp, const Instruction& instr, uint64_t now);
+
+    // A line's trip to memory, once the queue in front of it has been served.
+    // Returns the wait, and takes the slot.
+    uint32_t queue_for_memory(uint64_t now);
 
     // The same question for an atomic, which answers it differently: lanes
     // naming one address are served one at a time rather than merged into a

@@ -798,7 +798,27 @@ GlobalAccess WarpScheduler::atomic_access(const Warp& warp, const Instruction& i
     return {lanes * instruction_cost(instr.op), latency};
 }
 
-GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& instr)
+// A line's trip to memory. The queue is a single server with a deterministic
+// service time — the simplest thing that can saturate, and the one whose
+// behaviour a reader can predict without simulating it.
+//
+// memory_free_at_ counts in units of 1/lines_a_cycle of a cycle, so that eight
+// lines a cycle is exact rather than rounded to nothing.
+uint32_t WarpScheduler::queue_for_memory(uint64_t now)
+{
+    const uint64_t rate =
+        spec_.memory_lines_a_cycle == 0 ? 1 : spec_.memory_lines_a_cycle;
+    const uint64_t arrives = now * rate;
+    const uint64_t serves = std::max(arrives, memory_free_at_);
+    memory_free_at_ = serves + 1;
+
+    const uint64_t waited = (serves - arrives) / rate;
+    stats_.memory_queue_cycles += waited;
+    return static_cast<uint32_t>(waited);
+}
+
+GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& instr,
+                                          uint64_t now)
 {
     // A store is fire-and-forget, so nothing waits on it whatever it cost.
     const uint32_t store_latency =
@@ -812,6 +832,11 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
     // One line per float asked for at worst, so a sorted array counts them
     // without a set. A vector load asks for three and normally lands them in one
     // line, which is the whole of what it is for.
+    // A queue nobody waits in is not a queue: without latency the warp issues
+    // again immediately whatever the memory system is doing.
+    const bool queueing =
+        bandwidth_ == BandwidthModel::Modelled && latency_ == LatencyModel::Modelled;
+
     const uint32_t components = access_components(instr.op);
     std::array<size_t, WARP_SIZE * VEC3_COMPONENTS> lines{};
     uint32_t n = 0;
@@ -835,7 +860,13 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
     if (memory_ == MemoryModel::Cached) {
         GlobalAccess total;
         for (uint64_t i = 0; i < distinct; ++i) {
-            const GlobalAccess line = cache_lookup(lines[i], instr);
+            GlobalAccess line = cache_lookup(lines[i], instr);
+            if (queueing && line.latency >= MEMORY_LATENCY) {
+                // Only the trips to memory queue. A hit is answered on chip, and
+                // giving the on-chip paths a ceiling too would be two claims
+                // where the measurement can only support one.
+                line.latency += queue_for_memory(now);
+            }
             total.cost += line.cost;
             total.latency = std::max(total.latency, line.latency);
         }
@@ -853,7 +884,16 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
     // completely and must read one it only partly covers, so the two are not
     // alike — but telling them apart means tracking which lanes cover which
     // bytes, and nothing here asks that yet.
-    return {distinct * transaction_cost(instr.op), store_latency};
+    //
+    // Every line is a trip to memory here: Coalesced counts transactions and has
+    // no cache to answer one, so all of them queue.
+    uint32_t waited = 0;
+    if (queueing && store_latency > 0) {
+        for (uint64_t i = 0; i < distinct; ++i) {
+            waited = std::max(waited, queue_for_memory(now));
+        }
+    }
+    return {distinct * transaction_cost(instr.op), store_latency + waited};
 }
 
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
@@ -1374,7 +1414,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
                                   issued.op == Opcode::V_ST_GLOBAL_F32 ||
                                   issued.op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32;
     const bool is_atomic = issued.op == Opcode::V_ATOM_ADD_GLOBAL_F32;
-    const GlobalAccess access = addresses_memory ? global_access(warp, issued)
+    const GlobalAccess access = addresses_memory ? global_access(warp, issued, now)
                                 : is_atomic      ? atomic_access(warp, issued)
                                                  : GlobalAccess{};
 
@@ -1685,6 +1725,10 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
     for (LineCache& l1 : l1s_) {
         l1.clear();
     }
+
+    // A queue drains between launches where a cache's residency does not: one is
+    // a resource in use, the other is what it remembers.
+    memory_free_at_ = 0;
 
     std::vector<Unit> units(l1s_.size());
     bool loaded_any = false;   // a slot took a block this cycle

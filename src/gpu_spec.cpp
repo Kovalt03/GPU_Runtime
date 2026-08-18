@@ -37,11 +37,12 @@ std::string GPUSpec::describe() const
                   "  registers a thread %u\n"
                   "  L1 / L2            %zu / %zu lines of %u bytes\n"
                   "  line cost          L1 %u, L2 %u, miss by opcode\n"
-                  "  line latency       L1 %u, L2 %u, memory %u\n",
+                  "  line latency       L1 %u, L2 %u, memory %u\n"
+                  "  memory delivers    %u lines a cycle\n",
                   sms.sm_count, sms.blocks_per_sm, sms.warp_slots_per_sm, WARP_SIZE,
                   sms.shared_bytes_per_sm, SHARED_MEM_FLOATS, REGS_PER_THREAD, l1_lines,
                   l2_lines, CACHE_LINE_BYTES, L1_HIT_COST, L2_HIT_COST, L1_HIT_LATENCY,
-                  L2_HIT_LATENCY, MEMORY_LATENCY);
+                  L2_HIT_LATENCY, MEMORY_LATENCY, memory_lines_a_cycle);
     return buf;
 }
 
@@ -56,9 +57,10 @@ std::string GPUSpec::to_text() const
                   "warp_slots_per_sm   = %u\n"
                   "shared_bytes_per_sm = %zu\n"
                   "l1_lines            = %zu\n"
-                  "l2_lines            = %zu\n",
+                  "l2_lines            = %zu\n"
+                  "memory_lines_a_cycle = %u\n",
                   sms.sm_count, sms.blocks_per_sm, sms.warp_slots_per_sm,
-                  sms.shared_bytes_per_sm, l1_lines, l2_lines);
+                  sms.shared_bytes_per_sm, l1_lines, l2_lines, memory_lines_a_cycle);
     return buf;
 }
 
@@ -148,6 +150,8 @@ GPUSpec parse_spec(const std::string& text)
             spec.l1_lines = static_cast<size_t>(number);
         } else if (name == "l2_lines") {
             spec.l2_lines = static_cast<size_t>(number);
+        } else if (name == "memory_lines_a_cycle") {
+            spec.memory_lines_a_cycle = static_cast<uint32_t>(number);
         } else {
             throw std::runtime_error("machine spec: no field named " + name);
         }
