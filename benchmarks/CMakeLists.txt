@@ -22,3 +22,8 @@ target_link_libraries(cache_bench PRIVATE gpurt project_warnings)
 # The same comparisons render_bench makes, under the cost models it does not use.
 add_executable(model_bench model_bench.cpp)
 target_link_libraries(model_bench PRIVATE gpurt project_warnings)
+
+# One kernel against several machines, where the others measure kernels against
+# each other on one.
+add_executable(occupancy_bench occupancy_bench.cpp)
+target_link_libraries(occupancy_bench PRIVATE gpurt project_warnings)
