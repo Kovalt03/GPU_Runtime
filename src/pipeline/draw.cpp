@@ -412,7 +412,8 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
 
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                 const DeviceFrame& frame, const DrawTarget& target,
-                                bool predicated, const Shading& shading)
+                                bool predicated, const Shading& shading,
+                                bool async_staging)
 {
     if (shading.mode != ShadingMode::Barycentric) {
         throw std::runtime_error(
@@ -423,6 +424,8 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry
     run_pass_one(rt, geometry, target);
     TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
     args.predicated = predicated;
+    args.staging =
+        async_staging ? TileStaging::AsyncDoubleBuffered : TileStaging::Synchronous;
     run_shared_raster_stage(rt, args);
     return download(rt, frame);
 }

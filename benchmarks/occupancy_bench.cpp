@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -47,9 +48,24 @@ struct Reading {
     uint64_t l2_hits = 0;
 };
 
-using Route = std::vector<Float3> (*)(MyGPURuntime&, const DeviceGeometry&,
-                                      const DeviceFrame&, const DrawTarget&, bool,
-                                      const Shading&);
+// A std::function rather than a plain pointer: draw_shared takes one argument
+// more than the others, and how a tile reaches shared memory is not what this
+// benchmark varies.
+using Route = std::function<std::vector<Float3>(MyGPURuntime&, const DeviceGeometry&,
+                                                const DeviceFrame&, const DrawTarget&,
+                                                bool, const Shading&)>;
+
+// Named rather than passed as draw_walk and friends directly: each of them is
+// overloaded on how the geometry arrives, and a std::function parameter cannot
+// choose between the overloads. Wrapping picks the resident-geometry one.
+#define GPURT_ROUTE(fn)                                                 \
+    [](MyGPURuntime& rt, const DeviceGeometry& g, const DeviceFrame& f, \
+       const DrawTarget& t, bool p,                                     \
+       const Shading& sh) { return fn(rt, g, f, t, p, sh); }
+
+const Route WALK = GPURT_ROUTE(draw_walk);
+const Route TILED = GPURT_ROUTE(draw_tiled);
+const Route SHARED = GPURT_ROUTE(draw_shared);
 
 Reading measure(Route route, const std::vector<Float3>& world, uint32_t sm_count,
                 uint32_t blocks_per_sm)
@@ -118,8 +134,7 @@ int main(int argc, char** argv)
     std::vector<Row> grid;
     for (const uint32_t sms : {1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u}) {
         for (const uint32_t per_sm : {1u, 8u}) {
-            grid.push_back(
-                Row{sms, per_sm, "walk", measure(draw_walk, world, sms, per_sm)});
+            grid.push_back(Row{sms, per_sm, "walk", measure(WALK, world, sms, per_sm)});
         }
     }
 
@@ -143,9 +158,9 @@ int main(int argc, char** argv)
 
     std::vector<Row> routes;
     for (const uint32_t per_sm : {1u, 2u, 4u, 8u, 16u, 32u}) {
-        const Reading walk = measure(draw_walk, world, 1, per_sm);
-        const Reading tiled = measure(draw_tiled, world, 1, per_sm);
-        const Reading shared = measure(draw_shared, world, 1, per_sm);
+        const Reading walk = measure(WALK, world, 1, per_sm);
+        const Reading tiled = measure(TILED, world, 1, per_sm);
+        const Reading shared = measure(SHARED, world, 1, per_sm);
         routes.push_back(Row{1, per_sm, "walk", walk});
         routes.push_back(Row{1, per_sm, "tiled", tiled});
         routes.push_back(Row{1, per_sm, "shared", shared});
@@ -164,8 +179,8 @@ int main(int argc, char** argv)
                 "issued");
 
     std::vector<Row> sharing;
-    for (const auto& [name, route] : std::vector<std::pair<const char*, Route>>{
-             {"walk", draw_walk}, {"tiled", draw_tiled}}) {
+    for (const auto& [name, route] :
+         std::vector<std::pair<const char*, Route>>{{"walk", WALK}, {"tiled", TILED}}) {
         for (const uint32_t per_sm : {1u, 8u}) {
             GPUSpec scaled = MACHINE;
             scaled.l1_lines = 16;

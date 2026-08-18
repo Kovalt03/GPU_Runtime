@@ -68,6 +68,31 @@ struct TileBinning {
 TileBinning bin_triangles(const std::vector<ScreenTriangle>& triangles, uint32_t width,
                           uint32_t height);
 
+// How a tile reaches shared memory. Two shapes rather than two kernels: the walk
+// is the same instructions either way, and a fix landing in one copy of it would
+// leave the two routes drawing different frames.
+enum class TileStaging {
+    // The whole tile at once, a float at a time, through a register. The warp
+    // waits out each load before it can issue the store that follows.
+    Synchronous,
+
+    // A chunk at a time into one of two buffers, with the next chunk's copies
+    // issued before this one is walked. The fetch and the walk overlap, which is
+    // what cp.async is for — and a tile larger than shared memory becomes more
+    // chunks rather than an error.
+    AsyncDoubleBuffered,
+};
+
+// How much of a tile a chunk holds, and how many copies that is a warp.
+//
+// Chosen so that the second number is exact: every warp of the block issues the
+// same count for every chunk, which is what S_CP_ASYNC_WAIT needs — it waits for
+// "all but n", and n has to be a number the kernel knows when it is built. 64
+// triangles is 768 floats, which is three floats for each of the block's 256
+// threads exactly.
+inline constexpr uint32_t TILE_BLOCK_THREADS = TILE_WIDTH * TILE_HEIGHT;
+inline constexpr uint32_t CHUNK_TRIANGLES = 64;
+
 struct TiledRasterStageArgs {
     // Byte offsets from the base of device memory.
     size_t tile_vertices_offset = 0;
@@ -92,6 +117,10 @@ struct TiledRasterStageArgs {
     // out about 2% dearer than the branch, which is what makes the pair worth
     // measuring rather than assuming.
     bool predicated = false;
+
+    // How the shared-memory route gets its tile there. Ignored by the other two,
+    // which stage nothing.
+    TileStaging staging = TileStaging::Synchronous;
 };
 
 // Builds the tiled pass 2. Same picture as build_raster_program, reached by
@@ -121,6 +150,16 @@ inline constexpr uint32_t TILE_TRIANGLE_FLOATS = 3 * SCREEN_VERTEX_FLOATS;
 
 inline constexpr uint32_t SHARED_TRIANGLE_CAPACITY =
     SHARED_MEM_FLOATS / TILE_TRIANGLE_FLOATS;
+
+inline constexpr uint32_t CHUNK_COPIES_A_WARP =
+    CHUNK_TRIANGLES * TILE_TRIANGLE_FLOATS / TILE_BLOCK_THREADS;
+
+static_assert(CHUNK_TRIANGLES * TILE_TRIANGLE_FLOATS % TILE_BLOCK_THREADS == 0,
+              "a chunk has to be a whole number of copies for every thread, or the "
+              "count S_CP_ASYNC_WAIT is given would be wrong for some of them");
+static_assert(2 * CHUNK_TRIANGLES <= SHARED_TRIANGLE_CAPACITY,
+              "two chunks have to fit in shared memory at once, which is what makes "
+              "the double buffering double");
 
 // Builds the shared-memory pass 2. args[0] must point at a
 // TiledRasterStageArgs, whose max_tile_triangles must not exceed

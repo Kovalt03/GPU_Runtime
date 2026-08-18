@@ -243,10 +243,15 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                const DeviceFrame& frame, const DrawTarget& target,
                                bool predicated = false,
                                const Shading& shading = Shading{});
+// async_staging says how the tile reaches shared memory: through a register and
+// a wait a float, or a chunk at a time through copies the warp does not wait for.
+// Same frame either way — it is a cost question, and benchmarks/RESULTS.md has
+// the answer, along with the reason it is a small one here.
 std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                 const DeviceFrame& frame, const DrawTarget& target,
                                 bool predicated = false,
-                                const Shading& shading = Shading{});
+                                const Shading& shading = Shading{},
+                                bool async_staging = false);
 
 // Throws on indexed geometry rather than resolving it. The index buffer exists
 // to feed a vertex stage and this route has none, so an indexed upload is not a

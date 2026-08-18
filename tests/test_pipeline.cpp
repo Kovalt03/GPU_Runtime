@@ -824,6 +824,22 @@ TEST(Pipeline, SharedRasterRejectsATileItCannotStage)
     EXPECT_THROW(run_shared_raster_stage(rt, args), std::runtime_error);
 }
 
+TEST(Pipeline, DoubleBufferedStagingHasNoTileItCannotHold)
+{
+    // The limit above is a property of filling the tile in one pass, not of the
+    // route. Taking it a chunk at a time is what real hardware does with an
+    // overfull tile, and the refusal goes with the single pass.
+    MyGPURuntime rt(1u << 20);
+    TiledRasterStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.tiles_x = 2;
+    args.max_tile_triangles = SHARED_TRIANGLE_CAPACITY + 1;
+    args.staging = TileStaging::AsyncDoubleBuffered;
+
+    EXPECT_NO_THROW(run_shared_raster_stage(rt, args));
+}
+
 TEST(Pipeline, SharedRasterStagesThroughSharedMemory)
 {
     // Cheap structural check: the triangles have to arrive in shared memory,
@@ -1918,4 +1934,45 @@ TEST(Pipeline, TriangleOrderReachesTheCountersOnlyThroughDepth)
     // Ordinary work is unchanged; what the shuffle costs is agreement.
     EXPECT_GT(round_b.stats().warp_steps, round_a.stats().warp_steps);
     EXPECT_GT(round_b.divergence_rate(), round_a.divergence_rate());
+}
+
+// ---------------------------------------------------------------------------
+// Asynchronous staging — the same tile in shared memory, delivered differently
+// ---------------------------------------------------------------------------
+
+TEST(Pipeline, StagingATileAsynchronouslyDrawsWhatStagingItSynchronouslyDoes)
+{
+    // The frame is the check. A chunk the kernel walked before its copies landed
+    // would show up here as whatever shared memory held before them, and the
+    // scheduler refuses that outright — so this passing means both the ordering
+    // and the bytes.
+    //
+    // Sixteen triangles, so the tile lists are long enough that the walk runs
+    // more than one chunk's worth of iterations.
+    const std::vector<Float3> world = scattered_scene();
+    const DrawTarget target = default_target();
+
+    MyGPURuntime sync_rt(1u << 24);
+    MyGPURuntime async_rt(1u << 24);
+    DeviceGeometry sync_geometry = upload(sync_rt, world);
+    DeviceGeometry async_geometry = upload(async_rt, world);
+    DeviceFrame sync_frame = allocate_frame(sync_rt, target);
+    DeviceFrame async_frame = allocate_frame(async_rt, target);
+
+    const std::vector<Float3> synchronous =
+        draw_shared(sync_rt, sync_geometry, sync_frame, target, false, Shading{}, false);
+    const std::vector<Float3> asynchronous = draw_shared(
+        async_rt, async_geometry, async_frame, target, false, Shading{}, true);
+
+    ASSERT_EQ(synchronous.size(), asynchronous.size());
+    for (size_t i = 0; i < synchronous.size(); ++i) {
+        ASSERT_EQ(synchronous[i].x, asynchronous[i].x) << "pixel " << i;
+        ASSERT_EQ(synchronous[i].y, asynchronous[i].y) << "pixel " << i;
+        ASSERT_EQ(synchronous[i].z, asynchronous[i].z) << "pixel " << i;
+    }
+
+    release(sync_rt, sync_frame);
+    release(sync_rt, sync_geometry);
+    release(async_rt, async_frame);
+    release(async_rt, async_geometry);
 }
