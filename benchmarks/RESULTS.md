@@ -963,6 +963,83 @@ cheaply than the first.
 
 ---
 
+## A copy the warp does not wait for
+
+`cp.async` moves global memory into shared memory without a register in between,
+and the warp does not wait for it — it issues the copy, carries on, and meets it
+later at `S_CP_ASYNC_WAIT`. What it replaces is a load into a register and a
+store out of it, with the warp waiting out the load in the middle.
+
+```
+cmake --build build -j8
+./build/benchmarks/async_bench
+```
+
+### The mechanism
+
+A fill and nothing else: one warp, a cache line a float, so every float misses.
+
+| Floats | sync issued | async issued | change | sync cycles | async cycles | change |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 3,232 | 1,216 | -62.4% | 3,250 | 449 | **-86.2%** |
+| 16 | 6,336 | 2,272 | -64.1% | 6,490 | 849 | **-86.9%** |
+| 32 | 12,544 | 4,384 | -65.1% | 12,970 | 1,649 | **-87.3%** |
+| 64 | 24,960 | 8,608 | -65.5% | 25,930 | 3,249 | **-87.5%** |
+
+**The issued work falls because the shared store is gone**, two instructions
+becoming one and the register between them never written.
+
+**The cycles fall by the queue depth.** A warp may hold eight copies in flight,
+so eight trips to memory overlap instead of happening one after another —
+1/8 is 87.5%, and 87.5% is what the last row says. The constant is not a
+guess that happened to work: it is the number the measurement recovers.
+
+### The same mechanism in a renderer
+
+`draw_shared` stages a tile into shared memory and then walks it. The
+asynchronous form takes the tile a chunk at a time and issues the next chunk's
+copies before walking this one, so the fetch and the walk overlap.
+
+| Scene | triangles | sync issued | async issued | change | sync cycles | async cycles | change |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| small, spread | 16 | 739,844 | 833,028 | +12.6% | 19,500 | 19,976 | **+2.4%** |
+| full-frame, stacked | 16 | 4,861,500 | 4,936,892 | +1.6% | 100,834 | 100,359 | -0.5% |
+| full-frame, stacked | 64 | 16,491,932 | 16,517,068 | +0.2% | 335,258 | 330,398 | -1.4% |
+| full-frame, stacked | 128 | 25,913,884 | 25,955,404 | +0.2% | 524,954 | 515,678 | **-1.8%** |
+
+**Eighty-seven percent becomes two.** The frames are identical and the mechanism
+is the same one; what changed is what fraction of the kernel it applies to.
+
+**A staged float is fetched once and read 256 times** — once by each thread of the
+block, since every pixel of the tile walks every triangle in it. Hiding the fetch
+can therefore save at most 1/256 of the walk, and no scene can move that: it is a
+property of the kernel. The gain grows with the triangle count only because more
+triangles mean more chunks and so more overlap, and it converges on that ceiling.
+
+**The small scene loses outright.** A chunk is 64 triangles because
+`S_CP_ASYNC_WAIT` takes a count and the kernel has to know how many copies a
+chunk is; a tile of 16 triangles therefore stages four times what it needs. That
+is +12.6% of issued work on a route where the fetch is 2% of the bill, and it
+prices exactly what a compile-time wait count costs.
+
+### Where it would have paid
+
+The trade is fetch against reuse, and this kernel is at the wrong end of it: it
+stages once and reads 256 times. `cp.async` was introduced for the other end —
+a matrix multiply's inner loop stages a tile and consumes it in a fixed, small
+number of multiply-accumulates, so the fetch is a real fraction of the work and
+double buffering hides it. That kernel is `[m6]`, and it is where this
+instruction will be measured again.
+
+### What it bought that is not a number
+
+The double-buffered route has no tile it cannot hold. The synchronous one stages
+the tile in a single pass and refuses anything over 341 triangles — real hardware
+splits an overfull tile across passes, and taking it a chunk at a time is that
+split. The refusal was a property of filling in one pass, not of the route.
+
+---
+
 ## Summing a warp
 
 The reduction is five rounds either way — the live values halve each time, and
