@@ -12,6 +12,7 @@
 #include "pipeline/raster.hpp"
 #include "pipeline/raster_tiled.hpp"
 #include "pipeline/raytrace.hpp"
+#include "pipeline/swap_chain.hpp"
 #include "pipeline/types.hpp"
 #include "pipeline/vertex.hpp"
 #include "reference.hpp"
@@ -2316,4 +2317,84 @@ TEST(Pipeline, TheSurvivorsAreCompactedRatherThanScattered)
         EXPECT_FLOAT_EQ(vertex.z, -2.0f)
             << "a slot nobody wrote came back among the survivors";
     }
+}
+
+// ---------------------------------------------------------------------------
+// Two frames — the one being drawn is not the one being read
+// ---------------------------------------------------------------------------
+
+TEST(Pipeline, PresentingGivesBackTheFrameThatWasDrawn)
+{
+    const DrawTarget target = default_target(16, 8);
+    MyGPURuntime rt(1u << 22);
+    DeviceGeometry triangle = upload(rt, triangle_at(0.5f, 0.0f));
+
+    SwapChain chain(rt, target);
+    draw_depth_tested(rt, triangle, chain.back(), target);
+    const std::vector<Float3> presented = chain.present();
+
+    uint32_t covered = 0;
+    for (const Float3& pixel : presented) {
+        if (pixel.x + pixel.y + pixel.z > 0.0f) {
+            ++covered;
+        }
+    }
+    EXPECT_GT(covered, 0u) << "the frame that came back is not the one drawn into";
+
+    release(rt, triangle);
+}
+
+TEST(Pipeline, TheNextFrameStartsClearedRatherThanStale)
+{
+    // The risk a queued clear brings: it is not waited for, so if nothing drained
+    // it before the next draw read the pixels, a frame would start from the one
+    // before it. The next draw's own launch is what collects it, and this is the
+    // test that says so.
+    const DrawTarget target = default_target(16, 8);
+    MyGPURuntime rt(1u << 22);
+    DeviceGeometry wide = upload(rt, triangle_at(0.5f, 0.0f));
+    DeviceGeometry narrow = upload(rt, triangle_at(0.5f, 2.5f));  // off to one side
+
+    SwapChain chain(rt, target);
+
+    // A frame that covers a good part of the image.
+    draw_depth_tested(rt, wide, chain.back(), target);
+    const std::vector<Float3> first = chain.present(Float3{0.0f, 0.0f, 0.0f}, 2.0f);
+
+    // And one that covers almost none of it. Where the first frame drew and this
+    // one does not, the pixel has to be the clear colour.
+    draw_depth_tested(rt, narrow, chain.back(), target);
+    const std::vector<Float3> second = chain.present(Float3{0.0f, 0.0f, 0.0f}, 2.0f);
+
+    uint32_t stale = 0;
+    for (size_t i = 0; i < first.size(); ++i) {
+        const bool drawn_before = first[i].x + first[i].y + first[i].z > 0.0f;
+        const bool drawn_now = second[i].x + second[i].y + second[i].z > 0.0f;
+        if (drawn_before && drawn_now && first[i].x == second[i].x &&
+            first[i].y == second[i].y && first[i].z == second[i].z) {
+            ++stale;
+        }
+    }
+    EXPECT_EQ(stale, 0u) << "a pixel came through from the frame before";
+
+    release(rt, narrow);
+    release(rt, wide);
+}
+
+TEST(Pipeline, TheTwoFramesAreDifferentBuffers)
+{
+    // What a swap chain is. Drawing, presenting and drawing again must not have
+    // put both frames in the same place.
+    const DrawTarget target = default_target(16, 8);
+    MyGPURuntime rt(1u << 22);
+
+    SwapChain chain(rt, target);
+    const void* first = chain.back().pixels;
+    chain.present();
+    const void* second = chain.back().pixels;
+    chain.present();
+    const void* third = chain.back().pixels;
+
+    EXPECT_NE(first, second) << "presenting did not change which frame is drawn into";
+    EXPECT_EQ(first, third) << "two buffers should come back round";
 }

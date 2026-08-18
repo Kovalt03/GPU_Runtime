@@ -245,6 +245,15 @@ void release(MyGPURuntime& rt, DeviceFrame& frame);
 void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
                  Float3 colour = Float3{0.0f, 0.0f, 0.0f}, float depth = 2.0f);
 
+// The same, queued on a stream and not waited for.
+//
+// A clear has nothing to do with the frame being drawn, so it need not happen
+// between two draws — it needs only to have happened before the frame it clears
+// is drawn into. Whoever draws next drains the queue, which is why a synchronous
+// draw route is enough to collect it.
+void queue_clear(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                 Float3 colour, float depth, StreamId stream);
+
 // A draw that lands in the frame rather than over it: the depth buffer decides,
 // and a pixel this draw does not cover keeps what the last one left.
 //

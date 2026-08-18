@@ -320,21 +320,51 @@ void release(MyGPURuntime& rt, DeviceFrame& frame)
 
 // --- the routes over what is already there -----------------------------------
 
-void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
-                 Float3 colour, float depth)
+namespace {
+
+// The clear, as a kernel and its arguments. One thread a pixel, four stores
+// each — a kernel rather than a transfer from the host because a frame cleared
+// every frame is device work, and because the depth and the colour are two
+// buffers, so a host clear would be two transfers of what the device is about to
+// overwrite.
+struct ClearArgs {
+    size_t framebuffer_offset = 0;
+    size_t depth_offset = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    Float3 colour;
+    float depth = 2.0f;
+};
+
+Program build_clear_program(void** raw)
 {
-    // One thread a pixel, four stores each. A kernel rather than a memcpy from
-    // the host because a frame that has to be cleared every frame is device work
-    // — and because the depth and the colour are two buffers, so a host clear
-    // would be two transfers of the thing the device is about to overwrite.
-    struct ClearArgs {
-        size_t framebuffer_offset = 0;
-        size_t depth_offset = 0;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        Float3 colour;
-        float depth = 2.0f;
-    };
+    const ClearArgs& a = *static_cast<const ClearArgs*>(raw[0]);
+    IRBuilder k;
+    const Reg<Scalar> px = k.thread_x();
+    const Reg<Scalar> py = k.thread_y();
+    k.if_(k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
+                k.lt(py, k.constant(static_cast<float>(a.height)))),
+          [&] {
+              const Reg<Scalar> pixel =
+                  k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
+              const Reg<Scalar> at =
+                  k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
+              const float base = static_cast<float>(a.framebuffer_offset);
+              k.store(at, k.constant(a.colour.x), base + 0.0f);
+              k.store(at, k.constant(a.colour.y), base + 4.0f);
+              k.store(at, k.constant(a.colour.z), base + 8.0f);
+
+              const Reg<Scalar> depth_at =
+                  k.add(k.constant(static_cast<float>(a.depth_offset)),
+                        k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
+              k.store(depth_at, k.constant(a.depth), 0.0f);
+          });
+    return k.build();
+}
+
+ClearArgs clear_args(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                     Float3 colour, float depth)
+{
     ClearArgs args;
     args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
     args.depth_offset = rt.myrt_device_offset(frame.depth);
@@ -342,37 +372,37 @@ void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& t
     args.height = target.height;
     args.colour = colour;
     args.depth = depth;
+    return args;
+}
 
-    const auto build = [](void** raw) {
-        const ClearArgs& a = *static_cast<const ClearArgs*>(raw[0]);
-        IRBuilder k;
-        const Reg<Scalar> px = k.thread_x();
-        const Reg<Scalar> py = k.thread_y();
-        k.if_(k.min(k.lt(px, k.constant(static_cast<float>(a.width))),
-                    k.lt(py, k.constant(static_cast<float>(a.height)))),
-              [&] {
-                  const Reg<Scalar> pixel =
-                      k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
-                  const Reg<Scalar> at =
-                      k.mul(pixel, k.constant(static_cast<float>(PIXEL_BYTES)));
-                  const float base = static_cast<float>(a.framebuffer_offset);
-                  k.store(at, k.constant(a.colour.x), base + 0.0f);
-                  k.store(at, k.constant(a.colour.y), base + 4.0f);
-                  k.store(at, k.constant(a.colour.z), base + 8.0f);
+dim3 clear_grid(const DrawTarget& target)
+{
+    return dim3{(target.width + WARP_SIZE - 1) / WARP_SIZE, target.height, 1};
+}
 
-                  const Reg<Scalar> depth_at =
-                      k.add(k.constant(static_cast<float>(a.depth_offset)),
-                            k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
-                  k.store(depth_at, k.constant(a.depth), 0.0f);
-              });
-        return k.build();
-    };
+}  // namespace
 
-    const dim3 block{WARP_SIZE, 1, 1};
-    const dim3 grid{(target.width + WARP_SIZE - 1) / WARP_SIZE, target.height, 1};
+void clear_frame(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                 Float3 colour, float depth)
+{
+    ClearArgs args = clear_args(rt, frame, target, colour, depth);
     void* raw[] = {&args};
-    rt.myrt_launch(build, grid, block, raw);
+    rt.myrt_launch(build_clear_program, clear_grid(target), dim3{WARP_SIZE, 1, 1}, raw);
     rt.myrt_sync(false);
+}
+
+void queue_clear(MyGPURuntime& rt, const DeviceFrame& frame, const DrawTarget& target,
+                 Float3 colour, float depth, StreamId stream)
+{
+    // args must outlive the launch, and this one returns immediately — so the
+    // kernel is built here, where the arguments are still alive. myrt_launch_async
+    // calls the builder before it returns, which is what makes that safe.
+    ClearArgs args = clear_args(rt, frame, target, colour, depth);
+    void* raw[] = {&args};
+    const Program prog = build_clear_program(raw);
+    rt.myrt_launch_async([prog](void**) { return prog; },
+                         LaunchConfig{clear_grid(target), dim3{WARP_SIZE, 1, 1}}, nullptr,
+                         stream);
 }
 
 std::vector<Float3> draw_depth_tested(MyGPURuntime& rt, const DeviceGeometry& geometry,
