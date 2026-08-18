@@ -833,6 +833,136 @@ and 24.7% of the cycles. The digits are new; the findings are the same ones.
 
 ---
 
+## Two queues
+
+An SM can hold two blocks; until now they always came from the same launch. A
+stream is a queue, launches in one run in order, and launches in different ones
+are free to overlap — which is the first time this machine has been asked to run
+two kernels at once.
+
+```
+cmake --build build -j8
+./build/benchmarks/stream_bench
+./build/benchmarks/stream_bench --machine machines/a100.spec
+```
+
+### A machine one grid cannot fill
+
+Eight blocks of compute on eight SMs holding one block each, cut into launches.
+The work is identical in every row; only the number of queues changes.
+
+| Launches | blocks each | one stream | n streams | speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 90 | 90 | 1.00x |
+| 2 | 4 | 180 | 90 | **2.00x** |
+| 4 | 2 | 360 | 90 | **4.00x** |
+| 8 | 1 | 720 | 90 | **8.00x** |
+
+**A grid that fits gains nothing, and one that does not gains everything.** The
+first row is the control: eight blocks already reach eight SMs, and a second
+queue has nowhere to put anything. Every row below it is the same work through a
+narrower door, and concurrency opens the door back up — the eight single-block
+launches take eight times as long in one queue and exactly as long as one launch
+in eight.
+
+This is the case a stream exists for, and it is common: a shadow map, a
+post-process, a reduction over a small buffer. None of them is wide enough to
+fill a modern machine, and the machine only gets wider.
+
+### Covering one kernel's waiting with another
+
+Two launches on one SM holding two blocks. `memory` is sixteen loads of a line
+each, `compute` sixteen fused multiply-adds; they read separate buffers, so
+nothing here is one of them finding a line the other fetched.
+
+| First | second | 1st alone | 2nd alone | one stream | two streams | hidden |
+|---|---|---:|---:|---:|---:|---:|
+| compute | compute | 90 | 90 | 180 | 92 | 97.78% |
+| memory | memory | 6,490 | 6,490 | 12,980 | 6,492 | **99.97%** |
+| memory | compute | 6,490 | 90 | 6,580 | 6,490 | **100.00%** |
+
+*hidden* is what concurrency took off the shorter of the two, which is the most it
+could take: nothing retires sooner than the longer kernel does alone.
+
+**Two memory kernels cost one.** A warp waiting 400 cycles for a line leaves 399
+issue slots behind it, and a second kernel needs 22. The waiting is so much larger
+than the work that the second launch is free — `[m3]` found this among warps of
+one kernel, and it turns out not to care whether the warps came from the same
+launch at all.
+
+**Which is the honest form of the usual advice.** Pairing a memory-bound kernel
+with a compute-bound one is what streams are recommended for, and it is the row
+that hides everything — but so is memory with memory, on this machine. The
+mechanism is idle issue slots, not complementary units: there are no separate
+units here to complement. A machine with distinct load and arithmetic pipes would
+separate those two rows, and this one cannot.
+
+### A grid the host never learns
+
+A cull pass adds up eight visibility flags and writes the total where the launch
+after it reads its grid. `host` is that same grid launched the ordinary way.
+
+| Visible | grid | indirect work | cycles | host work | cycles |
+|---:|---:|---:|---:|---:|---:|
+| 8 | 8 | 6,924 | 900 | 6,688 | 90 |
+| 4 | 4 | 3,580 | 900 | 3,344 | 90 |
+| 2 | 2 | 1,908 | 900 | 1,672 | 90 |
+| 0 | 0 | 236 | 810 | 0 | 0 |
+
+**Reading the grid from memory costs nothing.** Every row's difference in issued
+work is 236, and the last row says what 236 is: the cull, on its own, deciding
+nothing. The indirect launch itself adds not one lane-op — the grid is read once
+on the host side of the simulator, between one launch retiring and the next
+starting, which is where hardware's command processor reads it too.
+
+**What it does cost is a serial pass.** 810 of those 900 cycles are the cull, and
+it is one thread walking eight flags because this ISA has no atomic to combine
+lanes with. The shape is right — a pass that looks at everything and says how much
+survived — and the implementation is the slowest possible one. A real culling
+pass is one thread per candidate and a reduction; that needs an atomic or a
+prefix sum, and neither exists here yet.
+
+**Zero survivors is a launch that runs.** The last row's grid is empty and the
+draw issues nothing at all, without the host ever being told. That is the whole
+premise of GPU-driven rendering, and it is now expressible.
+
+### What this cost the figures above
+
+Two scheduler rules changed with it, and both were wrong before streams made them
+visible.
+
+**The clock no longer jumps past a block that arrived this cycle.** A slot taking a
+new block while the SM's other warps were waiting used to be skipped over to the
+moment the waiters wake, so a block that could have issued immediately sat out the
+gap. A second stream's block arriving into an SM stalled on the first would have
+been made to wait for a kernel it has nothing to do with.
+
+**Blocks are handed out breadth first from an empty machine.** Residency is counted
+a block at a time now — two kernels on one SM have no single residency number
+between them — and the prologue that placed the first block before the fill went
+with it. That prologue was an off-by-one at the head of a breadth-first pass: SM 0
+received a second block before SM 1 had its first, and at 64 blocks on 64 SMs it
+left the last SM empty.
+
+Only rows with more than one SM or more than one block an SM can reach either, so
+the defaults are untouched: `render_bench`, `cache_bench` and `model_bench` are
+byte-identical. What moved is inside *Several SMs*, by tenths of a percent and in
+both directions:
+
+| | before | after | which rule |
+|---|---:|---:|---|
+| 1 SM, 8 blocks | 76,490 | 76,484 | the clock |
+| 8 SMs, 1 block | 71,998 | 71,982 | the clock |
+| 16 SMs, 8 blocks | 9,446 | **9,347** | the fill |
+| 32 SMs, 8 blocks | 9,967 | **9,593** | the fill |
+| 1 SM, 2 blocks | 283,962 | 284,185 | the clock |
+
+Issuing sooner can cost more, which is why the last row goes the other way: it
+reorders which warp reaches a line first, and a cache answers the second asker more
+cheaply than the first.
+
+---
+
 ## Summing a warp
 
 The reduction is five rounds either way — the live values halve each time, and

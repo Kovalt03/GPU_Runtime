@@ -54,13 +54,13 @@ grows only with the perimeter.
   ┌────────────────────▼─────────────────────────────┐
   │                 Runtime API                      │
   │              include/runtime.hpp                 │
-  │   malloc / free / memcpy / launch / sync / stats │
+  │   malloc / memcpy / launch / stream / sync       │
   └──────┬───────────────────────────────────────────┘
          │  delegates warp execution
   ┌──────▼───────────────────────────────────────────┐
   │              Warp Scheduler                      │
   │            include/scheduler.hpp                 │
-  │   Round-robin · divergence statistics counters   │
+  │   SMs · residency · round-robin · divergence     │
   └──────┬───────────────────────────────────────────┘
          │  executes instructions per warp
   ┌──────▼───────────────────────────────────────────┐
@@ -181,6 +181,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # What several SMs buy, and what stops a kernel from using them
 ./build/benchmarks/occupancy_bench          # benchmarks/result/occupancy.{md,csv}
+
+# What a second queue buys, and a grid the host never learns
+./build/benchmarks/stream_bench             # benchmarks/result/stream.{md,csv}
 
 # Any of them on another machine — machines/ holds the files
 ./build/benchmarks/render_bench --machine machines/a100.spec
@@ -494,7 +497,10 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Persistent buffers | modelled — `upload` / `release` hold geometry between draws, and a repeated draw of what fits refetches nothing. Capacity and compulsory misses are told apart by whether a second draw pays again |
 | Early-Z / depth prepass | modelled — `draw_early_z` runs a depth pass and then shades only the triangle it names. It loses here, by a ratio the shade and the coverage test decide |
 | Fragment shading | flat lighting: a point light, a face normal a triangle, one normalize a pixel. No textures, no shadows |
-| Streams, async copy | **absent** — every launch is synchronous |
+| Streams, concurrent kernels | modelled — launches queue, one stream runs in order and separate streams overlap. Work partitions between them exactly; cycles are charged to every stream that was resident, so they add to more than the wall clock and the surplus is the overlap |
+| Indirect launch | modelled — `myrt_launch_indirect` reads its grid from device memory when the launch reaches the machine, so the kernel before it in the stream decides its size. Reading it costs no lane-op at all |
+| Asynchronous copy (`cp.async`) | **absent** — a transfer is a host call that completes before it returns, so shared-memory staging can only be the synchronous kind |
+| Atomics | **absent** — nothing combines lanes into one number, which is why the culling pass in `stream_bench` is a single thread walking a buffer |
 
 ### The three that matter most
 
@@ -509,11 +515,12 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**Streams and concurrent kernels.** Blocks of one launch now overlap, on several
-SMs and several to an SM. Two *launches* still do not: `myrt_launch` returns when
-the last block retires, so nothing hides the tail of one kernel behind the start
-of another, and there is no indirect launch — a grid's size is a host number, which
-is the one thing GPU-driven rendering cannot be built on.
+**Atomics.** There is no instruction that combines what the lanes hold into one
+number, so anything whose answer is a single value has to be walked serially by one
+thread. That is what the culling pass in `stream_bench` does, and 810 of its 900
+cycles are the walk. Streams and indirect launch made the pass expressible — a
+kernel now decides how much work the kernel after it does — and this is what stands
+between that and a culling pass with the shape a real one has.
 
 ---
 
