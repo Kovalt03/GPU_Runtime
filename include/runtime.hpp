@@ -35,6 +35,23 @@ struct LaunchConfig {
     size_t shared_bytes = 0;
 };
 
+// Where an indirect launch reads its grid, and everything else a launch declares.
+//
+// The grid is three consecutive floats in device memory — x, y, z — rather than
+// a dim3 the host filled in, which is the whole difference: a kernel can write
+// them, so the size of one launch can be decided by the one before it. Floats
+// because the ISA has no integer register to write them from, and whole numbers
+// are exact to 2^24.
+//
+// A grid of zero is legal here where it is an error in LaunchConfig. Nothing to
+// draw is a result a culling pass is entitled to reach, and a launch that
+// refused it would make the host check what it just asked the device to decide.
+struct IndirectLaunchConfig {
+    size_t grid_offset = 0;
+    dim3 block;
+    size_t shared_bytes = 0;
+};
+
 // Which queue a launch waits in. Launches sharing one run in order; launches in
 // different ones are unordered, and the machine interleaves their blocks.
 //
@@ -127,6 +144,16 @@ public:
     // stream's blocks take.
     void myrt_launch_async(KernelFunc kernel, const LaunchConfig& config, void** args,
                            StreamId stream = DEFAULT_STREAM);
+
+    // The same, with the grid read from device memory when the launch reaches the
+    // machine rather than when it is queued.
+    //
+    // The delay is the point. A kernel earlier in the same stream can write those
+    // three floats, so a culling pass can decide how much work the pass after it
+    // does without the host ever learning the number — the premise GPU-driven
+    // rendering is built on.
+    void myrt_launch_indirect(KernelFunc kernel, const IndirectLaunchConfig& config,
+                              void** args, StreamId stream = DEFAULT_STREAM);
 
     // A fresh stream id. Ordered against nothing, including the default stream.
     StreamId myrt_stream_create();
@@ -221,6 +248,8 @@ private:
         dim3 block;
         size_t shared_bytes = 0;
         StreamId stream = DEFAULT_STREAM;
+        bool indirect = false;
+        size_t grid_offset = 0;
     };
 
     std::vector<QueuedLaunch> queue_;
@@ -240,6 +269,11 @@ private:
     // Seeds one block's threads with the coordinates a kernel reads.
     void seed_block(ThreadBlock& tb, const QueuedLaunch& launch, uint32_t block_id,
                     uint32_t warps) const;
+
+    // Reads three floats from device memory. Throws if they are not whole,
+    // non-negative numbers, or if the offset is not three floats inside the
+    // device arena.
+    dim3 read_grid(size_t offset) const;
 
     // "[STATS] divergence: X.X%, throughput: X.X GIOPS"
     void print_stats() const;

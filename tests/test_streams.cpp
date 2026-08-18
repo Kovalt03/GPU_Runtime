@@ -314,3 +314,108 @@ TEST(Streams, AStreamsTotalsStandAfterAWaitAndAreClearedByASync)
     EXPECT_EQ(rt.myrt_stream_stats(DEFAULT_STREAM).warp_steps, 0u)
         << "a stream's share is cleared with the totals it belongs to";
 }
+
+// ---------------------------------------------------------------------------
+// Indirect launches — a grid the host never sees
+// ---------------------------------------------------------------------------
+
+TEST(Streams, AnIndirectLaunchReadsItsGridFromDeviceMemory)
+{
+    MyGPURuntime rt = make_runtime();
+    void* out = rt.myrt_malloc(128 * sizeof(float));
+    void* grid = rt.myrt_malloc(3 * sizeof(float));
+    const float dims[3] = {3.0f, 1.0f, 1.0f};
+    rt.myrt_memcpy(grid, dims, sizeof(dims), Direction::HostToDevice);
+
+    IndirectLaunchConfig config;
+    config.grid_offset = rt.myrt_device_offset(grid);
+    config.block = dim3{32, 1, 1};
+    rt.myrt_launch_indirect(
+        constant_kernel(store_kernel(rt.myrt_device_offset(out), 5.0f)), config, nullptr);
+    rt.myrt_sync(false);
+
+    const std::vector<float> back = read_back(rt, out, 128);
+    for (uint32_t i = 0; i < 96; ++i) {
+        EXPECT_FLOAT_EQ(back[i], 5.0f) << "thread " << i;
+    }
+    EXPECT_FLOAT_EQ(back[96], 0.0f) << "a fourth block would have written here";
+}
+
+TEST(Streams, TheKernelBeforeItDecidesAnIndirectLaunchsGrid)
+{
+    // The premise of GPU-driven rendering: the size of one launch is a result the
+    // device computed, and the host is never told it.
+    MyGPURuntime rt = make_runtime();
+    void* out = rt.myrt_malloc(128 * sizeof(float));
+    void* grid = rt.myrt_malloc(3 * sizeof(float));
+    const size_t grid_offset = rt.myrt_device_offset(grid);
+
+    const float dims[3] = {0.0f, 0.0f, 0.0f};
+    rt.myrt_memcpy(grid, dims, sizeof(dims), Direction::HostToDevice);
+
+    // One thread writes the grid the launch after it will run at.
+    const Program writer{
+        make_v_mov_f32(1, static_cast<float>(grid_offset)),
+        make_v_mov_f32(2, 2.0f),
+        make_v_st_global_f32(1, 2),
+        make_v_mov_f32(3, 1.0f),
+        make_v_st_global_f32(1, 3, 4.0f),
+        make_v_st_global_f32(1, 3, 8.0f),
+        make_ret(),
+    };
+    rt.myrt_launch_async(constant_kernel(writer),
+                         LaunchConfig{dim3{1, 1, 1}, dim3{1, 1, 1}}, nullptr);
+
+    IndirectLaunchConfig config;
+    config.grid_offset = grid_offset;
+    config.block = dim3{32, 1, 1};
+    rt.myrt_launch_indirect(
+        constant_kernel(store_kernel(rt.myrt_device_offset(out), 9.0f)), config, nullptr);
+    rt.myrt_sync(false);
+
+    const std::vector<float> back = read_back(rt, out, 128);
+    EXPECT_FLOAT_EQ(back[63], 9.0f) << "two blocks ran";
+    EXPECT_FLOAT_EQ(back[64], 0.0f) << "and no more than two";
+}
+
+TEST(Streams, AnEmptyIndirectGridRunsNothing)
+{
+    // Nothing to draw is a result a culling pass is entitled to reach.
+    MyGPURuntime rt = make_runtime();
+    void* grid = rt.myrt_malloc(3 * sizeof(float));
+    const float dims[3] = {0.0f, 1.0f, 1.0f};
+    rt.myrt_memcpy(grid, dims, sizeof(dims), Direction::HostToDevice);
+
+    IndirectLaunchConfig config;
+    config.grid_offset = rt.myrt_device_offset(grid);
+    config.block = dim3{32, 1, 1};
+    rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr);
+    rt.myrt_wait();
+
+    EXPECT_EQ(rt.stats().warp_steps, 0u);
+    EXPECT_EQ(rt.stats().cycles, 0u);
+}
+
+TEST(Streams, AnIndirectGridMustBeWholeNumbers)
+{
+    MyGPURuntime rt = make_runtime();
+    void* grid = rt.myrt_malloc(3 * sizeof(float));
+    const float dims[3] = {1.5f, 1.0f, 1.0f};
+    rt.myrt_memcpy(grid, dims, sizeof(dims), Direction::HostToDevice);
+
+    IndirectLaunchConfig config;
+    config.grid_offset = rt.myrt_device_offset(grid);
+    config.block = dim3{32, 1, 1};
+    rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr);
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+}
+
+TEST(Streams, AnIndirectGridMustLieInDeviceMemory)
+{
+    MyGPURuntime rt = make_runtime();
+    IndirectLaunchConfig config;
+    config.grid_offset = TEST_DEVICE_BYTES - sizeof(float);
+    config.block = dim3{32, 1, 1};
+    rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr);
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+}

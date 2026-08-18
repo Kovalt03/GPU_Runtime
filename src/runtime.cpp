@@ -112,6 +112,25 @@ void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
     }
 }
 
+dim3 MyGPURuntime::read_grid(size_t offset) const
+{
+    if (offset % sizeof(float) != 0 || offset + 3 * sizeof(float) > mem_->device_size()) {
+        throw std::runtime_error(
+            "myrt_launch_indirect: the grid must be three aligned floats inside "
+            "device memory");
+    }
+    const float* p = reinterpret_cast<const float*>(mem_->device_base() + offset);
+
+    // The same decoder the ISA's addresses go through, so that a grid written by
+    // a kernel is read under the rule the kernel wrote it under. A dimension is
+    // one number and cannot be half of one.
+    dim3 grid;
+    grid.x = static_cast<uint32_t>(decode_address(p[0], "indirect grid x"));
+    grid.y = static_cast<uint32_t>(decode_address(p[1], "indirect grid y"));
+    grid.z = static_cast<uint32_t>(decode_address(p[2], "indirect grid z"));
+    return grid;
+}
+
 void MyGPURuntime::myrt_launch(KernelFunc kernel, const LaunchConfig& config, void** args)
 {
     // Queued and drained at once, which is what makes it synchronous. Anything
@@ -137,6 +156,23 @@ void MyGPURuntime::myrt_launch_async(KernelFunc kernel, const LaunchConfig& conf
     // Called once for the whole launch, not once per thread: every thread runs
     // these same instructions, and only their registers differ. Called here
     // rather than at the drain so that args may die with the calling scope.
+    launch.program = kernel(args);
+    enqueue(std::move(launch));
+}
+
+void MyGPURuntime::myrt_launch_indirect(KernelFunc kernel,
+                                        const IndirectLaunchConfig& config, void** args,
+                                        StreamId stream)
+{
+    if (config.block.volume() == 0) {
+        throw std::runtime_error("myrt_launch_indirect: block must be non-empty");
+    }
+    QueuedLaunch launch;
+    launch.block = config.block;
+    launch.shared_bytes = config.shared_bytes;
+    launch.stream = stream;
+    launch.indirect = true;
+    launch.grid_offset = config.grid_offset;
     launch.program = kernel(args);
     enqueue(std::move(launch));
 }
@@ -195,9 +231,14 @@ void MyGPURuntime::drain()
         // so a 256x256 launch would otherwise materialise tens of megabytes of
         // blocks before the first instruction issued.
         launches[i].next_block = [this, i, &cursors](ThreadBlock& tb) {
-            const QueuedLaunch& launch = queue_[i];
+            QueuedLaunch& launch = queue_[i];
             Cursor& cursor = cursors[i];
             if (!cursor.resolved) {
+                // First asked for when the launch reaches the machine, which for
+                // an indirect one is after whatever wrote its grid has retired.
+                if (launch.indirect) {
+                    launch.grid = read_grid(launch.grid_offset);
+                }
                 cursor.blocks = launch.grid.volume();
                 cursor.warps = (launch.block.volume() + WARP_SIZE - 1) / WARP_SIZE;
                 cursor.resolved = true;
