@@ -31,3 +31,7 @@ target_link_libraries(occupancy_bench PRIVATE gpurt project_warnings)
 # The first benchmark to hand the machine two kernels at once.
 add_executable(stream_bench stream_bench.cpp)
 target_link_libraries(stream_bench PRIVATE gpurt project_warnings)
+
+# What a copy the warp does not wait for buys — on its own, and in a renderer.
+add_executable(async_bench async_bench.cpp)
+target_link_libraries(async_bench PRIVATE gpurt project_warnings)
