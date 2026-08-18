@@ -47,3 +47,7 @@ target_link_libraries(ser_bench PRIVATE gpurt project_warnings)
 # What a block reading its neighbour's shared memory is worth.
 add_executable(cluster_bench cluster_bench.cpp)
 target_link_libraries(cluster_bench PRIVATE gpurt project_warnings)
+
+# The kernel V_MMA_16X16X16_F32 and cp.async were both waiting for.
+add_executable(gemm_bench gemm_bench.cpp)
+target_link_libraries(gemm_bench PRIVATE gpurt project_warnings)
