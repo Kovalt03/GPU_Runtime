@@ -12,7 +12,13 @@ cmake --build build -j8
 ./build/benchmarks/reduction_bench  #         plus benchmarks/result/reduction.{md,csv}
 ./build/benchmarks/cache_bench      #         plus benchmarks/result/cache.{md,csv}
 ./build/benchmarks/model_bench      #         plus benchmarks/result/models.{md,csv}
+./build/benchmarks/occupancy_bench  #         plus benchmarks/result/occupancy.{md,csv}
 ```
+
+**Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
+writes the machine it ran on into its output directory. With no flag it is
+`machines/default.spec` — one SM holding one block — which is what every table
+here was taken on unless it says otherwise.
 
 **Which cost model.** Every figure here is taken with a global access charged per
 lane and no instruction waiting on another — `MemoryModel::Flat` and
@@ -350,8 +356,8 @@ three wide ones. The frames are identical.
 |---|---:|---:|---:|
 | Flat | 31,517,216 | 31,517,216 | **0.0%** |
 | Coalesced | 2,410,016 | 1,814,816 | **-24.7%** |
-| Cached | 1,517,928 | 1,470,312 | -3.1% |
-| Cycles, cached and latency | 430,092 | 245,772 | **-42.9%** |
+| Cached | 1,509,612 | 1,461,996 | -3.2% |
+| Cycles, cached and latency | 376,542 | 192,222 | **-49.0%** |
 | Warp steps | 33,436 | 27,292 | -18.4% |
 
 64x32, 16 triangles. The rows are the same kernel under different cost models, so
@@ -362,14 +368,14 @@ opcode waited: three floats cost three floats however many instructions ask for
 them. Charged by the line, twelve bytes at one address are one transaction where
 three loads are three.
 
-**A cache had already absorbed most of the issue saving.** 24.7% against 3.1% —
+**A cache had already absorbed most of the issue saving.** 24.7% against 3.2% —
 the second and third scalar loads were finding their line in L1 at a cost of 8
-rather than missing at 100. The transactions still fall, L1 hits going 9,409 to
-3,457, but what a wide load saves in capacity a cache mostly saves first.
+rather than missing at 100. The transactions still fall, L1 hits going 9,787 to
+3,835, but what a wide load saves in capacity a cache mostly saves first.
 
 **What the cache does not absorb is the waiting.** Issue is in-order with no
 scoreboard: a warp that has issued a load cannot issue again until the result
-arrives, so three loads are three waits whatever each one cost. Cycles fall 42.9%
+arrives, so three loads are three waits whatever each one cost. Cycles fall 49.0%
 with the cache and 64.9% without it.
 
 **The divergence rate rises, 12.5% to 15.0%, and nothing diverged.** The removed
@@ -450,11 +456,17 @@ shared memory 30, and a global load from wherever its line was found — L1 30, 
 
 | Warps | Steps | Cycles | Stalls | Cycles/warp |
 |---:|---:|---:|---:|---:|
-| 1 | 6 | 30 | 24 | 30.0 |
-| 2 | 12 | 32 | 20 | 16.0 |
-| 4 | 24 | 36 | 12 | 9.0 |
-| 8 | 48 | 56 | 8 | 7.0 |
+| 1 | 6 | 45 | 39 | 45.0 |
+| 2 | 12 | 46 | 34 | 23.0 |
+| 4 | 24 | 48 | 24 | 12.0 |
+| 8 | 48 | 64 | 16 | 8.0 |
 | 16 | 96 | 96 | 0 | **6.0** |
+
+The program is the one in `MoreWarpsCoverMoreOfTheWaiting`: a mov, an add, a
+reciprocal, an add, a reciprocal, each waiting on the one before. An earlier
+printing of this table came from a program that was never committed, which is the
+failure this project has recorded once already — the numbers here are from the
+chain a test holds.
 
 A chain of dependent arithmetic, and the reason warps are batched at all: one warp
 waits out every latency alone, sixteen cover it completely. This is the first thing
@@ -488,12 +500,12 @@ modelled:
 
 | L1 lines | Vertices held | Cost | | Cycles | | L2 hits |
 |---:|---:|---:|---:|---:|---:|---:|
-| 2 | 16 | 43,413,292 | -0.23% | 26,486,224 | -2.9% | 71,838 → 67,230 |
-| 4 | 32 | 42,348,822 | -1.33% | 18,347,984 | -19.4% | 44,765 → 18,845 |
-| 8 | 64 | 42,057,366 | **-1.60%** | 16,095,824 | **-24.7%** | 36,637 → 5,597 |
-| 16 | 128 | 42,044,694 | -0.87% | 15,997,904 | -15.1% | 21,725 → 5,021 |
-| 32 | 256 | 42,023,574 | +0.02% | 15,834,704 | +0.4% | 3,677 → 4,061 |
-| 1024 (hardware) | 8,192 | 42,015,126 | -0.00% | 15,769,424 | 0.0% | 3,677 → 3,677 |
+| 2 | 16 | 43,413,362 | -0.23% | 26,486,224 | -2.9% | 71,837 → 67,229 |
+| 4 | 32 | 42,348,914 | -1.33% | 18,347,984 | -19.4% | 44,765 → 18,845 |
+| 8 | 64 | 42,057,458 | **-1.60%** | 16,095,824 | **-24.7%** | 36,637 → 5,597 |
+| 16 | 128 | 42,044,786 | -0.85% | 15,997,904 | -14.9% | 21,473 → 5,021 |
+| 32 | 256 | 42,016,736 | +0.07% | 15,781,154 | +1.5% | 2,354 → 3,746 |
+| 1024 (hardware) | 8,192 | 41,934,830 | -0.00% | 15,158,954 | 0.0% | 23 → 23 |
 
 **It is not fewer fetches.** The misses are 226 in every row, before and after: each
 line is compulsory, touched once by someone whatever the order. What the reorder
@@ -527,17 +539,17 @@ Three draws of one upload, latency modelled:
 
 | Triangles | Cache | Draw | Misses | Cost | Cycles |
 |---:|---|---:|---:|---:|---:|
-| 360 | hardware | 1 | 192 | 37,136,442 | 13,975,936 |
-| 360 | hardware | 2 | **0** | 37,123,002 | 13,975,936 |
-| 360 | hardware | 3 | **0** | 37,123,002 | 13,975,936 |
-| 3,000 | scaled | 1 | 72,318 | 313,916,878 | 130,742,840 |
-| 3,000 | scaled | 2 | **72,318** | 313,916,878 | 130,742,840 |
-| 3,000 | scaled | 3 | **72,318** | 313,916,878 | 130,742,840 |
+| 360 | hardware | 1 | 192 | 36,945,024 | 12,519,376 |
+| 360 | hardware | 2 | **0** | 36,931,584 | 12,519,376 |
+| 360 | hardware | 3 | **0** | 36,931,584 | 12,519,376 |
+| 3,000 | scaled | 1 | 72,255 | 313,909,546 | 130,742,840 |
+| 3,000 | scaled | 2 | **72,255** | 313,909,546 | 130,742,840 |
+| 3,000 | scaled | 3 | **72,255** | 313,909,546 | 130,742,840 |
 
 **The distinction is now measurable, and the answer is that both kinds exist.**
 At the hardware sizes the scene fits and a second draw fetches nothing at all —
 every one of those 192 misses was compulsory. Scaled down until the scene
-outgrows L2, the same 72,318 misses recur on every draw: those are capacity
+outgrows L2, the same 72,255 misses recur on every draw: those are capacity
 misses, and holding the geometry buys nothing, because what evicted it was the
 rest of the same draw.
 
@@ -571,12 +583,12 @@ Positive means the blend costs more. `cycles` is time under `Cached` and
 
 | Scene | Route | flat | coalesced | cached | cycles |
 |---|---|---:|---:|---:|---:|
-| small, spread | walk | +2.0% | +28.1% | +47.2% | +15.8% |
-| small, spread | tiled | +1.6% | +19.4% | +32.1% | +14.7% |
-| small, spread | raytrace | +4.4% | **+75.4%** | **+92.6%** | +46.0% |
-| full-frame, stacked | walk | +1.9% | +27.4% | +45.8% | +15.8% |
-| full-frame, stacked | tiled | +1.9% | +27.1% | +45.4% | +25.4% |
-| full-frame, stacked | raytrace | +2.5% | +32.0% | +37.2% | +26.8% |
+| small, spread | walk | +2.0% | +28.3% | +47.5% | +17.9% |
+| small, spread | tiled | +1.6% | +20.2% | +32.5% | +17.7% |
+| small, spread | raytrace | +4.4% | **+75.4%** | **+93.1%** | +58.2% |
+| full-frame, stacked | walk | +1.9% | +27.6% | +46.1% | +17.9% |
+| full-frame, stacked | tiled | +1.9% | +27.3% | +45.4% | +24.0% |
+| full-frame, stacked | raytrace | +2.5% | +32.0% | +37.4% | +32.7% |
 
 **The flat model was flattering predication by a factor of twenty.** Both variants
 make the same loads, and at 100 a lane those loads were most of the bill —
@@ -597,8 +609,8 @@ divergence and going faster are different things.**
 
 | Mesh | Triangles | flat | coalesced | cached | cycles |
 |---|---:|---:|---:|---:|---:|
-| cube | 12 | +24.0% | +17.3% | **+12.7%** | +13.9% |
-| sphere | 360 | +24.5% | +18.2% | **+13.1%** | +12.7% |
+| cube | 12 | +24.0% | +17.4% | **+13.0%** | +20.6% |
+| sphere | 360 | +24.5% | +18.2% | **+13.5%** | +20.9% |
 
 Predicted to get worse, being three dependent loads a triangle before a vertex
 address is known, and it got better: the index buffer costs half what the flat
@@ -611,9 +623,9 @@ no scoreboard, so a warp waits out every instruction's latency whether or not
 anything needed the result: a chain of three loads and three independent ones
 cost the same cycles here, which is pinned in
 `DependenceIsNotDistinguishedFromIssueOrder`. That is pessimistic rather than
-generous — every load in the indexed path is charged a full wait — so 13.9% is an
-upper bound on what the extra loads cost in time, and it is still well inside the
-24% the flat model charged for them in issue capacity.
+generous — every load in the indexed path is charged a full wait — so 20.6% is an
+upper bound on what the extra loads cost in time, and it is still inside the 24%
+the flat model charged for them in issue capacity.
 
 **Both movements are the same error seen from two sides.** A flat charge per lane
 overprices loads relative to arithmetic, so it flattered the variant that trades
@@ -636,10 +648,10 @@ nearer than the last, so the walk shades all of them.
 
 | Scene | Depth complexity | flat | coalesced | cached | cycles |
 |---|---:|---:|---:|---:|---:|
-| stacked, barycentric | 4 | +96.9% | +80.4% | +75.2% | +91.6% |
-| stacked, barycentric | 32 | +98.4% | +81.6% | +71.9% | +82.8% |
-| stacked, lit | 4 | +36.9% | +39.8% | +33.8% | +52.4% |
-| stacked, lit | 32 | **+29.9%** | +30.3% | **+20.5%** | +32.1% |
+| stacked, barycentric | 4 | +97.1% | +82.0% | +77.4% | +91.9% |
+| stacked, barycentric | 32 | +98.4% | +81.9% | +72.1% | +81.2% |
+| stacked, lit | 4 | +36.9% | +40.9% | +35.4% | +51.2% |
+| stacked, lit | 32 | **+29.9%** | +30.4% | **+20.8%** | +35.8% |
 
 Positive means the prepass costs more. It loses everywhere, and the frames are
 identical to the walk's — asserted with EQ in
@@ -659,8 +671,8 @@ complexity grows the ratio goes to
 ```
 
 The two shading modes are one measurement of `c` and `s` apart. Barycentric at 32
-gives `Nc` = 83,000,320, and lighting the same scene adds 44,895,872 — so `c` is
-2,593,760 a triangle and the diffuse shade `s` is 1,402,996, a ratio of **0.54**.
+gives `Nc` = 82,969,600, and lighting the same scene adds 44,916,352 — so `c` is
+2,592,800 a triangle and the diffuse shade `s` is 1,403,636, a ratio of **0.54**.
 The formula then predicts 1.980 and 1.298 against measured 1.984 and 1.299.
 
 **So the crossover is a shader 1.85x this one.** `s/c > 1` is what it takes, and
@@ -674,6 +686,146 @@ sees. Lighting them means growing the tile lists by a world position a vertex an
 a normal a triangle, which is why the walk is the only route that can be lit
 today, and why the more interesting version of this measurement is not yet
 available.
+
+---
+
+## Several SMs, and the two things they buy
+
+Until now a launch ran its blocks one after another: `myrt_launch` looped, and
+`[m3]`'s warps could only cover each other *inside* one block. An SM is the thing
+a block sits on, and there is now more than one of them, each holding more than
+one block.
+
+The defaults are one SM holding one block, which is the machine every figure
+above was taken on — `machines/default.spec`, and turning it up is what the rest
+of this section does. `draw_walk` at 64x32 over 64 blocks of one warp, with a
+cache and latency modelled.
+
+| SMs | blocks an SM | issued work | cycles | vs 1x1 | stalls |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 1,718,778 | 567,142 | 1.00x | 507,020 |
+| 1 | 8 | 1,718,778 | 76,490 | **7.41x** | 16,368 |
+| 2 | 1 | 1,718,932 | 284,166 | 2.00x | 508,210 |
+| 4 | 1 | 1,719,240 | 142,759 | 3.97x | 510,800 |
+| 8 | 1 | 1,719,856 | 71,998 | 7.88x | 515,520 |
+| 8 | 8 | 1,719,856 | 10,553 | **53.74x** | 23,498 |
+| 16 | 8 | 1,721,088 | 9,446 | **60.04x** | 88,921 |
+| 32 | 8 | 1,723,552 | 9,967 | 56.90x | 244,621 |
+| 64 | 1 | 1,728,480 | 10,095 | 56.18x | 581,990 |
+
+**The work does not move.** 1,718,778 against 1,728,480 across the whole table,
+half a percent — and that residue is itself a finding, below. A cycle count that
+fell without the work following it would mean blocks were being dropped rather
+than overlapped, which is what `MoreSMsFinishSoonerWithoutDoingLessWork` exists
+to catch.
+
+**The two axes do different things.** More SMs divides the time — 2.00x, 3.97x,
+7.88x, almost exactly linear — and leaves the stalls alone: each SM still holds
+one warp, which still waits by itself. More blocks an SM removes the waiting:
+stalls collapse from 507,020 to 16,368 while the same single SM does the work.
+Parallelism splits the time; occupancy stops wasting it.
+
+**And they trade against each other once the grid runs out.** The best row is 16
+SMs of 8 blocks, not 32 of 8: sixty-four blocks spread over thirty-two SMs is two
+apiece, and two warps cover less of a wait than eight do. Stalls say the same
+thing louder — 88,921 against 244,621. A machine can be too wide for its work in
+a way that shows up as waiting rather than as idleness.
+
+### The residue: an SM keeps its own L1
+
+Spreading the same blocks over more SMs costs half a percent more issued work,
+and it is not noise. Every block of the naive walk reads the same triangles; on
+one SM the first block fetches a line and the rest find it, and on sixty-four SMs
+it is fetched sixty-four times. Splitting a cache is what that costs.
+
+With L1 scaled to 16 lines so the scene outgrows it, both sides of co-residency
+show:
+
+| Route | blocks an SM | L1 hits | L2 hits | issued work |
+|---|---:|---:|---:|---:|
+| walk | 1 | 48,000 | 1,536 | 6,675,072 |
+| walk | 8 | 49,344 | **192** | 6,645,504 |
+| tiled | 1 | 9,684 | **7** | 1,341,542 |
+| tiled | 8 | 9,488 | **203** | 1,345,854 |
+
+The walk's blocks all read the same triangles, and sharing an SM turns seven L2
+hits in eight into L1 hits. The tiled route's blocks each read their own tile,
+have nothing to hand each other, and evict each other instead — L2 hits go the
+other way and the bill rises 0.3%. **Co-residency is worth what the blocks have
+in common**, and the two routes sit either side of that.
+
+### Occupancy is not a knob every kernel can turn
+
+The same sweep, one SM, all three raster routes. Cycles, so lower is better.
+
+| blocks an SM | walk | tiled | shared |
+|---:|---:|---:|---:|
+| 1 | 567,142 | 15,463 | 19,356 |
+| 2 | 283,962 | 11,557 | 19,356 |
+| 4 | 143,477 | 10,730 | 19,356 |
+| 8 | 76,490 | 10,714 | 19,356 |
+| 16 | 60,548 | 10,714 | 19,356 |
+| 32 | 60,124 | 10,714 | 19,356 |
+
+Three shapes, and each says something.
+
+**The walk gains most and saturates last.** Its blocks are one warp each, so a
+block has nobody of its own to hide behind and every gain comes from
+co-residency.
+
+**The tiled route is nearly done at one.** Its blocks are 256 threads, eight
+warps that already cover each other, so occupancy adds a little and then stops.
+
+**The shared route cannot move at all.** It stages a tile through the whole
+scratchpad and now says so at the launch, and residency is the smallest of what
+the three limits allow: 16,384 bytes declared against 16,384 an SM is one block,
+whatever is asked for. **Its occupancy is pinned at one.**
+
+That is the price the flat cost model could not charge. Staging won 96% when a
+global load cost 100 a lane; charging by the line took the win away (*Charging
+memory by the line*); and this is the third bill — the route that trades global
+traffic for shared memory cannot use the machine's latency hiding, because the
+memory it traded for is the resource occupancy is made of.
+
+### How the blocks are handed out decides where the ceiling sits
+
+They go breadth first, one to each SM before any gets a second. Filling each SM
+to capacity first looks equivalent and is not: `sphere.obj` at 128x64 is 256
+blocks, and on 108 SMs holding 32 each the greedy order lands all of them on the
+first eight while a hundred sit out — 80x against the 250x spreading gives.
+Hardware's work distributor spreads for the same reason.
+
+### What this cost every figure above
+
+At the defaults — one SM holding one block — the machine is the one every earlier
+table was taken on, with a single exception: **L1 belongs to an SM and is no
+longer emptied between blocks.** Hardware does not flush it per block, and the
+old model did, so blocks were being made to re-fetch what the block before them
+had just read.
+
+Everything under `MemoryModel::Flat` and `Coalesced` is unmoved to the byte —
+neither consults a cache — and `render_bench.csv` is byte-identical. What moved is
+every `Cached` and every cycle figure, and all of it in one direction:
+
+| | before | after |
+|---|---:|---:|
+| Ray tracer, L2 hits (16 triangles) | 378 | **0** |
+| Ordering a mesh, L2 hits at the hardware L1 | 3,677 | **23** |
+| Wide load against three, in cycles | -42.9% | **-49.0%** |
+| Indexed pass 2, in cycles | +13.9% | **+20.6%** |
+| Predication on the ray tracer, in cycles | +46.0% | **+58.2%** |
+
+A block used to start cold. Now it starts on whatever the block before it left,
+which is worth more to a route whose blocks read the same data than to one whose
+blocks read their own — and the figures that moved most are the ones where a
+second reader was being charged for a line that was already there.
+
+**No conclusion moved.** Predication still loses on every route and still loses by
+an order of magnitude more once loads are charged by the line. The index buffer
+still costs half what the flat model said. Early-Z still loses, and the ratio it
+turns on is still `2/(1 + s/c)` with `s/c` still 0.54 and the crossover still a
+shader 1.85x this one. Reordering a mesh still buys 1.6% of the issue capacity
+and 24.7% of the cycles. The digits are new; the findings are the same ones.
 
 ---
 

@@ -178,6 +178,12 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # The flat model's conclusions, put to the other cost models
 ./build/benchmarks/model_bench              # benchmarks/result/models.{md,csv}
+
+# What several SMs buy, and what stops a kernel from using them
+./build/benchmarks/occupancy_bench          # benchmarks/result/occupancy.{md,csv}
+
+# Any of them on another machine — machines/ holds the files
+./build/benchmarks/render_bench --machine machines/a100.spec
 ```
 
 ### Formatting
@@ -211,13 +217,15 @@ on their own line, `int* ptr`.
 | Warp reduction, exchange against shared memory | **33** instructions against 68 |
 | Charging memory by the line, not the lane | **-93%**, and staging stops winning |
 | A cache over the same scenes | **-40%**, flat — L2 is never outgrown here |
-| Latency covered by 16 warps against 1 | **30 → 6** cycles a warp |
+| Latency covered by 16 warps against 1 | **45 → 6** cycles a warp |
 | Ordering a mesh for a cache smaller than it | **-25%** cycles, **-1.6%** issued work |
 | A second draw of resident geometry | **192 → 0** misses, and 0.04% of the bill |
 | Depth prepass against a single pass | **+30%** lit, **+98%** unlit — it needs a shader 1.85x dearer |
-| A wide load for the ray tracer's vertices | **-25%** transactions, **-43%** cycles |
+| Sixteen SMs of eight blocks against one of one | **60x** fewer cycles, same work to half a percent |
+| Shared-memory staging's occupancy | **pinned at one block an SM** — it declares the whole scratchpad |
+| A wide load for the ray tracer's vertices | **-25%** transactions, **-49%** cycles |
 | Opcodes | 31 |
-| Tests | 275 |
+| Tests | 283 |
 
 ### What divergence costs
 
@@ -295,7 +303,7 @@ flattened walk made twelve, and the pass costs **24.0%** more.
 | pass 2 — coverage | 31,317,520 | 38,841,872 | +24.0% |
 
 That 24% is what a flat charge per lane says, and it is roughly double what the
-other cost models say: **+12.7% with a cache**, +13.9% in cycles with every load
+other cost models say: **+13.0% with a cache**, +20.6% in cycles with every load
 charged a full wait. Every lane of a warp is on the same triangle, so all
 thirty-two read the same three indices — one transaction, which is precisely the
 case a per-lane charge overstates.
@@ -364,9 +372,9 @@ cache line it touches and that arithmetic is most of what is left to compare:
 
 | 16 small triangles, 64x32 | per lane | per line | with a cache | in cycles |
 |---|---:|---:|---:|---:|
-| every pixel walks every triangle | +2.0% | +28.1% | +47.2% | +15.8% |
-| binned into tiles | +1.6% | +19.4% | +32.1% | +14.7% |
-| ray tracer | +4.4% | +75.4% | **+92.6%** | +46.0% |
+| every pixel walks every triangle | +2.0% | +28.3% | +47.5% | +17.9% |
+| binned into tiles | +1.6% | +20.2% | +32.5% | +17.7% |
+| ray tracer | +4.4% | +75.4% | **+93.1%** | +58.2% |
 
 The divergence still goes — the blend measures exactly 0.00% on every route —
 which makes this the strongest form of the finding rather than a retraction. What
@@ -480,8 +488,8 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Warps of 32, `activeMask`, reconvergence | modelled — the centre of the project |
 | Independent thread scheduling | modelled — `WarpPolicy::Independent`, per-thread pc with no lane starving another |
 | Warp-level primitives | modelled — ballot, any, all, syncwarp, shuffle, each naming its participants |
-| Multiple SMs, occupancy | **absent** — `myrt_launch` runs blocks one after another |
-| Latency hiding | modelled **within a block** — a result arrives some cycles after it is issued and other warps cover the wait. Hardware puts several blocks on an SM and lets all their warps cover each other; here a block runs to completion first |
+| Multiple SMs, occupancy | modelled — SMs hold several blocks at once, and residency is the smallest of the block, warp-slot and shared-memory limits. One SM holding one block is the default, which is what every figure was taken on |
+| Latency hiding | modelled — a result arrives some cycles after it is issued, and both the warps of a block and the blocks of an SM cover the wait |
 | Instruction-level parallelism | **absent** — issue is in-order with no scoreboard, so a warp waits out every instruction whether or not the next one wanted the result. A dependent chain and independent accesses cost the same; occupancy is what covers a wait here, never the warp's own next instruction |
 | Persistent buffers | modelled — `upload` / `release` hold geometry between draws, and a repeated draw of what fits refetches nothing. Capacity and compulsory misses are told apart by whether a second draw pays again |
 | Early-Z / depth prepass | modelled — `draw_early_z` runs a depth pass and then shades only the triangle it names. It loses here, by a ratio the shade and the coverage test decide |
@@ -501,10 +509,11 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**Occupancy across blocks.** Latency is covered within a block, which is where this
-machine can see it: `myrt_launch` runs blocks one after another, so the warps of
-one never cover the waiting of another. A real SM holds several blocks at once and
-that is most of where occupancy comes from.
+**Streams and concurrent kernels.** Blocks of one launch now overlap, on several
+SMs and several to an SM. Two *launches* still do not: `myrt_launch` returns when
+the last block retires, so nothing hides the tail of one kernel behind the start
+of another, and there is no indirect launch — a grid's size is a host number, which
+is the one thing GPU-driven rendering cannot be built on.
 
 ---
 
