@@ -43,3 +43,7 @@ target_link_libraries(mma_bench PRIVATE gpurt project_warnings)
 # What regrouping a block's threads is worth, and when it is not.
 add_executable(ser_bench ser_bench.cpp)
 target_link_libraries(ser_bench PRIVATE gpurt project_warnings)
+
+# What a block reading its neighbour's shared memory is worth.
+add_executable(cluster_bench cluster_bench.cpp)
+target_link_libraries(cluster_bench PRIVATE gpurt project_warnings)
