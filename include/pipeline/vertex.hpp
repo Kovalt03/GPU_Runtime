@@ -22,6 +22,15 @@ struct VertexStageArgs {
     uint32_t vertex_count = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+
+    // Where the view-projection is, if it is not baked into the program.
+    //
+    // Zero means bake it: sixteen moves, and a program that serves one matrix.
+    // Anything else is a byte offset into device memory, and the kernel reads it
+    // through the constant window — one instruction, and a program that serves
+    // any matrix. That is the difference between a demo and a runtime: without
+    // it, an object with its own transform needs its own build.
+    size_t uniform_offset = 0;
 };
 
 // Builds pass 1. Matches KernelFunc, so it is handed to myrt_launch directly;

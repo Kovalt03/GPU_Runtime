@@ -282,5 +282,15 @@ std::vector<Float3> draw_early_z(MyGPURuntime& rt, const DeviceGeometry& geometr
 // The draw routes clear the counters between their passes so a caller reads
 // pass 2 alone, which leaves the vertex stage — the half indexing actually
 // saves — with nowhere to be seen. This runs it and nothing else.
+// uniforms says how the matrix reaches the kernel: baked into the program as
+// sixteen moves, or read from the constant window in one instruction. The frame
+// is the same and the programs are not — a baked one serves one matrix, and the
+// figures taken before the window existed all used it.
+enum class Uniforms {
+    Baked,
+    Window,
+};
+
 SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
-                                 const DrawTarget& target);
+                                 const DrawTarget& target,
+                                 Uniforms uniforms = Uniforms::Baked);

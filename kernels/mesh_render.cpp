@@ -107,6 +107,10 @@ struct Row {
     Mesh mesh;
     Reading walk, tiled, shared, ray;
     uint64_t pass1_indexed = 0;
+    uint64_t pass1_steps_baked = 0;
+    uint64_t pass1_steps_window = 0;
+    uint64_t pass1_lanes_baked = 0;
+    uint64_t pass1_lanes_window = 0;
     uint64_t pass1_flat = 0;
     uint64_t pass2_indexed = 0;
     uint64_t pass2_flat = 0;
@@ -184,6 +188,17 @@ int run(int argc, char** argv)
         // pays and pass 2 is where it charges, so both have to be read.
         row.pass1_indexed = vertex_stage_cost(mesh.vertices, target).weighted_lane_ops;
         row.pass1_flat = vertex_stage_cost(flat, target).weighted_lane_ops;
+
+        // And the same pass with the matrix read from the constant window rather
+        // than baked into the program. The frame is identical; what moves is the
+        // sixteen moves a baked matrix costs every thread.
+        const SchedulerStats baked = vertex_stage_cost(mesh.vertices, target);
+        const SchedulerStats window =
+            vertex_stage_cost(mesh.vertices, target, Uniforms::Window);
+        row.pass1_steps_baked = baked.warp_steps;
+        row.pass1_steps_window = window.warp_steps;
+        row.pass1_lanes_baked = baked.active_lane_ops;
+        row.pass1_lanes_window = window.active_lane_ops;
         row.pass2_indexed = row.walk.weighted;
         row.pass2_flat = measure(budget, [&](MyGPURuntime& rt) {
                              return draw_walk(rt, flat, target);
@@ -242,6 +257,20 @@ int run(int argc, char** argv)
                     change(r.pass2_flat, r.pass2_indexed));
     }
 
+    // Where the matrix comes from. The frame is the same either way; a baked one
+    // is sixteen moves every thread runs, and a program that serves one matrix.
+    std::printf("\n  %-12s | %12s %12s %8s | %12s %12s %8s\n", "uniform", "steps baked",
+                "steps window", "change", "lanes baked", "lanes window", "change");
+    for (const Row& r : rows) {
+        std::printf("  %-12s | %12llu %12llu %7.1f%% | %12llu %12llu %7.1f%%\n",
+                    r.name.c_str(), static_cast<unsigned long long>(r.pass1_steps_baked),
+                    static_cast<unsigned long long>(r.pass1_steps_window),
+                    change(r.pass1_steps_baked, r.pass1_steps_window),
+                    static_cast<unsigned long long>(r.pass1_lanes_baked),
+                    static_cast<unsigned long long>(r.pass1_lanes_window),
+                    change(r.pass1_lanes_baked, r.pass1_lanes_window));
+    }
+
     std::printf("\n  %-12s %10s %10s %10s %10s\n", "seconds", "walk", "tiled", "shared",
                 "raytrace");
     for (const Row& r : rows) {
@@ -272,6 +301,10 @@ int run(int argc, char** argv)
         csv << r.name << ',' << r.mesh.vertex_count() << ',' << r.mesh.triangle_count()
             << ',' << double(r.mesh.vertex_count()) / r.mesh.triangle_count() << ','
             << size << ',' << size << ",pass1_indexed," << r.pass1_indexed << ",,\n";
+        csv << r.name << ',' << size << ',' << size << ",pass1_steps_baked,"
+            << r.pass1_steps_baked << ",,\n";
+        csv << r.name << ',' << size << ',' << size << ",pass1_steps_window,"
+            << r.pass1_steps_window << ",,\n";
         csv << r.name << ',' << r.mesh.vertex_count() << ',' << r.mesh.triangle_count()
             << ',' << double(r.mesh.vertex_count()) / r.mesh.triangle_count() << ','
             << size << ',' << size << ",pass1_flattened," << r.pass1_flat << ",,\n";

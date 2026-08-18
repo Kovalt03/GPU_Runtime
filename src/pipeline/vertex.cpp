@@ -30,16 +30,25 @@ Program build_vertex_program(void** args)
     const VertexStageArgs& a = *static_cast<const VertexStageArgs*>(args[0]);
     IRBuilder k;
 
-    // The uniform, baked in as sixteen moves. Row-major on both sides, so no
-    // transpose belongs here — if a render comes out transposed, this loop is
-    // the first suspect.
-    const Reg<Mat4> mvp = k.mat4();
-    for (uint32_t row = 0; row < MATRIX_DIMENSION; ++row) {
-        for (uint32_t col = 0; col < MATRIX_DIMENSION; ++col) {
-            k.set(mvp.component(row * MATRIX_DIMENSION + col),
-                  a.view_projection.at(row, col));
+    // The uniform, either baked in as sixteen moves or read as one instruction
+    // from the constant window. Row-major on both sides, so no transpose belongs
+    // here — if a render comes out transposed, this is the first suspect.
+    //
+    // The two forms compute the same frame, and the baked one is what every
+    // figure taken before the window existed used.
+    const Reg<Mat4> mvp = [&] {
+        if (a.uniform_offset != 0) {
+            return k.load_const_mat4(k.const_base());
         }
-    }
+        const Reg<Mat4> baked = k.mat4();
+        for (uint32_t row = 0; row < MATRIX_DIMENSION; ++row) {
+            for (uint32_t col = 0; col < MATRIX_DIMENSION; ++col) {
+                k.set(baked.component(row * MATRIX_DIMENSION + col),
+                      a.view_projection.at(row, col));
+            }
+        }
+        return baked;
+    }();
 
     // A launch rounds up to whole warps, so unless vertex_count is a multiple
     // of 32 the last warp runs lanes with no vertex to read. Everything below
@@ -116,5 +125,7 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
     // myrt_launch takes void** after CUDA's convention, so the const has to
     // come off. The kernel only reads it, and args outlives the call.
     void* raw[] = {const_cast<VertexStageArgs*>(&args)};
-    rt.myrt_launch(build_vertex_program, grid, block, raw);
+    LaunchConfig config{grid, block};
+    config.const_offset = args.uniform_offset;
+    rt.myrt_launch(build_vertex_program, config, raw);
 }

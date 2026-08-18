@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -593,7 +594,7 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const Mesh& mesh,
 }
 
 SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
-                                 const DrawTarget& target)
+                                 const DrawTarget& target, Uniforms uniforms)
 {
     // No width or height in the plan, so no framebuffer: this runs pass 1 and
     // never writes a pixel. Saying so is the point of BufferPlan — this path
@@ -616,6 +617,25 @@ SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
     args.vertex_count = geometry.vertex_count;
     args.width = target.width;
     args.height = target.height;
+
+    if (uniforms == Uniforms::Window) {
+        // The matrix goes to the device instead of into the instruction stream.
+        // Sixteen floats of their own, so that the offset is not zero — which is
+        // how the kernel is told to read rather than bake.
+        constexpr uint32_t SIDE = 4;
+        void* window = rt.myrt_malloc(SIDE * SIDE * sizeof(float));
+        const Float4x4 mvp = target.camera.view_projection(target.aspect());
+        std::array<float, SIDE * SIDE> flat{};
+        for (uint32_t row = 0; row < SIDE; ++row) {
+            for (uint32_t col = 0; col < SIDE; ++col) {
+                flat[row * SIDE + col] = mvp.at(row, col);
+            }
+        }
+        rt.myrt_memcpy(window, flat.data(), flat.size() * sizeof(float),
+                       Direction::HostToDevice);
+        args.uniform_offset = rt.myrt_device_offset(window);
+    }
+
     run_vertex_stage(rt, args);
 
     return rt.stats();

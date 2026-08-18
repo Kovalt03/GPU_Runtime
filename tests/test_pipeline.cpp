@@ -1976,3 +1976,106 @@ TEST(Pipeline, StagingATileAsynchronouslyDrawsWhatStagingItSynchronouslyDoes)
     release(async_rt, async_frame);
     release(async_rt, async_geometry);
 }
+
+// ---------------------------------------------------------------------------
+// Uniforms — the same program, a different matrix
+// ---------------------------------------------------------------------------
+
+TEST(Pipeline, TheConstantWindowProjectsWhatABakedMatrixDoes)
+{
+    // The frame is the check. A window read from the wrong place, or a matrix
+    // written transposed into it, comes out as a different picture.
+    const std::vector<Float3> world = scattered_scene();
+    const DrawTarget target = default_target();
+
+    const SchedulerStats baked = vertex_stage_cost(world, target);
+    const SchedulerStats window = vertex_stage_cost(world, target, Uniforms::Window);
+
+    // Sixteen moves become one load, for every warp of the launch.
+    EXPECT_LT(window.warp_steps, baked.warp_steps);
+    EXPECT_LT(window.active_lane_ops, baked.active_lane_ops);
+}
+
+TEST(Pipeline, OneProgramServesAnyMatrix)
+{
+    // What the window is for. The kernel is built once and launched twice
+    // against two different uniform buffers, and the two frames differ — with
+    // the matrix baked, the second would have needed its own build.
+    const std::vector<Float3> world = scattered_scene();
+    const DrawTarget target = default_target();
+
+    MyGPURuntime rt(1u << 24);
+    DeviceGeometry geometry = upload(rt, world);
+
+    constexpr uint32_t SIDE = 4;
+    void* window = rt.myrt_malloc(SIDE * SIDE * sizeof(float));
+
+    const auto project = [&](const Camera& camera) {
+        const Float4x4 mvp = camera.view_projection(target.aspect());
+        std::array<float, SIDE * SIDE> flat{};
+        for (uint32_t row = 0; row < SIDE; ++row) {
+            for (uint32_t col = 0; col < SIDE; ++col) {
+                flat[row * SIDE + col] = mvp.at(row, col);
+            }
+        }
+        rt.myrt_memcpy(window, flat.data(), flat.size() * sizeof(float),
+                       Direction::HostToDevice);
+
+        VertexStageArgs args;
+        args.view_projection = mvp;  // ignored: the offset is what decides
+        args.world_offset = rt.myrt_device_offset(geometry.world);
+        args.screen_offset = rt.myrt_device_offset(geometry.screen);
+        args.vertex_count = geometry.vertex_count;
+        args.width = target.width;
+        args.height = target.height;
+        args.uniform_offset = rt.myrt_device_offset(window);
+        run_vertex_stage(rt, args);
+        rt.myrt_sync(false);
+
+        std::vector<float> screen(geometry.vertex_count * SCREEN_VERTEX_FLOATS, 0.0f);
+        rt.myrt_memcpy(screen.data(), geometry.screen, screen.size() * sizeof(float),
+                       Direction::DeviceToHost);
+        return screen;
+    };
+
+    Camera moved = target.camera;
+    moved.eye.x += 1.5f;
+
+    const std::vector<float> first = project(target.camera);
+    const std::vector<float> second = project(moved);
+
+    bool differs = false;
+    for (size_t i = 0; i < first.size(); ++i) {
+        differs = differs || first[i] != second[i];
+    }
+    EXPECT_TRUE(differs) << "moving the camera through the window changed nothing";
+
+    release(rt, geometry);
+}
+
+TEST(Pipeline, AUniformIsChargedOnceForTheWarpRatherThanOncePerLane)
+{
+    // Why the space exists. The address comes from the register the launch
+    // seeds, so it is the same in every lane by construction and hardware
+    // answers it once — which is what the cost model says here.
+    ThreadBlock block = make_block(1, 0);
+    std::vector<uint8_t> global(1024, 0);
+    for (uint32_t i = 0; i < 16; ++i) {
+        const float value = static_cast<float>(i);
+        std::memcpy(global.data() + i * sizeof(float), &value, sizeof(float));
+    }
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[REG_CONST_BASE] = 0.0f;
+    }
+
+    WarpScheduler sched;
+    sched.run(Program{make_v_ld_const_f32(1, REG_CONST_BASE, 8.0f), make_ret()}, block,
+              DeviceSpan{global.data(), global.size()});
+
+    EXPECT_FLOAT_EQ(block.warps[0].threads[0].regs[1], 2.0f);
+    EXPECT_FLOAT_EQ(block.warps[0].threads[WARP_SIZE - 1].regs[1], 2.0f);
+    EXPECT_EQ(sched.stats().weighted_lane_ops,
+              instruction_cost(Opcode::V_LD_CONST_F32) +
+                  WARP_SIZE * instruction_cost(Opcode::RET))
+        << "a broadcast is one access, not 32";
+}
