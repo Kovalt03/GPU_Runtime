@@ -39,3 +39,7 @@ target_link_libraries(async_bench PRIVATE gpurt project_warnings)
 # One instruction against 4,096 multiply-adds.
 add_executable(mma_bench mma_bench.cpp)
 target_link_libraries(mma_bench PRIVATE gpurt project_warnings)
+
+# What regrouping a block's threads is worth, and when it is not.
+add_executable(ser_bench ser_bench.cpp)
+target_link_libraries(ser_bench PRIVATE gpurt project_warnings)
