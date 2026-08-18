@@ -963,6 +963,60 @@ cheaply than the first.
 
 ---
 
+## A tiled matrix multiply
+
+Two instructions were measured and neither had a kernel worth measuring in.
+`V_MMA_16X16X16_F32` had none at all; `cp.async` had one whose staged tile was
+read 256 times, so hiding the fetch could not matter and the section above says
+where to ask again. This is that place.
+
+```
+cmake --build build -j8
+./build/benchmarks/gemm_bench
+```
+
+C[64x256] = A × B, a block of four warps holding a 16×64 strip of C in registers
+for the whole K loop, staging one A tile and four B tiles a step. Cycles.
+
+| K | fma, sync | mma, sync | change | mma, staged ahead | change |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 202,556 | 44,220 | **-78.2%** | 33,056 | **-25.2%** |
+| 64 | 401,734 | 85,062 | **-78.8%** | 62,340 | **-26.7%** |
+| 128 | 812,660 | 179,316 | **-77.9%** | 120,977 | **-32.5%** |
+
+Issued work at K = 128: 27,145,216 against 5,960,704 against 4,762,624.
+
+**cp.async is worth 33% here and was worth 1.8% in the renderer.** Same
+instruction, same double buffering, same scheduler. What changed is the ratio the
+earlier section named: a staged tile is consumed by a fixed, small number of
+operations instead of being read by every thread of the block. The prediction was
+written before this kernel existed and is what the kernel was built to test.
+
+**The matrix unit is worth 78%, which is less than the instruction counts
+suggest.** One MMA replaces 128 multiply-adds a lane, but it does not replace the
+loads that assemble its fragments: sixteen shared loads a lane a k-step, against
+one instruction that consumes them. At a cost of 8 each that is 128 a lane of
+loading to feed 16 of multiplying — **the fragment load, not the multiply, is
+what the inner loop spends its capacity on.**
+
+Hardware has `ldmatrix` for exactly this, and this ISA does not. That is the next
+instruction this measurement asks for, and the shape of the argument is the one
+`V_LD_GLOBAL_VEC3_F32` already made: a wide load is not three narrow ones.
+
+### What the shape of the kernel had to work around
+
+The block is 2 × 16 × 4 threads. Every index the kernel needs — which half of a
+fragment row a lane holds, which row, which warp — is a coordinate, because the
+ISA has no integer divide and a flat thread index cannot be taken apart. It is the
+first kernel where that constraint decided the launch geometry rather than being
+worked around inside the kernel.
+
+Addresses are advanced in place rather than rebuilt. Every arithmetic call in the
+builder allocates a register, the staging is emitted twice in the double-buffered
+form, and the obvious spelling wanted about 120 registers of the 250 a thread has.
+
+---
+
 ## A block reading its neighbour's shared memory
 
 Blocks cannot see each other. Anything one makes for another goes out to global

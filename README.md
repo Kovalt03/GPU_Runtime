@@ -197,6 +197,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # A block reading its neighbour's shared memory
 ./build/benchmarks/cluster_bench            # benchmarks/result/cluster.{md,csv}
 
+# A tiled matrix multiply — what the matrix unit and cp.async were waiting for
+./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
+
 # Any of them on another machine — machines/ holds the files
 ./build/benchmarks/render_bench --machine machines/a100.spec
 ```
@@ -530,12 +533,13 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**A kernel that reuses what it fetches.** `cp.async` is worth 87% of a fill on its
-own and 2% of the renderer it was put into, because a staged tile here is fetched
-once and read by all 256 threads of the block. The instruction's home is the other
-end of that ratio — a matrix multiply consumes a staged tile in a fixed, small
-number of operations — and this repository has no such kernel yet. It is the same
-gap `V_MMA` would fill, and the reason the two are next to each other on the list.
+**A wide load for a fragment.** The tiled matrix multiply is here, and it says
+what the two instructions built for it are worth: 78% off the cycles for the
+matrix unit, 33% for staging a tile ahead. But an MMA consumes fragments that cost
+sixteen shared loads a lane to assemble, at 8 each against the instruction's 16 —
+so the inner loop spends its capacity on loading rather than multiplying. Hardware
+has `ldmatrix`; this ISA has the same argument `V_LD_GLOBAL_VEC3_F32` already won
+once, and has not made it twice.
 
 ---
 
