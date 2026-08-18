@@ -2250,3 +2250,135 @@ TEST(Scheduler, CoalescingCannotHelpAnAtomic)
     EXPECT_EQ(weighted(MemoryModel::Flat), weighted(MemoryModel::Coalesced));
     EXPECT_EQ(weighted(MemoryModel::Flat), weighted(MemoryModel::Cached));
 }
+
+// ---------------------------------------------------------------------------
+// The matrix unit — the first instruction whose operands are the warp's
+// registers rather than a lane's
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The 16x16x16 product on the host, against the same layout the instruction
+// uses: row-major across the warp, eight elements a lane.
+std::array<float, MMA_ELEMENTS> host_mma(const std::array<float, MMA_ELEMENTS>& a,
+                                         const std::array<float, MMA_ELEMENTS>& b,
+                                         const std::array<float, MMA_ELEMENTS>& c)
+{
+    std::array<float, MMA_ELEMENTS> d = c;
+    for (uint32_t row = 0; row < MMA_TILE; ++row) {
+        for (uint32_t col = 0; col < MMA_TILE; ++col) {
+            for (uint32_t k = 0; k < MMA_TILE; ++k) {
+                d[row * MMA_TILE + col] += a[row * MMA_TILE + k] * b[k * MMA_TILE + col];
+            }
+        }
+    }
+    return d;
+}
+
+}  // namespace
+
+TEST(Scheduler, TheMatrixUnitComputesTheProductTheHostDoes)
+{
+    Fixture f;
+    constexpr uint8_t A = 0;
+    constexpr uint8_t B = 8;
+    constexpr uint8_t D = 16;
+
+    std::array<float, MMA_ELEMENTS> a{};
+    std::array<float, MMA_ELEMENTS> b{};
+    std::array<float, MMA_ELEMENTS> c{};
+    for (uint32_t i = 0; i < MMA_ELEMENTS; ++i) {
+        // Nothing symmetric: a transposed operand would pass against a symmetric
+        // one and this is the mistake the layout invites.
+        a[i] = static_cast<float>((i % 7) - 3);
+        b[i] = static_cast<float>((i % 5) - 2);
+        c[i] = static_cast<float>(i % 3);
+    }
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+            const size_t at = lane * MMA_FRAGMENT_REGISTERS + i;
+            f.lane(lane).regs[A + i] = a[at];
+            f.lane(lane).regs[B + i] = b[at];
+            f.lane(lane).regs[D + i] = c[at];
+        }
+    }
+
+    f.run(Program{make_v_mma_16x16x16_f32(D, A, B, ALL_LANES), make_ret()});
+
+    const std::array<float, MMA_ELEMENTS> expected = host_mma(a, b, c);
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+            EXPECT_FLOAT_EQ(f.lane(lane).regs[D + i],
+                            expected[lane * MMA_FRAGMENT_REGISTERS + i])
+                << "lane " << lane << " element " << i;
+        }
+    }
+}
+
+TEST(Scheduler, TheMatrixUnitAccumulatesIntoItsDestination)
+{
+    // D = A * B + C with C and D the same registers, which is what lets a chain
+    // of these sum a product longer than the tile without touching memory.
+    Fixture f;
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+            f.lane(lane).regs[0 + i] = 1.0f;   // A, all ones
+            f.lane(lane).regs[8 + i] = 1.0f;   // B, all ones
+            f.lane(lane).regs[16 + i] = 0.0f;  // the accumulator
+        }
+    }
+
+    // Two of them: every element of A*B is 16, so twice is 32.
+    f.run(Program{make_v_mma_16x16x16_f32(16, 0, 8, ALL_LANES),
+                  make_v_mma_16x16x16_f32(16, 0, 8, ALL_LANES), make_ret()});
+
+    EXPECT_FLOAT_EQ(f.lane(0).regs[16], 32.0f);
+    EXPECT_FLOAT_EQ(f.lane(WARP_SIZE - 1).regs[16 + MMA_FRAGMENT_REGISTERS - 1], 32.0f);
+}
+
+TEST(Scheduler, TheMatrixUnitNeedsEveryLane)
+{
+    // A fragment is missing without one of them, and the answer would be wrong
+    // rather than partial. Refused instead.
+    Fixture f;
+    EXPECT_THROW(f.run(Program{make_v_mma_16x16x16_f32(16, 0, 8, LOW_HALF), make_ret()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, AFragmentMustFitTheRegisterFile)
+{
+    // Eight registers from 252 runs off the end. A fragment is checked like a
+    // VEC3 and for the same reason: the range is implied by the opcode rather
+    // than written at the call site, so nothing else would catch it.
+    Fixture f;
+    EXPECT_THROW(
+        f.run(Program{make_v_mma_16x16x16_f32(252, 0, 8, ALL_LANES), make_ret()}),
+        std::runtime_error);
+
+    // And it starts on a multiple of four, as every shape wider than a VEC3 does.
+    EXPECT_THROW(f.run(Program{make_v_mma_16x16x16_f32(17, 0, 8, ALL_LANES), make_ret()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, OneMatrixInstructionCostsAFractionOfTheFmasItReplaces)
+{
+    // 4,096 multiply-adds either way. What differs is how many issue slots and
+    // how much capacity they take.
+    Fixture f;
+    f.run(Program{make_v_mma_16x16x16_f32(16, 0, 8, ALL_LANES), make_ret()});
+    const uint64_t mma = f.sched.stats().weighted_lane_ops;
+
+    Fixture g;
+    Program fmas;
+    // Each lane owns eight elements of D, and each needs sixteen multiply-adds.
+    for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS * MMA_TILE; ++i) {
+        fmas.push_back(make_v_fma_f32(16, 0, 8));
+    }
+    fmas.push_back(make_ret());
+    g.run(fmas);
+    const uint64_t one_at_a_time = g.sched.stats().weighted_lane_ops;
+
+    EXPECT_LT(mma, one_at_a_time);
+    EXPECT_EQ(g.sched.stats().warp_steps - 1, MMA_FRAGMENT_REGISTERS * MMA_TILE)
+        << "the arithmetic route issues one instruction per multiply-add";
+}

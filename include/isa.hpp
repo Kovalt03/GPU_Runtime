@@ -123,6 +123,22 @@ enum class Opcode : uint8_t {
     // different one per lane, so the warp gathers in one instruction.
     V_SHUFFLE_F32,  // reg[dst] = reg[src0] of the lane in reg[src1]
 
+    // One 16x16x16 multiply-accumulate, performed by the warp together:
+    // D = A * B + C, with every lane holding an eighth of each matrix.
+    //
+    // 4,096 multiply-adds in one instruction. It is V_ rather than S_ because
+    // every lane ends up with different elements of D, and it is warp-level
+    // because no lane holds enough of A or B to compute anything alone — this is
+    // the first instruction here whose operands are the warp's registers rather
+    // than a lane's.
+    //
+    // Layout: each matrix is 16x16 row-major across the warp, lane L holding the
+    // eight elements at L*8. Rows are 16 wide, so lanes 2r and 2r+1 hold row r
+    // between them. Chosen for being explainable — hardware's fragment layouts
+    // are chosen for the datapath, and modelling one of those would say nothing
+    // this cannot.
+    V_MMA_16X16X16_F32,  // reg[dst..+7] += A(reg[src0..+7]) * B(reg[src1..+7])
+
     // CUDA's __syncthreads().
     BARRIER,  // wait for every live warp of the block    (all operands unused)
     RET,      // end thread                               (all operands unused)
@@ -238,6 +254,16 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// Every lane takes part, always: the shape is fixed and a fragment is missing
+// without one of them. participants is still spelled out, so the call site says
+// what the instruction assumes rather than leaving it to be discovered.
+//
+// dst is the accumulator and is read as well as written — D = A * B + C with C
+// and D the same eight registers, which is what "accumulate" means and what lets
+// a chain of these sum a long product without touching memory.
+Instruction make_v_mma_16x16x16_f32(uint8_t dst, uint8_t src0, uint8_t src1,
+                                    uint32_t participants);
 
 // src1 names a lane rather than holding a value, and it does so as a float in a
 // lane register: each lane reads from whichever lane its own src1 points at.

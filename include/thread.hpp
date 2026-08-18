@@ -38,6 +38,16 @@ struct Thread {
 // a lane's: real hardware counts its predicate registers in single digits too.
 inline constexpr uint32_t WARP_MASK_REGISTERS = 4;
 
+// The tile a V_MMA_16X16X16_F32 works on, and how it is spread over the warp.
+//
+// 16x16 is 256 elements and a warp is 32 lanes, so a fragment is eight registers
+// a lane — and three of them (A, B and the accumulator) is 24 registers, which a
+// 256-register file holds several times over. The shape is fixed by the opcode
+// name, so these are constants rather than knobs.
+inline constexpr uint32_t MMA_TILE = 16;
+inline constexpr uint32_t MMA_ELEMENTS = MMA_TILE * MMA_TILE;
+inline constexpr uint32_t MMA_FRAGMENT_REGISTERS = MMA_ELEMENTS / WARP_SIZE;
+
 // How many copies a warp may have in flight at once.
 //
 // Sizes the array above, so it is a constant rather than a knob. Hardware has a

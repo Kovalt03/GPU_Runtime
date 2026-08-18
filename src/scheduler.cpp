@@ -170,7 +170,7 @@ void require_participants_present(const Warp& warp, uint32_t participants,
 bool is_warp_level(Opcode op)
 {
     return op == Opcode::S_BALLOT || op == Opcode::S_ANY || op == Opcode::S_ALL ||
-           op == Opcode::V_SHUFFLE_F32;
+           op == Opcode::V_SHUFFLE_F32 || op == Opcode::V_MMA_16X16X16_F32;
 }
 
 // A lane index arriving as a float, which is how this machine carries every
@@ -463,8 +463,11 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
     }
 
     // Warp state, and handled before the lane loop is reached. Named here so
-    // that -Wswitch keeps watching this switch for the next opcode.
-    case Opcode::S_CP_ASYNC_WAIT: break;
+    // that -Wswitch keeps watching this switch for the next opcode. The matrix
+    // multiply is there too, for the stronger reason: no lane holds enough of A
+    // or B to compute anything on its own.
+    case Opcode::S_CP_ASYNC_WAIT:
+    case Opcode::V_MMA_16X16X16_F32: break;
 
     // decode_cmp_op(instr.imm) recovers the condition. The result is written as
     // 1.0f or 0.0f so that BRA_DIV, which only tests against zero, can consume
@@ -1079,6 +1082,63 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
             break;
         }
 
+        case Opcode::V_MMA_16X16X16_F32: {
+            // D = A * B + C, 16x16x16, with the warp's registers as the
+            // fragments. Every lane takes part: the shape is fixed and a
+            // fragment is missing without one of them.
+            require_register_range(instr.src0, MMA_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F32 src0");
+            require_register_range(instr.src1, MMA_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F32 src1");
+            require_register_range(instr.dst, MMA_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F32 dst");
+            require_register_alignment(instr.src0, 4, "V_MMA_16X16X16_F32 src0");
+            require_register_alignment(instr.src1, 4, "V_MMA_16X16X16_F32 src1");
+            require_register_alignment(instr.dst, 4, "V_MMA_16X16X16_F32 dst");
+
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            if (participants != 0xFFFFFFFFu) {
+                throw std::runtime_error(
+                    "V_MMA_16X16X16_F32: the shape needs every lane, and the "
+                    "participation mask names only 0x" +
+                    to_hex(participants));
+            }
+            require_participants_present(warp, participants, "V_MMA_16X16X16_F32");
+
+            // Gathered whole before anything is written, as the shuffle is: the
+            // accumulator is read as well as written, and a lane's element of D
+            // is a sum over a row of A and a column of B that other lanes hold.
+            std::array<float, MMA_ELEMENTS> a{};
+            std::array<float, MMA_ELEMENTS> b{};
+            std::array<float, MMA_ELEMENTS> d{};
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+                    const size_t at = lane * MMA_FRAGMENT_REGISTERS + i;
+                    a[at] = warp.threads[lane].regs[instr.src0 + i];
+                    b[at] = warp.threads[lane].regs[instr.src1 + i];
+                    d[at] = warp.threads[lane].regs[instr.dst + i];
+                }
+            }
+
+            for (uint32_t row = 0; row < MMA_TILE; ++row) {
+                for (uint32_t col = 0; col < MMA_TILE; ++col) {
+                    float sum = d[row * MMA_TILE + col];
+                    for (uint32_t k = 0; k < MMA_TILE; ++k) {
+                        sum += a[row * MMA_TILE + k] * b[k * MMA_TILE + col];
+                    }
+                    d[row * MMA_TILE + col] = sum;
+                }
+            }
+
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+                    warp.threads[lane].regs[instr.dst + i] =
+                        d[lane * MMA_FRAGMENT_REGISTERS + i];
+                }
+            }
+            break;
+        }
+
         case Opcode::V_SHUFFLE_F32: {
             // reg[dst] of each participant = reg[src0] of the lane its own
             // reg[src1] names.
@@ -1140,6 +1200,13 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         stats_.warp_steps += 1;
         stats_.active_lane_ops += voting;
         stats_.weighted_lane_ops += voting * instruction_cost(instr.op);
+
+        // These have latencies like anything else, and this path used to fall out
+        // without setting one — so a warp primitive was charged whatever the
+        // instruction before it happened to cost. The matrix unit is where that
+        // became visible: it is 32 deep and was reporting a cycle.
+        issued_latency_ =
+            latency_ == LatencyModel::Ignored ? 0 : instruction_latency(instr.op);
 
         // true, where BARRIER returns false: a barrier takes the warp out of the
         // queue to wait, and these have nothing to wait for.

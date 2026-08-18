@@ -45,10 +45,14 @@ bool has_type_suffix(std::string_view name)
 
 bool has_valid_shape_token(std::string_view name)
 {
+    // A tile is the fifth shape and reads as its own dimensions rather than as a
+    // name: MxNxK is what every matrix-unit ISA writes, and a token like MAT16
+    // would hide that three numbers are involved and that they need not match.
     return name.find("_VEC3_") != std::string_view::npos ||
            name.find("_VEC4_") != std::string_view::npos ||
            name.find("_MAT3_") != std::string_view::npos ||
-           name.find("_MAT4_") != std::string_view::npos;
+           name.find("_MAT4_") != std::string_view::npos ||
+           name.find("_16X16X16_") != std::string_view::npos;
 }
 
 bool has_space_token(std::string_view name)
@@ -75,10 +79,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 34 opcodes, 0-indexed → RET == 33
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 33);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 32);
-    EXPECT_EQ(OPCODE_COUNT, 34);
+    // 35 opcodes, 0-indexed → RET == 34
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 34);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 33);
+    EXPECT_EQ(OPCODE_COUNT, 35);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -143,10 +147,11 @@ TEST(Isa, ShapeTokensAreFromTheAllowedSet)
     for (int i = 0; i < OPCODE_COUNT; ++i) {
         const std::string_view name = opcode_name(static_cast<Opcode>(i));
         const bool mentions_shape = name.find("VEC") != std::string_view::npos ||
-                                    name.find("MAT") != std::string_view::npos;
+                                    name.find("MAT") != std::string_view::npos ||
+                                    name.find("X16") != std::string_view::npos;
         if (mentions_shape) {
             EXPECT_TRUE(has_valid_shape_token(name))
-                << name << ": shape token must be one of VEC3/VEC4/MAT3/MAT4";
+                << name << ": shape token must be one of VEC3/VEC4/MAT3/MAT4/16X16X16";
         }
     }
 }

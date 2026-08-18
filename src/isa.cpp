@@ -65,6 +65,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::S_SYNCWARP:       return "S_SYNCWARP";
     case Opcode::S_CP_ASYNC_WAIT:  return "S_CP_ASYNC_WAIT";
     case Opcode::V_SHUFFLE_F32:    return "V_SHUFFLE_F32";
+    case Opcode::V_MMA_16X16X16_F32: return "V_MMA_16X16X16_F32";
     // SYNC
     case Opcode::BARRIER:          return "BARRIER";
     case Opcode::RET:              return "RET";
@@ -277,6 +278,12 @@ Instruction make_s_cp_async_wait(uint32_t outstanding)
     return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
+Instruction make_v_mma_16x16x16_f32(uint8_t dst, uint8_t src0, uint8_t src1,
+                                    uint32_t participants)
+{
+    return {Opcode::V_MMA_16X16X16_F32, dst, src0, src1, encode_lane_mask(participants)};
+}
+
 Instruction make_v_shuffle_f32(uint8_t dst, uint8_t src0, uint8_t src1,
                                uint32_t participants)
 {
@@ -334,6 +341,17 @@ uint32_t instruction_cost(Opcode op)
 
     // Sixteen products and twelve sums.
     case Opcode::V_MATVEC_MAT4_F32: return 16;
+
+    // 4,096 multiply-adds across 32 lanes is 128 a lane, and this is priced at an
+    // eighth of that. The number is not the arithmetic: it is the claim that a
+    // matrix unit retires the work about eight times faster than the lanes would
+    // one FMA at a time, which is the conservative end of what hardware's tensor
+    // cores are quoted at.
+    //
+    // reduction_bench's method rather than a guess left standing —
+    // mma_bench asks how expensive this would have to be before the two routes
+    // came level, and the answer is 128.
+    case Opcode::V_MMA_16X16X16_F32: return 16;
 
     // On-chip, so tens of cycles rather than hundreds.
     case Opcode::V_LD_SHARED_F32:
@@ -440,6 +458,11 @@ uint32_t instruction_latency(Opcode op)
     case Opcode::S_SYNCWARP:
     case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::RET: return 0;
+
+    // Deeper than the arithmetic pipe, as a unit that retires 4,096 operations in
+    // one issue has to be. Sixteen FMAs deep, which is the same ratio to its own
+    // cost that an FMA has to its latency.
+    case Opcode::V_MMA_16X16X16_F32: return 32;
 
     // A crossbar across the warp, priced like the shared-memory traffic it
     // replaces and no deeper than the arithmetic around it.
