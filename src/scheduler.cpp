@@ -465,8 +465,9 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
     // Warp state, and handled before the lane loop is reached. Named here so
     // that -Wswitch keeps watching this switch for the next opcode. The matrix
     // multiply is there too, for the stronger reason: no lane holds enough of A
-    // or B to compute anything on its own.
+    // or B to compute anything on its own, and REORDER moves whole threads.
     case Opcode::S_CP_ASYNC_WAIT:
+    case Opcode::REORDER:
     case Opcode::V_MMA_16X16X16_F32: break;
 
     // decode_cmp_op(instr.imm) recovers the condition. The result is written as
@@ -842,7 +843,8 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
                                  std::to_string(program.size()) + "-instruction program");
     }
 
-    if (program[warp.pc].op == Opcode::BARRIER) {
+    if (program[warp.pc].op == Opcode::BARRIER ||
+        program[warp.pc].op == Opcode::REORDER) {
         // Every live lane has to have arrived. min-PC issue means the warp
         // reaches a barrier with only the lanes that got there; any that
         // branched past sit at a higher pc and will never come back, so the
@@ -872,9 +874,18 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
             }
         }
 
+        const Instruction& rendezvous = program[warp.pc];
         stats_.warp_steps += 1;
         stats_.active_lane_ops += live;
-        stats_.weighted_lane_ops += live * instruction_cost(Opcode::BARRIER);
+        stats_.weighted_lane_ops += live * instruction_cost(rendezvous.op);
+
+        if (rendezvous.op == Opcode::REORDER) {
+            // Which register to sort by, left for the release: the threads cannot
+            // be regrouped until every warp of the block has arrived, and by then
+            // this instruction is behind them.
+            require_register_range(rendezvous.src0, 1, "REORDER key");
+            block.reorder_key = rendezvous.src0;
+        }
 
         warp.at_barrier = true;
         return false;
@@ -1298,6 +1309,51 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     return true;
 }
 
+namespace {
+
+// The regroup itself: the block's threads sorted by their key and laid back down
+// across its warps, sixteen at a time and then the next.
+//
+// A thread carries its registers and its pc with it, so nothing about what it
+// computes changes — only which lanes it shares an instruction with. That is the
+// whole claim of shader execution reordering, and it is why the answer can be
+// compared against the unreordered one exactly rather than approximately.
+//
+// Retired threads sort last. They will not issue again, and leaving them among
+// the live ones would put holes in the warps this exists to fill.
+void regroup(ThreadBlock& block, uint32_t key_reg)
+{
+    std::vector<Thread> threads;
+    threads.reserve(block.warps.size() * WARP_SIZE);
+    for (Warp& warp : block.warps) {
+        for (Thread& thread : warp.threads) {
+            threads.push_back(thread);
+        }
+    }
+
+    std::stable_sort(threads.begin(), threads.end(),
+                     [key_reg](const Thread& a, const Thread& b) {
+                         if (a.active != b.active) {
+                             return a.active;
+                         }
+                         return a.regs[key_reg] < b.regs[key_reg];
+                     });
+
+    size_t at = 0;
+    for (Warp& warp : block.warps) {
+        for (Thread& thread : warp.threads) {
+            thread = threads[at++];
+        }
+
+        // A ballot's answer names lanes, and the lanes have just changed hands.
+        // Keeping it would let a S_ANY read a mask about threads that are no
+        // longer here.
+        warp.masks.fill(0);
+    }
+}
+
+}  // namespace
+
 void WarpScheduler::release_barrier(ThreadBlock& block)
 {
     // Called only once no warp of this block can issue, and that is the whole
@@ -1307,6 +1363,10 @@ void WarpScheduler::release_barrier(ThreadBlock& block)
     //
     // Per block, not per SM. Two blocks sharing an SM have separate barriers, and
     // one of them stalling is not the other's business.
+    if (block.reorder_key != ThreadBlock::NO_REORDER) {
+        regroup(block, block.reorder_key);
+        block.reorder_key = ThreadBlock::NO_REORDER;
+    }
     for (Warp& warp : block.warps) {
         warp.at_barrier = false;
     }

@@ -257,6 +257,14 @@ public:
     // the scheduler throws when one does not.
     void barrier();
 
+    // Regroups the block's threads so that equal keys share a warp. A rendezvous
+    // like barrier(), and under the same rule about divergent control flow.
+    //
+    // Nothing a thread holds changes, so a kernel with one of these computes what
+    // it computed without it — what changes is which lanes disagree, and so what
+    // the divergence costs.
+    void reorder(Reg<Scalar> key);
+
     // Structured forms, for the cases a label would only clutter. BRA_DIV can
     // only jump when a value is non-zero, so skipping a body costs one extra
     // instruction to invert the condition; that is hidden here.

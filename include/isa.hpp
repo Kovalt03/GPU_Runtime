@@ -141,6 +141,19 @@ enum class Opcode : uint8_t {
 
     // CUDA's __syncthreads().
     BARRIER,  // wait for every live warp of the block    (all operands unused)
+
+    // Regroup the block's threads so that lanes wanting the same thing share a
+    // warp. Ada's shader execution reordering, and OptiX's optixReorder.
+    //
+    // Every thread offers a key in src0 and the block's threads are redistributed
+    // across its warps in key order. Nothing about a thread changes except which
+    // warp it is in — its registers and its pc travel with it — so the answer is
+    // the same either way and only the divergence differs.
+    //
+    // No prefix and no type, like BARRIER: it writes no register. It is also a
+    // rendezvous for the same reason a barrier is, since threads cannot be
+    // regrouped while some of them are elsewhere.
+    REORDER,  // regroup the block's threads by reg[src0]   (dst/src1 unused)
     RET,      // end thread                               (all operands unused)
 };
 
@@ -254,6 +267,11 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// The key is a lane register, and threads are grouped by equal keys. Anything
+// whole works: what it means is the caller's, and hardware treats it the same
+// way — a coherence hint rather than an ordering.
+Instruction make_reorder(uint8_t key_reg);
 
 // Every lane takes part, always: the shape is fixed and a fragment is missing
 // without one of them. participants is still spelled out, so the call site says

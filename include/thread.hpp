@@ -110,6 +110,12 @@ struct ThreadBlock {
     std::vector<Warp> warps;
     std::array<float, SHARED_MEM_FLOATS> shared_mem{};  // shared by all warps here
     uint32_t block_id = 0;
+
+    // Which register the block is being regrouped by, once a warp has reached a
+    // REORDER. The rendezvous is a barrier's, and this is what tells the release
+    // that there is work to do at the end of it.
+    static constexpr uint32_t NO_REORDER = 0xFFFFFFFFu;
+    uint32_t reorder_key = NO_REORDER;
 };
 
 // --- activeMask helpers -----------------------------------------------------

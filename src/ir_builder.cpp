@@ -397,6 +397,11 @@ void IRBuilder::barrier()
     emit(make_barrier());
 }
 
+void IRBuilder::reorder(Reg<Scalar> key)
+{
+    emit(make_reorder(key.first()));
+}
+
 Label IRBuilder::label()
 {
     const uint32_t id = static_cast<uint32_t>(label_targets_.size());

@@ -16,7 +16,8 @@ constexpr int OPCODE_COUNT = static_cast<int>(Opcode::RET) + 1;
 bool is_control_flow(Opcode op)
 {
     return op == Opcode::BRA || op == Opcode::BRA_DIV || op == Opcode::BARRIER ||
-           op == Opcode::RET || op == Opcode::S_SYNCWARP || op == Opcode::S_CP_ASYNC_WAIT;
+           op == Opcode::RET || op == Opcode::S_SYNCWARP ||
+           op == Opcode::S_CP_ASYNC_WAIT || op == Opcode::REORDER;
 }
 
 // Warp-uniform: one result, the same in every lane. S_SYNCWARP and
@@ -79,10 +80,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 35 opcodes, 0-indexed → RET == 34
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 34);
+    // 36 opcodes, 0-indexed → RET == 35
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 35);
     EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 33);
-    EXPECT_EQ(OPCODE_COUNT, 35);
+    EXPECT_EQ(OPCODE_COUNT, 36);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an

@@ -68,6 +68,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_MMA_16X16X16_F32: return "V_MMA_16X16X16_F32";
     // SYNC
     case Opcode::BARRIER:          return "BARRIER";
+    case Opcode::REORDER:          return "REORDER";
     case Opcode::RET:              return "RET";
     }
 
@@ -278,6 +279,11 @@ Instruction make_s_cp_async_wait(uint32_t outstanding)
     return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
+Instruction make_reorder(uint8_t key_reg)
+{
+    return {Opcode::REORDER, 0, key_reg, 0, 0.0f};
+}
+
 Instruction make_v_mma_16x16x16_f32(uint8_t dst, uint8_t src0, uint8_t src1,
                                     uint32_t participants)
 {
@@ -390,6 +396,12 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::BARRIER:
     case Opcode::S_SYNCWARP: return 1;
 
+    // Not nothing: every thread of the block is sorted and moved. Priced at a
+    // shared-memory round trip a thread, which is the cheapest way the hardware
+    // could plausibly do it — the registers themselves do not move on a real
+    // machine, the thread's identity does.
+    case Opcode::REORDER: return 8;
+
     // Likewise: waiting for a copy costs the wait, which shows as the warp not
     // issuing. The instruction that expresses the wait is free.
     case Opcode::S_CP_ASYNC_WAIT: return 1;
@@ -458,6 +470,11 @@ uint32_t instruction_latency(Opcode op)
     case Opcode::S_SYNCWARP:
     case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::RET: return 0;
+
+    // The block waits for the sort, and the waiting is the scheduler's — but
+    // unlike a barrier there is work to do once everyone has arrived, and that
+    // work has a depth. A shared-memory round trip again.
+    case Opcode::REORDER: return 30;
 
     // Deeper than the arithmetic pipe, as a unit that retires 4,096 operations in
     // one issue has to be. Sixteen FMAs deep, which is the same ratio to its own

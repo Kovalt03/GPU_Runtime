@@ -2382,3 +2382,129 @@ TEST(Scheduler, OneMatrixInstructionCostsAFractionOfTheFmasItReplaces)
     EXPECT_EQ(g.sched.stats().warp_steps - 1, MMA_FRAGMENT_REGISTERS * MMA_TILE)
         << "the arithmetic route issues one instruction per multiply-add";
 }
+
+// ---------------------------------------------------------------------------
+// Reordering — the same threads, in different warps
+// ---------------------------------------------------------------------------
+
+TEST(Scheduler, ReorderingGroupsEqualKeysIntoTheSameWarp)
+{
+    // Two warps, keys alternating, so before the reorder every warp holds both
+    // kinds and after it none does.
+    ThreadBlock block = make_block(2, 0);
+    for (uint32_t w = 0; w < 2; ++w) {
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            Thread& t = block.warps[w].threads[lane];
+            t.regs[1] = static_cast<float>((w * WARP_SIZE + lane) % 2);  // the key
+            t.regs[2] = static_cast<float>(w * WARP_SIZE + lane);        // who it was
+        }
+    }
+
+    WarpScheduler sched;
+    std::vector<uint8_t> global(GLOBAL_BYTES, 0);
+    sched.run(Program{make_reorder(1), make_ret()}, block,
+              DeviceSpan{global.data(), global.size()});
+
+    for (const Warp& warp : block.warps) {
+        const float key = warp.threads[0].regs[1];
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            EXPECT_FLOAT_EQ(warp.threads[lane].regs[1], key)
+                << "a warp still holds two kinds of thread";
+        }
+    }
+
+    // Every thread is still there, once.
+    std::vector<bool> seen(2 * WARP_SIZE, false);
+    for (const Warp& warp : block.warps) {
+        for (const Thread& t : warp.threads) {
+            const auto who = static_cast<size_t>(t.regs[2]);
+            ASSERT_LT(who, seen.size());
+            EXPECT_FALSE(seen[who]) << "thread " << who << " was duplicated";
+            seen[who] = true;
+        }
+    }
+}
+
+TEST(Scheduler, AThreadKeepsWhatItHeldAcrossAReorder)
+{
+    // Registers and pc travel with the thread. That is what lets a reordered
+    // kernel be compared against an unreordered one exactly.
+    ThreadBlock block = make_block(1, 0);
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        block.warps[0].threads[lane].regs[1] = static_cast<float>(WARP_SIZE - lane);
+        block.warps[0].threads[lane].regs[5] = static_cast<float>(lane * 3);
+    }
+
+    WarpScheduler sched;
+    std::vector<uint8_t> global(GLOBAL_BYTES, 0);
+    sched.run(Program{make_reorder(1), make_ret()}, block,
+              DeviceSpan{global.data(), global.size()});
+
+    // The key and the payload moved together: reg[5] is three times what the
+    // thread's original lane was, and reg[1] says which lane that was.
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        const Thread& t = block.warps[0].threads[lane];
+        const float was = static_cast<float>(WARP_SIZE) - t.regs[1];
+        EXPECT_FLOAT_EQ(t.regs[5], was * 3.0f);
+    }
+}
+
+TEST(Scheduler, ReorderingIsRefusedUnderDivergence)
+{
+    // The threads cannot be regrouped while some of them are elsewhere, which is
+    // the rule a barrier is under and for the same reason.
+    Fixture f;
+    for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+        f.lane(lane).regs[REG_GLOBAL_ID_X] = static_cast<float>(lane);
+    }
+    EXPECT_THROW(f.run(Program{
+                     make_v_mov_f32(1, 16.0f),
+                     make_v_cmp_f32(2, REG_GLOBAL_ID_X, 1, CmpOp::LT),
+                     make_bra_div(2, 2),
+                     make_reorder(1),
+                     make_ret(),
+                 }),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, ReorderingCostsTheWarpStepsItSaves)
+{
+    // The measurement: lanes that disagree are made to agree, and what changes is
+    // how many steps the divergent stretch takes. Same answer either way.
+    const auto run = [](bool reordered) {
+        ThreadBlock block = make_block(2, 0);
+        for (uint32_t w = 0; w < 2; ++w) {
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                // Alternating, which is the worst case: every warp holds both.
+                block.warps[w].threads[lane].regs[1] =
+                    static_cast<float>((w * WARP_SIZE + lane) % 2);
+            }
+        }
+
+        Program p;
+        if (reordered) {
+            p.push_back(make_reorder(1));
+        }
+        // if (key != 0) { 20 instructions } — the divergent stretch.
+        p.push_back(make_bra_div(1, 2));
+        p.push_back(make_bra(21));
+        for (int i = 0; i < 20; ++i) {
+            p.push_back(make_v_add_f32(3, 3, 1));
+        }
+        p.push_back(make_ret());
+
+        WarpScheduler sched;
+        std::vector<uint8_t> global(GLOBAL_BYTES, 0);
+        sched.run(p, block, DeviceSpan{global.data(), global.size()});
+        return sched.stats();
+    };
+
+    const SchedulerStats split = run(false);
+    const SchedulerStats grouped = run(true);
+
+    EXPECT_LT(grouped.warp_steps, split.warp_steps)
+        << "grouping the lanes that take the branch should cost fewer steps";
+    EXPECT_LT(grouped.divergence_rate(), split.divergence_rate());
+    EXPECT_EQ(grouped.active_lane_ops - WARP_SIZE * 2, split.active_lane_ops)
+        << "the same work, plus the reorder itself";
+}
