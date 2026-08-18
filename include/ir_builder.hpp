@@ -47,6 +47,12 @@ struct Frag {
     static constexpr uint32_t ALIGNMENT = 4;
 };
 
+// The same fragment with two halves to a register, so half as many of them.
+struct HalfFrag {
+    static constexpr uint32_t REGISTERS = HALF_FRAGMENT_REGISTERS;
+    static constexpr uint32_t ALIGNMENT = 4;
+};
+
 // A typed handle to a register range. Deliberately not convertible to uint8_t:
 // the whole point is that Reg<Vec3> and Reg<Scalar> cannot be interchanged, and
 // that no raw number reaches an operand slot by accident.
@@ -129,6 +135,10 @@ public:
     {
         return alloc<Frag>();
     }
+    Reg<HalfFrag> half_fragment()
+    {
+        return alloc<HalfFrag>();
+    }
 
     uint32_t registers_used() const
     {
@@ -178,6 +188,11 @@ public:
     // accumulator += a * b, over a 16x16x16 tile, by the whole warp. In place,
     // which is what lets a K loop carry its answer in registers.
     void mma(Reg<Frag> accumulator, Reg<Frag> a, Reg<Frag> b);
+
+    // Half-precision operands, single-precision accumulator. The types make the
+    // pairing impossible to get wrong: a Frag cannot be passed where a HalfFrag
+    // belongs, and the accumulator is a Frag in both.
+    void mma(Reg<Frag> accumulator, Reg<HalfFrag> a, Reg<HalfFrag> b);
 
     // Accumulates in place, matching V_FMA_F32: acc += a * b.
     void fma(Reg<Scalar> acc, Reg<Scalar> a, Reg<Scalar> b);
@@ -237,6 +252,10 @@ public:
     // trips. The registers come back consecutive, which is what the matrix
     // instruction needs and what eight allocating loads could not promise.
     Reg<Frag> load_shared_fragment(Reg<Scalar> address, float offset = 0.0f);
+
+    // The same in half precision: four registers of packed halves, which nothing
+    // but the F16 instructions may read.
+    Reg<HalfFrag> load_shared_half_fragment(Reg<Scalar> address, float offset = 0.0f);
     void load_vec3_into(Reg<Vec3> dst, Reg<Scalar> address, float offset = 0.0f);
 
     // The block's own scratchpad. Addresses are byte offsets, as the global

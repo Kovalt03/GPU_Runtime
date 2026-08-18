@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/types.h>
 #include <vector>
+#include "half.hpp"
 #include "isa.hpp"
 #include "thread.hpp"
 
@@ -171,7 +172,8 @@ void require_participants_present(const Warp& warp, uint32_t participants,
 bool is_warp_level(Opcode op)
 {
     return op == Opcode::S_BALLOT || op == Opcode::S_ANY || op == Opcode::S_ALL ||
-           op == Opcode::V_SHUFFLE_F32 || op == Opcode::V_MMA_16X16X16_F32;
+           op == Opcode::V_SHUFFLE_F32 || op == Opcode::V_MMA_16X16X16_F32 ||
+           op == Opcode::V_MMA_16X16X16_F16;
 }
 
 // A lane index arriving as a float, which is how this machine carries every
@@ -480,6 +482,23 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // The same, four registers of packed halves. The bits are moved rather than
+    // read: what a register holds after this is two numbers, and only the
+    // instructions whose names end in F16 know how to take it apart.
+    case Opcode::V_LD_SHARED_16X16_F16: {
+        require_register_range(instr.dst, HALF_FRAGMENT_REGISTERS,
+                               "V_LD_SHARED_16X16_F16 dst");
+        require_register_alignment(instr.dst, 4, "V_LD_SHARED_16X16_F16 dst");
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_SHARED_16X16_F16");
+        for (uint32_t i = 0; i < HALF_FRAGMENT_REGISTERS; ++i) {
+            thread.regs[instr.dst + i] =
+                load_f32(shared_bytes(block), SHARED_MEM_BYTES, addr + i * sizeof(float),
+                         "V_LD_SHARED_16X16_F16");
+        }
+        break;
+    }
+
     // Another block's shared memory. The cluster is a list the scheduler set when
     // it placed the blocks together, so a rank that exists is a block that is
     // certainly resident; a block with no cluster is a cluster of one.
@@ -511,7 +530,8 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
     case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::REORDER:
     case Opcode::BARRIER_CLUSTER:
-    case Opcode::V_MMA_16X16X16_F32: break;
+    case Opcode::V_MMA_16X16X16_F32:
+    case Opcode::V_MMA_16X16X16_F16: break;
 
     // decode_cmp_op(instr.imm) recovers the condition. The result is written as
     // 1.0f or 0.0f so that BRA_DIV, which only tests against zero, can consume
@@ -1138,6 +1158,71 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
             for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
                 if ((participants & (1u << lane)) != 0) {
                     warp.threads[lane].regs[instr.dst] = all;
+                }
+            }
+            break;
+        }
+
+        case Opcode::V_MMA_16X16X16_F16: {
+            // The same product with the operands unpacked as they are read. Two
+            // halves a register, low then high, which is the order pack_f16x2
+            // writes them in — and the only place in the machine that knows it.
+            require_register_range(instr.src0, HALF_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F16 src0");
+            require_register_range(instr.src1, HALF_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F16 src1");
+            require_register_range(instr.dst, MMA_FRAGMENT_REGISTERS,
+                                   "V_MMA_16X16X16_F16 dst");
+            require_register_alignment(instr.src0, 4, "V_MMA_16X16X16_F16 src0");
+            require_register_alignment(instr.src1, 4, "V_MMA_16X16X16_F16 src1");
+            require_register_alignment(instr.dst, 4, "V_MMA_16X16X16_F16 dst");
+
+            const uint32_t participants = decode_lane_mask(instr.imm);
+            if (participants != 0xFFFFFFFFu) {
+                throw std::runtime_error(
+                    "V_MMA_16X16X16_F16: the shape needs every lane, and the "
+                    "participation mask names only 0x" +
+                    to_hex(participants));
+            }
+            require_participants_present(warp, participants, "V_MMA_16X16X16_F16");
+
+            std::array<float, MMA_ELEMENTS> a{};
+            std::array<float, MMA_ELEMENTS> b{};
+            std::array<float, MMA_ELEMENTS> d{};
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                for (uint32_t i = 0; i < HALF_FRAGMENT_REGISTERS; ++i) {
+                    uint16_t low = 0;
+                    uint16_t high = 0;
+                    unpack_f16x2(warp.threads[lane].regs[instr.src0 + i], low, high);
+                    a[lane * MMA_FRAGMENT_REGISTERS + i * 2] = f16_to_f32(low);
+                    a[lane * MMA_FRAGMENT_REGISTERS + i * 2 + 1] = f16_to_f32(high);
+
+                    unpack_f16x2(warp.threads[lane].regs[instr.src1 + i], low, high);
+                    b[lane * MMA_FRAGMENT_REGISTERS + i * 2] = f16_to_f32(low);
+                    b[lane * MMA_FRAGMENT_REGISTERS + i * 2 + 1] = f16_to_f32(high);
+                }
+                for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+                    d[lane * MMA_FRAGMENT_REGISTERS + i] =
+                        warp.threads[lane].regs[instr.dst + i];
+                }
+            }
+
+            // Accumulated in single precision, which is what the arrangement is
+            // for: the width is saved on the inputs and kept on the sum.
+            for (uint32_t row = 0; row < MMA_TILE; ++row) {
+                for (uint32_t col = 0; col < MMA_TILE; ++col) {
+                    float sum = d[row * MMA_TILE + col];
+                    for (uint32_t i = 0; i < MMA_TILE; ++i) {
+                        sum += a[row * MMA_TILE + i] * b[i * MMA_TILE + col];
+                    }
+                    d[row * MMA_TILE + col] = sum;
+                }
+            }
+
+            for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+                for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+                    warp.threads[lane].regs[instr.dst + i] =
+                        d[lane * MMA_FRAGMENT_REGISTERS + i];
                 }
             }
             break;

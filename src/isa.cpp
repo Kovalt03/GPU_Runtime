@@ -56,6 +56,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
     case Opcode::V_ATOM_ADD_GLOBAL_F32: return "V_ATOM_ADD_GLOBAL_F32";
     case Opcode::V_LD_SHARED_16X16_F32: return "V_LD_SHARED_16X16_F32";
+    case Opcode::V_LD_SHARED_16X16_F16: return "V_LD_SHARED_16X16_F16";
     case Opcode::V_LD_CLUSTER_F32: return "V_LD_CLUSTER_F32";
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
@@ -68,6 +69,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::S_CP_ASYNC_WAIT:  return "S_CP_ASYNC_WAIT";
     case Opcode::V_SHUFFLE_F32:    return "V_SHUFFLE_F32";
     case Opcode::V_MMA_16X16X16_F32: return "V_MMA_16X16X16_F32";
+    case Opcode::V_MMA_16X16X16_F16: return "V_MMA_16X16X16_F16";
     // SYNC
     case Opcode::BARRIER:          return "BARRIER";
     case Opcode::REORDER:          return "REORDER";
@@ -287,6 +289,11 @@ Instruction make_v_ld_shared_16x16_f32(uint8_t dst, uint8_t addr_reg, float offs
     return {Opcode::V_LD_SHARED_16X16_F32, dst, addr_reg, 0, offset};
 }
 
+Instruction make_v_ld_shared_16x16_f16(uint8_t dst, uint8_t addr_reg, float offset)
+{
+    return {Opcode::V_LD_SHARED_16X16_F16, dst, addr_reg, 0, offset};
+}
+
 Instruction make_v_ld_cluster_f32(uint8_t dst, uint8_t addr_reg, uint8_t rank_reg,
                                   float offset)
 {
@@ -307,6 +314,12 @@ Instruction make_v_mma_16x16x16_f32(uint8_t dst, uint8_t src0, uint8_t src1,
                                     uint32_t participants)
 {
     return {Opcode::V_MMA_16X16X16_F32, dst, src0, src1, encode_lane_mask(participants)};
+}
+
+Instruction make_v_mma_16x16x16_f16(uint8_t dst, uint8_t src0, uint8_t src1,
+                                    uint32_t participants)
+{
+    return {Opcode::V_MMA_16X16X16_F16, dst, src0, src1, encode_lane_mask(participants)};
 }
 
 Instruction make_v_shuffle_f32(uint8_t dst, uint8_t src0, uint8_t src1,
@@ -378,6 +391,11 @@ uint32_t instruction_cost(Opcode op)
     // came level, and the answer is 128.
     case Opcode::V_MMA_16X16X16_F32: return 16;
 
+    // Half again, which is the claim a tensor core makes for a narrow input and
+    // the reason f16 is on these units. The accumulator is still single
+    // precision, so the depth below is unchanged.
+    case Opcode::V_MMA_16X16X16_F16: return 8;
+
     // On-chip, so tens of cycles rather than hundreds.
     case Opcode::V_LD_SHARED_F32:
     case Opcode::V_ST_SHARED_F32: return 8;
@@ -387,6 +405,11 @@ uint32_t instruction_cost(Opcode op)
     // there is no transaction for a wide load to save, and claiming one would be
     // inventing a saving. What it does save is on the other line, in latency.
     case Opcode::V_LD_SHARED_16X16_F32: return 8 * 8;
+
+    // Half the registers, half the bytes, half the price. The saving is real
+    // rather than claimed: the instruction moves four registers where the other
+    // moves eight.
+    case Opcode::V_LD_SHARED_16X16_F16: return 4 * 8;
 
     // Still on-chip, and still not this block's: the request leaves the SM and
     // comes back. Twice a local one, which puts it an order below a cache line
@@ -475,7 +498,8 @@ uint32_t instruction_latency(Opcode op)
     // Deeper than one float and far shallower than eight of them: the address is
     // computed once and the bank sequence runs once. A third again, chosen the way
     // the rest of this table is.
-    case Opcode::V_LD_SHARED_16X16_F32: return 40;
+    case Opcode::V_LD_SHARED_16X16_F32:
+    case Opcode::V_LD_SHARED_16X16_F16: return 40;
 
     // Twice that, for the trip out of the SM and back. The point of the
     // instruction is that this is not the 200 an L2 hit costs.
@@ -521,7 +545,8 @@ uint32_t instruction_latency(Opcode op)
     // Deeper than the arithmetic pipe, as a unit that retires 4,096 operations in
     // one issue has to be. Sixteen FMAs deep, which is the same ratio to its own
     // cost that an FMA has to its latency.
-    case Opcode::V_MMA_16X16X16_F32: return 32;
+    case Opcode::V_MMA_16X16X16_F32:
+    case Opcode::V_MMA_16X16X16_F16: return 32;
 
     // A crossbar across the warp, priced like the shared-memory traffic it
     // replaces and no deeper than the arithmetic around it.

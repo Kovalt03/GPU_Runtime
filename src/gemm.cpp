@@ -2,6 +2,7 @@
 #include <string>
 
 #include "gemm.hpp"
+#include "half.hpp"
 #include "ir_builder.hpp"
 
 namespace {
@@ -32,9 +33,31 @@ Position lane_position(IRBuilder& k)
 //
 // A tile element (row, col) is A[(m0 + row) * k + k0 + col]; the four B tiles
 // together are one 16 x 64 slab, element (row, col) = B[(k0 + row) * n + n0 + col].
+// How wide an element is. Halves are packed two to a word, so a tile is half
+// the bytes and the staging moves half as many words — every address below is the
+// same expression scaled, which is what makes the narrow path a width rather than
+// a second kernel.
+float element_bytes(const GemmArgs& a)
+{
+    return a.half_inputs ? 2.0f : 4.0f;
+}
+
+// Words a thread copies of each tile. Two elements of A and eight of B either
+// way; at half precision those are one word and four.
+uint32_t a_words(const GemmArgs& a)
+{
+    return a.half_inputs ? 1u : 2u;
+}
+
+uint32_t b_words(const GemmArgs& a)
+{
+    return a.half_inputs ? 4u : 8u;
+}
+
 void emit_staging(IRBuilder& k, const GemmArgs& a, const Position& at, Reg<Scalar> buffer,
                   Reg<Scalar> k0, Reg<Scalar> m0, Reg<Scalar> n0, bool asynchronous)
 {
+    const float wide = element_bytes(a);
     const Reg<Scalar> four = k.constant(4.0f);
     const Reg<Scalar> one = k.constant(1.0f);
 
@@ -44,56 +67,55 @@ void emit_staging(IRBuilder& k, const GemmArgs& a, const Position& at, Reg<Scala
     const Reg<Scalar> to = k.copy(buffer);
     const Reg<Scalar> from = k.copy(buffer);
 
-    // A: this thread takes columns 4*warp + 2*half + {0, 1} of its row.
+    // A: columns 4*warp + 2*half + {0, 1} of this thread's row.
     //
-    // shared = buffer + (row * 16 + col) * 4
-    // global = a_offset + ((m0 + row) * k + k0 + col) * 4
+    // shared = buffer + (row * 16 + col) * wide
+    // global = a_offset + ((m0 + row) * k + k0 + col) * wide
     k.copy_into(to, buffer);
-    k.fma(to, at.row, k.constant(static_cast<float>(GEMM_TILE * sizeof(float))));
-    k.fma(to, at.warp, k.constant(16.0f));
-    k.fma(to, at.half, k.constant(8.0f));
+    k.fma(to, at.row, k.constant(static_cast<float>(GEMM_TILE) * wide));
+    k.fma(to, at.warp, k.constant(4.0f * wide));
+    k.fma(to, at.half, k.constant(2.0f * wide));
 
     k.copy_into(from, k.constant(static_cast<float>(a.a_offset)));
-    k.fma(from, k.add(m0, at.row), k.constant(static_cast<float>(a.k * sizeof(float))));
-    k.fma(from, k0, four);
-    k.fma(from, at.warp, k.constant(16.0f));
-    k.fma(from, at.half, k.constant(8.0f));
+    k.fma(from, k.add(m0, at.row), k.constant(static_cast<float>(a.k) * wide));
+    k.fma(from, k0, k.constant(wide));
+    k.fma(from, at.warp, k.constant(4.0f * wide));
+    k.fma(from, at.half, k.constant(2.0f * wide));
 
-    for (uint32_t i = 0; i < 2; ++i) {
+    for (uint32_t i = 0; i < a_words(a); ++i) {
         if (asynchronous) {
             k.cp_async(to, from, static_cast<float>(i * sizeof(float)));
         } else {
             k.store_shared(to, k.load(from, static_cast<float>(i * sizeof(float))));
         }
-        if (i + 1 < 2) {
+        if (i + 1 < a_words(a)) {
             k.fma(to, one, four);
         }
     }
 
-    // B: columns 16*warp + 8*half + {0 .. 7} of its row, in the slab that follows
-    // A in shared memory.
+    // B: columns 16*warp + 8*half + {0 .. 7} of its row, in the slab after A.
     //
-    // shared = buffer + a_floats * 4 + (row * 64 + col) * 4
-    // global = b_offset + ((k0 + row) * n + n0 + col) * 4
+    // shared = buffer + a_elements * wide + (row * 64 + col) * wide
+    // global = b_offset + ((k0 + row) * n + n0 + col) * wide
     k.copy_into(to, buffer);
-    k.fma(to, one, k.constant(static_cast<float>(GEMM_A_FLOATS * sizeof(float))));
-    k.fma(to, at.row, k.constant(static_cast<float>(GEMM_TILE_N * sizeof(float))));
-    k.fma(to, at.warp, k.constant(static_cast<float>(GEMM_TILE * sizeof(float))));
-    k.fma(to, at.half, k.constant(32.0f));
+    k.fma(to, one, k.constant(static_cast<float>(GEMM_A_FLOATS) * wide));
+    k.fma(to, at.row, k.constant(static_cast<float>(GEMM_TILE_N) * wide));
+    k.fma(to, at.warp, k.constant(static_cast<float>(GEMM_TILE) * wide));
+    k.fma(to, at.half, k.constant(8.0f * wide));
 
     k.copy_into(from, k.constant(static_cast<float>(a.b_offset)));
-    k.fma(from, k.add(k0, at.row), k.constant(static_cast<float>(a.n * sizeof(float))));
-    k.fma(from, n0, four);
-    k.fma(from, at.warp, k.constant(static_cast<float>(GEMM_TILE * sizeof(float))));
-    k.fma(from, at.half, k.constant(32.0f));
+    k.fma(from, k.add(k0, at.row), k.constant(static_cast<float>(a.n) * wide));
+    k.fma(from, n0, k.constant(wide));
+    k.fma(from, at.warp, k.constant(static_cast<float>(GEMM_TILE) * wide));
+    k.fma(from, at.half, k.constant(8.0f * wide));
 
-    for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+    for (uint32_t i = 0; i < b_words(a); ++i) {
         if (asynchronous) {
             k.cp_async(to, from, static_cast<float>(i * sizeof(float)));
         } else {
             k.store_shared(to, k.load(from, static_cast<float>(i * sizeof(float))));
         }
-        if (i + 1 < MMA_FRAGMENT_REGISTERS) {
+        if (i + 1 < b_words(a)) {
             k.fma(to, one, four);
         }
     }
@@ -125,8 +147,10 @@ Program build_gemm_program(void** args)
         k.set(accumulator.component(i), 0.0f);
     }
 
+    const float wide = element_bytes(a);
+    const uint32_t copies_a_warp = a_words(a) + b_words(a);
     const Reg<Scalar> buffer_bytes =
-        k.constant(static_cast<float>(GEMM_STAGE_FLOATS * sizeof(float)));
+        k.constant(static_cast<float>(GEMM_STAGE_FLOATS) * wide);
     const Reg<Scalar> buffer = k.copy(zero);
     const Reg<Scalar> step = k.copy(zero);
     const Reg<Scalar> steps = k.constant(static_cast<float>(a.k / GEMM_TILE));
@@ -150,7 +174,7 @@ Program build_gemm_program(void** args)
             k.lt(next_k0, k.constant(static_cast<float>(a.k))),
             [&] {
                 emit_staging(k, a, at, other, next_k0, m0, n0, true);
-                k.cp_async_wait(GEMM_COPIES_A_WARP);
+                k.cp_async_wait(copies_a_warp);
             },
             [&] { k.cp_async_wait(0); });
     } else {
@@ -159,21 +183,31 @@ Program build_gemm_program(void** args)
     k.barrier();
 
     // The fragments this lane holds: row `row`, columns 8*half + {0 .. 7}.
+    // Scaled by the element width, like the staging above: at half precision the
+    // same element sits at half the byte offset, and a fragment is half as far
+    // from the one beside it.
+    const Reg<Scalar> width = k.constant(wide);
     const Reg<Scalar> a_at =
         k.add(buffer,
-              k.mul(k.add(k.mul(at.row, tile), k.mul(at.half, k.constant(8.0f))), four));
-    const Reg<Scalar> b_at = k.add(
-        k.add(buffer, k.constant(static_cast<float>(GEMM_A_FLOATS * sizeof(float)))),
-        k.mul(k.add(k.mul(at.row, k.constant(static_cast<float>(GEMM_TILE_N))),
-                    k.add(k.mul(at.warp, tile), k.mul(at.half, k.constant(8.0f)))),
-              four));
+              k.mul(k.add(k.mul(at.row, tile), k.mul(at.half, k.constant(8.0f))), width));
+    const Reg<Scalar> b_at =
+        k.add(k.add(buffer, k.constant(static_cast<float>(GEMM_A_FLOATS) * wide)),
+              k.mul(k.add(k.mul(at.row, k.constant(static_cast<float>(GEMM_TILE_N))),
+                          k.add(k.mul(at.warp, tile), k.mul(at.half, k.constant(8.0f)))),
+                    width));
 
     if (a.matrix_unit) {
         // Sixteen loads and one instruction, or two loads and one instruction.
         // What the wide one saves is the waiting: this machine issues in order,
         // so eight round trips to shared memory are eight waits with nothing
         // between them.
-        if (a.wide_fragments) {
+        if (a.half_inputs) {
+            // Four registers an operand instead of eight, and an instruction
+            // priced at half. The accumulator stays single precision, which is
+            // the arrangement every tensor core makes.
+            k.mma(accumulator, k.load_shared_half_fragment(a_at),
+                  k.load_shared_half_fragment(b_at));
+        } else if (a.wide_fragments) {
             k.mma(accumulator, k.load_shared_fragment(a_at),
                   k.load_shared_fragment(b_at));
         } else {
@@ -248,10 +282,28 @@ void run_gemm(MyGPURuntime& rt, const GemmArgs& args)
 
     LaunchConfig config{grid, block};
     config.shared_bytes = (args.staging == TileStaging::Synchronous ? 1 : 2) *
-                          GEMM_STAGE_FLOATS * sizeof(float);
+                          GEMM_STAGE_FLOATS * (args.half_inputs ? 2 : 4);
 
     void* raw[] = {const_cast<GemmArgs*>(&args)};
     rt.myrt_launch(build_gemm_program, config, raw);
+}
+
+std::vector<float> pack_halves(const std::vector<float>& values)
+{
+    std::vector<float> packed(values.size() / 2);
+    for (size_t i = 0; i < packed.size(); ++i) {
+        packed[i] = pack_f16x2(f32_to_f16(values[i * 2]), f32_to_f16(values[i * 2 + 1]));
+    }
+    return packed;
+}
+
+std::vector<float> rounded_to_half(const std::vector<float>& values)
+{
+    std::vector<float> out(values.size());
+    for (size_t i = 0; i < values.size(); ++i) {
+        out[i] = f16_to_f32(f32_to_f16(values[i]));
+    }
+    return out;
 }
 
 std::vector<float> gemm_reference(const std::vector<float>& a,

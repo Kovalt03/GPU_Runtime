@@ -53,6 +53,13 @@ struct GemmArgs {
     // same staging — only the inner loop differs.
     bool matrix_unit = true;
 
+    // Whether the operands are halves. The host packs them — nothing on the
+    // device converts — so A and B arrive as half as many bytes, a fragment is
+    // four registers instead of eight, and the accumulator stays single
+    // precision. The answer is then *not* the reference's: the inputs were
+    // rounded, and the tests bound the difference rather than ignoring it.
+    bool half_inputs = false;
+
     // Whether a fragment is loaded in one instruction or eight.
     //
     // Only the matrix route has fragments; the arithmetic one reads a float at a
@@ -76,6 +83,17 @@ void run_gemm(MyGPURuntime& rt, const GemmArgs& args);
 // The same product on the host, for the tests to check against. Row-major, and
 // deliberately the obvious three loops: a reference that shared the kernel's
 // blocking could be wrong in the same way it is.
+// A and B packed as halves, two to a float, in the order the kernel reads them:
+// element (row, col) of a tile stays where it was, and the pair sharing a
+// register is (col, col + 1). What comes back is bit patterns rather than
+// numbers, and only the F16 instructions may read it.
+std::vector<float> pack_halves(const std::vector<float>& values);
+
+// What the device will actually multiply: every element through f32 -> f16 -> f32.
+// The tests compare against this as well as against the exact reference, because
+// the difference between the two is the whole of what the narrow type costs.
+std::vector<float> rounded_to_half(const std::vector<float>& values);
+
 std::vector<float> gemm_reference(const std::vector<float>& a,
                                   const std::vector<float>& b, uint32_t m, uint32_t n,
                                   uint32_t k);

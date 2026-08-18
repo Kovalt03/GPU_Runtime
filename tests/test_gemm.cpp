@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "gemm.hpp"
+#include "half.hpp"
 
 // The tiled matrix multiply, which exists to give V_MMA_16X16X16_F32 and
 // cp.async a kernel. Four routes — the matrix unit or the arithmetic pipe,
@@ -34,13 +35,34 @@ struct Measurement {
 struct GemmOptions {
     bool matrix_unit = true;
     bool wide_fragments = false;
+    bool half_inputs = false;
     TileStaging staging = TileStaging::Synchronous;
 };
 
-Measurement multiply(uint32_t m, uint32_t n, uint32_t k, const GemmOptions& how)
+// The operands every test uses unless it hands over its own. Multiples of a half
+// and a quarter, so that the single-precision routes can be checked exactly —
+// the half-precision one needs numbers that are not representable and says so.
+std::vector<float> default_a(uint32_t m, uint32_t k)
 {
-    const std::vector<float> a = ramp(static_cast<size_t>(m) * k, 7, 0.5f);
-    const std::vector<float> b = ramp(static_cast<size_t>(k) * n, 5, 0.25f);
+    return ramp(static_cast<size_t>(m) * k, 7, 0.5f);
+}
+
+std::vector<float> default_b(uint32_t k, uint32_t n)
+{
+    return ramp(static_cast<size_t>(k) * n, 5, 0.25f);
+}
+
+Measurement multiply(uint32_t m, uint32_t n, uint32_t k, const GemmOptions& how,
+                     const std::vector<float>* operand_a = nullptr,
+                     const std::vector<float>* operand_b = nullptr)
+{
+    const std::vector<float> a = operand_a != nullptr ? *operand_a : default_a(m, k);
+    const std::vector<float> b = operand_b != nullptr ? *operand_b : default_b(k, n);
+
+    // The device never converts: a kernel multiplying halves reads them already
+    // packed, so putting them there is the caller's job — here and on hardware.
+    const std::vector<float> a_device = how.half_inputs ? pack_halves(a) : a;
+    const std::vector<float> b_device = how.half_inputs ? pack_halves(b) : b;
 
     MyGPURuntime rt(1u << 24);
 
@@ -50,11 +72,13 @@ Measurement multiply(uint32_t m, uint32_t n, uint32_t k, const GemmOptions& how)
     rt.myrt_set_memory_model(MemoryModel::Cached);
     rt.myrt_set_latency_model(LatencyModel::Modelled);
 
-    void* da = rt.myrt_malloc(a.size() * sizeof(float));
-    void* db = rt.myrt_malloc(b.size() * sizeof(float));
+    void* da = rt.myrt_malloc(a_device.size() * sizeof(float));
+    void* db = rt.myrt_malloc(b_device.size() * sizeof(float));
     void* dc = rt.myrt_malloc(static_cast<size_t>(m) * n * sizeof(float));
-    rt.myrt_memcpy(da, a.data(), a.size() * sizeof(float), Direction::HostToDevice);
-    rt.myrt_memcpy(db, b.data(), b.size() * sizeof(float), Direction::HostToDevice);
+    rt.myrt_memcpy(da, a_device.data(), a_device.size() * sizeof(float),
+                   Direction::HostToDevice);
+    rt.myrt_memcpy(db, b_device.data(), b_device.size() * sizeof(float),
+                   Direction::HostToDevice);
 
     GemmArgs args;
     args.a_offset = rt.myrt_device_offset(da);
@@ -65,6 +89,7 @@ Measurement multiply(uint32_t m, uint32_t n, uint32_t k, const GemmOptions& how)
     args.k = k;
     args.matrix_unit = how.matrix_unit;
     args.wide_fragments = how.wide_fragments;
+    args.half_inputs = how.half_inputs;
     args.staging = how.staging;
     run_gemm(rt, args);
 
@@ -95,7 +120,7 @@ TEST(Gemm, TheMatrixUnitComputesWhatTheHostDoes)
 {
     constexpr uint32_t M = 32, N = 128, K = 32;
     const std::vector<float> want =
-        gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
+        gemm_reference(default_a(M, K), default_b(K, N), M, N, K);
     agrees(multiply(M, N, K, GemmOptions{}).c, want, "matrix unit");
 }
 
@@ -105,16 +130,19 @@ TEST(Gemm, EveryRouteAgreesWithEveryOther)
     // change what it costs rather than what it computes.
     constexpr uint32_t M = 32, N = 128, K = 32;
     const std::vector<float> want =
-        gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
+        gemm_reference(default_a(M, K), default_b(K, N), M, N, K);
 
+    agrees(multiply(M, N, K,
+                    GemmOptions{true, false, false, TileStaging::AsyncDoubleBuffered})
+               .c,
+           want, "matrix unit, staged ahead");
     agrees(
-        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered}).c,
-        want, "matrix unit, staged ahead");
-    agrees(multiply(M, N, K, GemmOptions{false, false, TileStaging::Synchronous}).c, want,
-           "arithmetic");
-    agrees(
-        multiply(M, N, K, GemmOptions{false, false, TileStaging::AsyncDoubleBuffered}).c,
-        want, "arithmetic, staged ahead");
+        multiply(M, N, K, GemmOptions{false, false, false, TileStaging::Synchronous}).c,
+        want, "arithmetic");
+    agrees(multiply(M, N, K,
+                    GemmOptions{false, false, false, TileStaging::AsyncDoubleBuffered})
+               .c,
+           want, "arithmetic, staged ahead");
 }
 
 TEST(Gemm, OneKStepIsAsMuchAKernelAsSeveral)
@@ -123,10 +151,11 @@ TEST(Gemm, OneKStepIsAsMuchAKernelAsSeveral)
     // step that does not exist and has to wait for it without walking it.
     constexpr uint32_t M = 16, N = 64, K = 16;
     const std::vector<float> want =
-        gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
-    agrees(
-        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered}).c,
-        want, "one k-step");
+        gemm_reference(default_a(M, K), default_b(K, N), M, N, K);
+    agrees(multiply(M, N, K,
+                    GemmOptions{true, false, false, TileStaging::AsyncDoubleBuffered})
+               .c,
+           want, "one k-step");
 }
 
 TEST(Gemm, TheMatrixUnitIssuesAFractionOfTheWork)
@@ -134,7 +163,7 @@ TEST(Gemm, TheMatrixUnitIssuesAFractionOfTheWork)
     constexpr uint32_t M = 32, N = 128, K = 32;
     const Measurement mma = multiply(M, N, K, GemmOptions{});
     const Measurement fma =
-        multiply(M, N, K, GemmOptions{false, false, TileStaging::Synchronous});
+        multiply(M, N, K, GemmOptions{false, false, false, TileStaging::Synchronous});
 
     EXPECT_LT(mma.weighted, fma.weighted / 2)
         << "one instruction against 128 multiply-adds a lane";
@@ -148,8 +177,8 @@ TEST(Gemm, StagingAheadPaysHereWhereItDidNotInTheRenderer)
     // work — the opposite of a tile read by 256 threads.
     constexpr uint32_t M = 32, N = 128, K = 64;
     const Measurement sync = multiply(M, N, K, GemmOptions{});
-    const Measurement async =
-        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered});
+    const Measurement async = multiply(
+        M, N, K, GemmOptions{true, false, false, TileStaging::AsyncDoubleBuffered});
 
     EXPECT_LT(async.cycles, sync.cycles * 9 / 10) << "at least a tenth of the cycles";
 }
@@ -174,7 +203,7 @@ TEST(Gemm, AWideFragmentLoadComputesTheSameProduct)
     // fragment, in the same order, or the multiply reads a transposed operand.
     constexpr uint32_t M = 32, N = 128, K = 32;
     const std::vector<float> want =
-        gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
+        gemm_reference(default_a(M, K), default_b(K, N), M, N, K);
 
     GemmOptions wide;
     wide.matrix_unit = true;
@@ -204,4 +233,73 @@ TEST(Gemm, AWideFragmentLoadBuysTimeRatherThanCapacity)
     EXPECT_EQ(one.weighted, eight.weighted)
         << "and the capacity is the same to the lane-op: eight floats are eight "
            "floats however they are asked for";
+}
+
+// ---------------------------------------------------------------------------
+// Half precision — the width is saved on the inputs and kept on the sum
+// ---------------------------------------------------------------------------
+
+TEST(Gemm, HalfInputsComputeTheRoundedProductExactly)
+{
+    // Not the reference's answer, and not approximately the reference's answer:
+    // exactly the answer the reference gives when its inputs are rounded first.
+    // That is what the narrow type costs, stated as an equality rather than a
+    // tolerance — a tolerance would pass a kernel that lost a fragment as well.
+    constexpr uint32_t M = 32, N = 128, K = 32;
+    const std::vector<float> a = ramp(M * K, 7, 0.1f);
+    const std::vector<float> b = ramp(K * N, 5, 0.3f);
+
+    GemmOptions half;
+    half.half_inputs = true;
+    const std::vector<float> got = multiply(M, N, K, half, &a, &b).c;
+
+    agrees(got, gemm_reference(rounded_to_half(a), rounded_to_half(b), M, N, K),
+           "half inputs against the rounded reference");
+
+    // And it is a different answer from the exact one, or the test above would
+    // be measuring nothing: 0.1 and 0.3 are not half-precision numbers.
+    const std::vector<float> exact = gemm_reference(a, b, M, N, K);
+    bool differs = false;
+    for (size_t i = 0; i < exact.size(); ++i) {
+        differs = differs || got[i] != exact[i];
+    }
+    EXPECT_TRUE(differs) << "the inputs were representable, so nothing was rounded";
+}
+
+TEST(Gemm, HalfInputsCostLessToStageAndToMultiply)
+{
+    constexpr uint32_t M = 32, N = 128, K = 64;
+    GemmOptions wide;
+    wide.wide_fragments = true;
+    GemmOptions half;
+    half.half_inputs = true;
+
+    const Measurement single = multiply(M, N, K, wide);
+    const Measurement narrow = multiply(M, N, K, half);
+
+    // Half the bytes staged, half the registers an operand, and an instruction
+    // priced at half.
+    EXPECT_LT(narrow.weighted, single.weighted * 3 / 4);
+    EXPECT_LT(narrow.cycles, single.cycles);
+}
+
+TEST(Gemm, HalfPrecisionRoundsTheWayHardwareDoes)
+{
+    // The conversion is written out in half.cpp rather than left to an
+    // intrinsic, so it is worth checking the corners it was written for.
+    EXPECT_EQ(f16_to_f32(f32_to_f16(2.5f)), 2.5f) << "exactly representable";
+    EXPECT_NE(f16_to_f32(f32_to_f16(0.1f)), 0.1f) << "not representable";
+    EXPECT_NEAR(f16_to_f32(f32_to_f16(0.1f)), 0.1f, 1e-4f);
+
+    EXPECT_TRUE(std::isinf(f16_to_f32(f32_to_f16(65600.0f)))) << "saturates";
+    EXPECT_EQ(f16_to_f32(f32_to_f16(1e-8f)), 0.0f) << "underflows to zero";
+    EXPECT_LT(f16_to_f32(f32_to_f16(-0.7f)), 0.0f) << "keeps its sign";
+
+    // Two to a register, low first, which is the order the F16 instructions
+    // unpack them in.
+    uint16_t low = 0;
+    uint16_t high = 0;
+    unpack_f16x2(pack_f16x2(f32_to_f16(1.0f), f32_to_f16(2.0f)), low, high);
+    EXPECT_EQ(f16_to_f32(low), 1.0f);
+    EXPECT_EQ(f16_to_f32(high), 2.0f);
 }

@@ -99,6 +99,14 @@ enum class Opcode : uint8_t {
     // has to gather rather than read a run.
     V_LD_SHARED_16X16_F32,  // reg[dst..+7] = shared[reg[src0] + imm ..+28]
 
+    // The same fragment in half precision: 256 halves are 128 registers across the
+    // warp, so a lane holds four rather than eight, two to a register.
+    //
+    // The narrow type is what is in memory. Nothing here converts — a kernel
+    // multiplying halves reads them already packed, as it does on hardware, and
+    // the packing is the caller's job.
+    V_LD_SHARED_16X16_F16,  // reg[dst..+3] = shared[reg[src0] + imm ..+12]
+
     // Another block's shared memory, from a block in the same cluster.
     //
     // Hopper's distributed shared memory. src1 names which block of the cluster
@@ -148,6 +156,15 @@ enum class Opcode : uint8_t {
     // going through memory. src1 holds a lane number rather than a value, and a
     // different one per lane, so the warp gathers in one instruction.
     V_SHUFFLE_F32,  // reg[dst] = reg[src0] of the lane in reg[src1]
+
+    // The same tile with half-precision operands and a single-precision
+    // accumulator, which is the arrangement every tensor core makes: the inputs
+    // are where the width is saved and the sum is where it would be missed.
+    //
+    // Two operand registers do the work of four, and it is priced at half — the
+    // claim hardware makes for a narrow input, and the reason f16 exists on these
+    // units at all.
+    V_MMA_16X16X16_F16,  // reg[dst..+7] += A(reg[src0..+3]) * B(reg[src1..+3])
 
     // One 16x16x16 multiply-accumulate, performed by the warp together:
     // D = A * B + C, with every lane holding an eighth of each matrix.
@@ -299,6 +316,15 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// Four registers rather than eight, and the same rules otherwise.
+Instruction make_v_ld_shared_16x16_f16(uint8_t dst, uint8_t addr_reg,
+                                       float offset = 0.0f);
+
+// The accumulator is eight registers of single precision; the operands are four
+// each of packed halves.
+Instruction make_v_mma_16x16x16_f16(uint8_t dst, uint8_t src0, uint8_t src1,
+                                    uint32_t participants);
 
 // dst names the first of eight registers, as every wide shape does, and starts
 // on a multiple of four.

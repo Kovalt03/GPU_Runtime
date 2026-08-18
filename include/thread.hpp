@@ -48,6 +48,11 @@ inline constexpr uint32_t MMA_TILE = 16;
 inline constexpr uint32_t MMA_ELEMENTS = MMA_TILE * MMA_TILE;
 inline constexpr uint32_t MMA_FRAGMENT_REGISTERS = MMA_ELEMENTS / WARP_SIZE;
 
+// Half of that, because two halves share a register. The saving is the point
+// beside the precision: a narrow fragment costs four registers where a wide one
+// costs eight, and a tile in memory is half the bytes.
+inline constexpr uint32_t HALF_FRAGMENT_REGISTERS = MMA_FRAGMENT_REGISTERS / 2;
+
 // How many copies a warp may have in flight at once.
 //
 // Sizes the array above, so it is a constant rather than a knob. Hardware has a

@@ -37,6 +37,7 @@ add_library(gpurt STATIC
     src/ir_builder.cpp
     src/math3d.cpp
     src/gemm.cpp
+    src/half.cpp
     src/mesh.cpp
     src/app_run.cpp
     src/pipeline/vertex.cpp
