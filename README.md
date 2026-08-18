@@ -533,13 +533,13 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**A wide load for a fragment.** The tiled matrix multiply is here, and it says
-what the two instructions built for it are worth: 78% off the cycles for the
-matrix unit, 33% for staging a tile ahead. But an MMA consumes fragments that cost
-sixteen shared loads a lane to assemble, at 8 each against the instruction's 16 —
-so the inner loop spends its capacity on loading rather than multiplying. Hardware
-has `ldmatrix`; this ISA has the same argument `V_LD_GLOBAL_VEC3_F32` already won
-once, and has not made it twice.
+**Narrow types.** The tiled matrix multiply is here, and the three instructions
+built for it come to 11.6x end to end: 78% off the cycles for the matrix unit, 33%
+for staging a tile ahead, 42% for loading a fragment in one instruction rather
+than eight. What is still missing is the other half of what a tensor core is —
+`f16` and `bf16` inputs, where much of hardware's advantage lives. Every type
+token in this ISA reads `F32`, and the scheme has left the others empty since the
+first commit.
 
 ---
 

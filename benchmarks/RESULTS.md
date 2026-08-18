@@ -978,13 +978,17 @@ cmake --build build -j8
 C[64x256] = A × B, a block of four warps holding a 16×64 strip of C in registers
 for the whole K loop, staging one A tile and four B tiles a step. Cycles.
 
-| K | fma, sync | mma, sync | change | mma, staged ahead | change |
-|---:|---:|---:|---:|---:|---:|
-| 32 | 202,556 | 44,220 | **-78.2%** | 33,056 | **-25.2%** |
-| 64 | 401,734 | 85,062 | **-78.8%** | 62,340 | **-26.7%** |
-| 128 | 812,660 | 179,316 | **-77.9%** | 120,977 | **-32.5%** |
+| K | fma, sync | mma, sync | change | mma, staged ahead | change | + wide fragments | change |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 202,556 | 44,220 | **-78.2%** | 33,056 | **-25.2%** | 20,256 | **-38.7%** |
+| 64 | 401,734 | 85,062 | **-78.8%** | 62,340 | **-26.7%** | 36,746 | **-41.1%** |
+| 128 | 812,660 | 179,316 | **-77.9%** | 120,977 | **-32.5%** | 69,809 | **-42.3%** |
 
-Issued work at K = 128: 27,145,216 against 5,960,704 against 4,762,624.
+Issued work at K = 128: 27,145,216, then 5,960,704, then 4,762,624 — and 4,762,624
+again. **The last two are equal to the lane-op**, which is the whole of what the
+fragment load is: eight floats are eight floats however they are asked for.
+
+End to end, the last column is 11.6x the first.
 
 **cp.async is worth 33% here and was worth 1.8% in the renderer.** Same
 instruction, same double buffering, same scheduler. What changed is the ratio the
@@ -999,9 +1003,26 @@ one instruction that consumes them. At a cost of 8 each that is 128 a lane of
 loading to feed 16 of multiplying — **the fragment load, not the multiply, is
 what the inner loop spends its capacity on.**
 
-Hardware has `ldmatrix` for exactly this, and this ISA does not. That is the next
-instruction this measurement asks for, and the shape of the argument is the one
-`V_LD_GLOBAL_VEC3_F32` already made: a wide load is not three narrow ones.
+### The instruction that measurement asked for
+
+`V_LD_SHARED_16X16_F32` reads a whole fragment: eight consecutive floats into the
+eight consecutive registers the matrix instruction wants. Hardware's `ldmatrix`,
+and the argument `V_LD_GLOBAL_VEC3_F32` already made once — a wide load is not
+several narrow ones.
+
+**What it buys is different, though, and the two are worth reading together.**
+The wide global load buys *transactions*: 32 lanes asking for twelve bytes touch
+fewer cache lines than three instructions do, so it took 24.7% off a count of
+lines and nothing at all off `Flat`. Shared memory has banks rather than lines,
+and this machine does not model a bank conflict — so there is no transaction to
+save, and the cost table says so by charging exactly eight floats for eight
+floats.
+
+**It buys waiting instead.** This machine issues in order with no scoreboard, so
+eight round trips to shared memory are eight waits with nothing between them; one
+is one. That is 42% of the cycles at K = 128, with the issued work identical to
+the lane-op — the sharpest separation in this file between what a kernel costs
+and how long it takes.
 
 ### What the shape of the kernel had to work around
 
