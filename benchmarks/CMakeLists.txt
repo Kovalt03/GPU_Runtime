@@ -35,3 +35,7 @@ target_link_libraries(stream_bench PRIVATE gpurt project_warnings)
 # What a copy the warp does not wait for buys — on its own, and in a renderer.
 add_executable(async_bench async_bench.cpp)
 target_link_libraries(async_bench PRIVATE gpurt project_warnings)
+
+# One instruction against 4,096 multiply-adds.
+add_executable(mma_bench mma_bench.cpp)
+target_link_libraries(mma_bench PRIVATE gpurt project_warnings)
