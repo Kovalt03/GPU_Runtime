@@ -188,6 +188,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # A copy the warp does not wait for, on its own and in a renderer
 ./build/benchmarks/async_bench              # benchmarks/result/async.{md,csv}
 
+# One instruction against 4,096 multiply-adds
+./build/benchmarks/mma_bench                # benchmarks/result/mma.{md,csv}
+
 # Any of them on another machine — machines/ holds the files
 ./build/benchmarks/render_bench --machine machines/a100.spec
 ```
@@ -503,6 +506,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Streams, concurrent kernels | modelled — launches queue, one stream runs in order and separate streams overlap. Work partitions between them exactly; cycles are charged to every stream that was resident, so they add to more than the wall clock and the surplus is the overlap |
 | Indirect launch | modelled — `myrt_launch_indirect` reads its grid from device memory when the launch reaches the machine, so the kernel before it in the stream decides its size. Reading it costs no lane-op at all |
 | Asynchronous copy (`cp.async`) | modelled — `V_CP_ASYNC_SHARED_GLOBAL_F32` moves global memory into shared without a register and without the warp waiting, and the warp meets it at `S_CP_ASYNC_WAIT`. Reading bytes still in flight is refused rather than answered. Worth 87% of a fill on its own and 2% of a renderer that stages once and reads 256 times |
+| Matrix unit | modelled — `V_MMA_16X16X16_F32` has the warp compute a 16x16x16 product in one instruction against 128 fused multiply-adds a lane, with the fragments spread eight elements to a lane. The cost is a claim about a unit rather than a measurement; what is counted is that it would have to cost 128 before the two routes came level |
 | Atomics | modelled — `V_ATOM_ADD_GLOBAL_F32` reads, adds and writes back indivisibly, and hands each lane what was there before, which is how a compaction pass gives every surviving item a slot. Lanes naming one address are charged for serialising, so coalescing cannot help them and a warp reduction before the atomic is worth 3.3x |
 
 ### The three that matter most

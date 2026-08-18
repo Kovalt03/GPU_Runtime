@@ -963,6 +963,63 @@ cheaply than the first.
 
 ---
 
+## A matrix unit against the arithmetic pipe
+
+`V_MMA_16X16X16_F32` has the warp compute a whole 16x16x16 product at once —
+4,096 multiply-adds, 128 for each of its 32 lanes — where the arithmetic pipe
+issues one fused multiply-add at a time.
+
+```
+cmake --build build -j8
+./build/benchmarks/mma_bench
+```
+
+| Tiles | Route | Instructions | Warp steps | Lane ops | Cycles |
+|---:|---|---:|---:|---:|---:|
+| 1 | fma | 129 | 129 | 4,128 | 513 |
+| 1 | mma | **2** | **2** | **544** | **33** |
+| 4 | fma | 513 | 513 | 16,416 | 2,049 |
+| 4 | mma | **5** | **5** | **2,080** | **129** |
+| 16 | fma | 2,049 | 2,049 | 65,568 | 8,193 |
+| 16 | mma | **17** | **17** | **8,224** | **513** |
+
+**The instruction count is the part that is not a claim.** One tile is 128
+multiply-adds a lane against one instruction, and that is arithmetic: the shape
+says so. The 16x-deep latency and the cost of 16 are chosen numbers, so the
+table is read the way `reduction_bench`'s is — counted columns first, price last.
+
+**What would make the two level is 128.** Priced at 16, the matrix instruction
+claims a unit that retires the work eight times faster than the lanes would one
+FMA at a time; 8x is the conservative end of what hardware's tensor cores are
+quoted at, and the honest form of the claim is that number rather than the ratio
+it produces.
+
+### What it took to add
+
+The first instruction here whose operands are the warp's registers rather than a
+lane's. A `V_SHUFFLE_F32` reaches across lanes but computes something per lane;
+this one cannot be started by any lane alone, because no lane holds a whole row
+of A or column of B. Every lane must take part, and a participation mask naming
+fewer is refused rather than producing a partial answer.
+
+The fragment layout is row-major across the warp, eight elements a lane, chosen
+for being explainable. Hardware's layouts are chosen for the datapath and
+modelling one would say nothing this does not.
+
+### A latency that was never being applied
+
+Adding it found a bug three opcodes old. The warp-level path — ballot, any, all,
+shuffle, and now this — counted its work and returned without setting a latency,
+so every one of them was charged whatever the instruction before it happened to
+cost. It showed up here because a matrix instruction is 32 cycles deep and was
+reporting one.
+
+The reduction figures above move with the fix: a warp's five shuffles are 149
+cycles rather than 129, and the atomic's margin over the exchange becomes 3.1x
+where it read 3.3x. Nothing else in `RESULTS.md` touches those opcodes.
+
+---
+
 ## A copy the warp does not wait for
 
 `cp.async` moves global memory into shared memory without a register in between,
