@@ -963,6 +963,58 @@ cheaply than the first.
 
 ---
 
+## A block reading its neighbour's shared memory
+
+Blocks cannot see each other. Anything one makes for another goes out to global
+memory and comes back — and since there is no block-wide rendezvous inside a
+launch, it crosses a kernel boundary as well. A cluster removes both: the blocks
+are placed together, `BARRIER_CLUSTER` is the rendezvous, and `V_LD_CLUSTER_F32`
+is the read.
+
+```
+cmake --build build -j8
+./build/benchmarks/cluster_bench
+```
+
+256 elements made once and summed by every block.
+
+| Blocks | Global work | cluster | change | Global cycles | cluster | change |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2 | 7,676 | 15,490 | +101.8% | 2,223 | 976 | **-56.1%** |
+| 4 | 11,320 | 26,046 | +130.1% | 2,623 | 976 | **-62.8%** |
+| 8 | 18,608 | 47,158 | +153.4% | 3,223 | 976 | **-69.7%** |
+
+**The cluster's clock does not move with the block count and the global route's
+does.** Every consumer reads out of one producer's shared memory at the same
+time; through global memory they queue behind a second launch that cannot start
+until the first has entirely finished.
+
+**It costs issue capacity to save time.** A neighbour's shared memory is charged
+per lane, like this machine's own shared memory and for the same reason — banks,
+not cache lines. A coalesced global read of the same 32 addresses is one line.
+So the cluster route does more than twice the issued work and still finishes in
+a third of the cycles, and which of those a kernel cares about is the trade.
+
+**What it does not show is a saving on fetches.** The first thing tried here was
+four blocks each staging the same table, against one staging it and three reading
+across. That barely moved: the cache had already done it — the second block's
+fetch was an L2 hit and the third's an L1 hit. **Distributed shared memory is for
+what a block computes, not for what it fetches**, and the benchmark had to be
+rewritten around a producer before it measured anything.
+
+### What co-residency costs the scheduler
+
+A cluster is placed whole or not at all, and none of its blocks is freed until
+all of them have retired — a neighbour may still be reading the shared memory a
+finished block owns. Hardware makes the same promise for the same reason.
+
+Two consequences are stated as errors rather than left to be discovered: a
+cluster larger than the machine can hold at once is a launch that cannot start,
+and a grid that ends part-way through a cluster is refused. Both would otherwise
+appear as a barrier nobody can pass.
+
+---
+
 ## Regrouping the threads before they disagree
 
 A warp issues one instruction, so lanes that disagree take turns — that is the

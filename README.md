@@ -194,6 +194,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # What regrouping a block's threads is worth, and when it is a tax
 ./build/benchmarks/ser_bench                # benchmarks/result/ser.{md,csv}
 
+# A block reading its neighbour's shared memory
+./build/benchmarks/cluster_bench            # benchmarks/result/cluster.{md,csv}
+
 # Any of them on another machine — machines/ holds the files
 ./build/benchmarks/render_bench --machine machines/a100.spec
 ```
@@ -509,6 +512,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Streams, concurrent kernels | modelled — launches queue, one stream runs in order and separate streams overlap. Work partitions between them exactly; cycles are charged to every stream that was resident, so they add to more than the wall clock and the surplus is the overlap |
 | Indirect launch | modelled — `myrt_launch_indirect` reads its grid from device memory when the launch reaches the machine, so the kernel before it in the stream decides its size. Reading it costs no lane-op at all |
 | Asynchronous copy (`cp.async`) | modelled — `V_CP_ASYNC_SHARED_GLOBAL_F32` moves global memory into shared without a register and without the warp waiting, and the warp meets it at `S_CP_ASYNC_WAIT`. Reading bytes still in flight is refused rather than answered. Worth 87% of a fill on its own and 2% of a renderer that stages once and reads 256 times |
+| Thread block clusters | modelled — `LaunchConfig::cluster_size` places blocks together, `V_LD_CLUSTER_F32` reads a neighbour's shared memory and `BARRIER_CLUSTER` is the rendezvous across them. A producer-consumer pair that needed two launches through global memory becomes one launch: -63% of the cycles at four blocks, for twice the issued work |
 | Shader execution reordering | modelled — `REORDER` regroups a block's threads by a key so that lanes about to do the same thing share a warp, registers and pc travelling with the thread. Worth -75% of the warp steps on a scattered key and +13% on one that was already coherent; the regroup is within a block, where hardware's pool is an SM |
 | Matrix unit | modelled — `V_MMA_16X16X16_F32` has the warp compute a 16x16x16 product in one instruction against 128 fused multiply-adds a lane, with the fragments spread eight elements to a lane. The cost is a claim about a unit rather than a measurement; what is counted is that it would have to cost 128 before the two routes came level |
 | Atomics | modelled — `V_ATOM_ADD_GLOBAL_F32` reads, adds and writes back indivisibly, and hands each lane what was there before, which is how a compaction pass gives every surviving item a slot. Lanes naming one address are charged for serialising, so coalescing cannot help them and a warp reduction before the atomic is worth 3.3x |
