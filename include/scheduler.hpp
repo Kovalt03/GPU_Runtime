@@ -2,10 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <list>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
+#include "gpu_spec.hpp"
 #include "isa.hpp"
 #include "thread.hpp"
 
@@ -173,32 +176,6 @@ private:
     std::unordered_map<size_t, std::list<size_t>::iterator> resident_;
 };
 
-// Bytes fetched together. 128 is what NVIDIA moves for a warp-wide access, and
-// at four bytes a float that is a warp's 32 lanes exactly.
-inline constexpr uint32_t CACHE_LINE_BYTES = 128;
-
-// Sizes from hardware rather than scaled to these scenes, so a scene has to grow
-// past L1 before eviction happens at all.
-//
-// L1 is exact: 128 KB per SM from Volta onwards. L2 is device-wide and has grown
-// by generation — 6 MB on V100, 40 MB on A100 — and 8 MB is the low end of that.
-// Nothing here fills L2, so what it demonstrably does is catch what L1 drops.
-inline constexpr size_t L1_LINES = 1024;
-inline constexpr size_t L2_LINES = 65536;
-
-// What a line costs depending on where it was found, and how long it takes.
-//
-// Two independent scales. Cost is issue capacity, which is this project's own
-// measure; latency is cycles, following hardware in putting L1 in the tens, L2 in
-// the low hundreds and a trip to memory beyond. Both are chosen ratios with the
-// provenance instruction_cost has.
-inline constexpr uint32_t L1_HIT_COST = 8;
-inline constexpr uint32_t L2_HIT_COST = 30;
-
-inline constexpr uint32_t L1_HIT_LATENCY = 30;
-inline constexpr uint32_t L2_HIT_LATENCY = 200;
-inline constexpr uint32_t MEMORY_LATENCY = 400;
-
 // What a warp's access to global memory came to.
 //
 // Cost adds across the lines, capacity being spent on each. Latency takes the
@@ -209,22 +186,35 @@ struct GlobalAccess {
     uint32_t latency = 0;
 };
 
+// A source of blocks for the SMs to pull from.
+//
+// The runtime knows how to build block i — seeding its coordinates is its job —
+// and the scheduler knows when a slot is free. Handing over a callback rather
+// than a vector is what keeps a 256x256 launch from materialising 2,048 blocks
+// at 32 KB a warp before the first one runs.
+//
+// Returns false when the grid is exhausted.
+using NextBlock = std::function<bool(ThreadBlock&)>;
+
 class WarpScheduler {
 public:
-    // How many cycles one block may take before run() gives up.
+    // How many cycles a *launch* may take before run_grid gives up.
     //
     // Cycles rather than issued instructions, because the two part under
-    // LatencyModel::Modelled and a block can then burn time without issuing
-    // anything — a bound on issues alone would never be reached by a block that
-    // only ever waits.
+    // LatencyModel::Modelled and a warp can then burn time without issuing
+    // anything — a bound on issues alone would never be reached by one that only
+    // ever waits.
     //
-    // Not every block that fails to retire is a mistaken kernel: issuing the
+    // Not every launch that fails to retire is a mistaken kernel: issuing the
     // lowest live pc first means a lane can wait on one that will never be
     // reached. See LowestPcFirstStrandsALaneWaitingOnAHigherOne.
     //
-    // The heaviest kernel here takes 706 cycles for a block at 256x256, so this
-    // leaves four orders of magnitude before anything that works could meet it.
-    static constexpr uint64_t DEFAULT_CYCLE_BUDGET = 1ull << 24;
+    // It used to bound one block, and blocks ran one at a time. Now it bounds the
+    // launch's wall clock, which on one SM is every block's time added up — so a
+    // grid of sixty-four blocks meets a per-block bound sixty-four times sooner
+    // than it should. Raised by four bits to cover that, which still leaves the
+    // heaviest thing measured here (about 130 million cycles) two bits of room.
+    static constexpr uint64_t DEFAULT_CYCLE_BUDGET = 1ull << 28;
 
     // Lowered by tests that mean to reach the budget: at the default, doing so
     // takes tens of seconds.
@@ -258,7 +248,9 @@ public:
     // meaningless.
     void set_cache_lines(size_t l1, size_t l2)
     {
-        l1_ = LineCache(l1);
+        spec_.l1_lines = l1;
+        spec_.l2_lines = l2;
+        l1s_.clear();
         l2_ = LineCache(l2);
     }
 
@@ -277,6 +269,41 @@ public:
     // block must outlive the call.
     void run(const Program& program, ThreadBlock& block, DeviceSpan global);
 
+    // A whole grid, with the SMs pulling blocks as their slots come free.
+    //
+    // The cycle count this leaves is the launch's wall clock rather than the sum
+    // of its blocks': with several SMs the blocks overlap, and adding their
+    // clocks would count the same cycle once per SM. At the default one SM
+    // holding one block the two are the same number, which is what keeps every
+    // earlier figure standing.
+    //
+    // shared_bytes is what the kernel declares it will use of a block's
+    // scratchpad, and one of the three things residency is the smallest of. It
+    // is not a bound on what the kernel may address — ThreadBlock carries the
+    // whole scratchpad either way — but a statement about how many blocks can
+    // sit on an SM at once, which is what it decides on hardware.
+    void run_grid(const Program& program, DeviceSpan global, size_t shared_bytes,
+                  const NextBlock& next_block);
+
+    // The machine this scheduler runs on. Defaults to the one every figure in
+    // benchmarks/ was taken on: one SM holding one block.
+    void set_sm_config(const SMConfig& config)
+    {
+        spec_.sms = config;
+    }
+
+    void set_spec(const GPUSpec& spec)
+    {
+        spec_ = spec;
+        l1s_.clear();
+        l2_ = LineCache(spec_.l2_lines);
+    }
+
+    const GPUSpec& spec() const
+    {
+        return spec_;
+    }
+
     const SchedulerStats& stats() const
     {
         return stats_;
@@ -290,20 +317,28 @@ public:
     void reset_stats();
 
 private:
-    std::queue<Warp*> ready_queue_;  // pointers: a Warp is ~32 KB
+    // Where run() leaves the block it was handed, so that it can be given back:
+    // the residency loop owns its blocks, and run()'s caller owns theirs.
+    std::unique_ptr<ThreadBlock> last_block_;
     SchedulerStats stats_;
     uint64_t cycle_budget_ = DEFAULT_CYCLE_BUDGET;
     WarpPolicy policy_ = WarpPolicy::LowestPc;
     MemoryModel memory_ = MemoryModel::Flat;
     LatencyModel latency_ = LatencyModel::Ignored;
 
-    // L1 belongs to the SM running one block, so run() empties it. L2 belongs to
-    // the device and outlives a launch — which it does by living here, the
-    // runtime holding one scheduler for its lifetime.
-    LineCache l1_{L1_LINES};
+    GPUSpec spec_;
+
+    // L1 belongs to an SM, so there is one a piece and a launch empties them all.
+    // Blocks that share an SM therefore share its L1 — which is the point, and
+    // the reason this stopped being cleared between blocks.
+    //
+    // L2 belongs to the device and outlives a launch, which it does by living
+    // here: the runtime holds one scheduler for its lifetime.
+    std::vector<LineCache> l1s_;
+    LineCache* active_l1_ = nullptr;  // the SM currently issuing
     LineCache l2_{L2_LINES};
 
-    // The latency of whatever step_warp last issued, so that run_modelled need not
+    // The latency of whatever step_warp last issued, so that run_grid need not
     // decide it a second time — and so that a global load's answer, which comes
     // from the memory model rather than from instruction_latency, reaches it.
     uint32_t issued_latency_ = 0;
@@ -315,10 +350,6 @@ private:
     // What one line came to, given where it was found. Mutable because a lookup
     // changes what is resident.
     GlobalAccess cache_lookup(size_t line, const Instruction& instr);
-
-    // run() under LatencyModel::Modelled, where a warp that has issued waits for
-    // its result and the scheduler looks for one that has not.
-    void run_modelled(const Program& program, ThreadBlock& block, DeviceSpan global);
 
     // Which pc to issue under Independent. Mutable because fairness needs
     // somewhere to remember what it last did — Warp::last_issued_pc.

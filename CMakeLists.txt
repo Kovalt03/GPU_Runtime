@@ -28,6 +28,7 @@ target_compile_options(project_warnings INTERFACE
 # the kernels and the benchmark link this and add a main().
 # ---------------------------------------------------------------------------
 add_library(gpurt STATIC
+    src/gpu_spec.cpp
     src/isa.cpp
     src/memory.cpp
     src/thread.cpp

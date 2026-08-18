@@ -57,6 +57,28 @@ size_t MyGPURuntime::myrt_device_free_bytes() const
 
 void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** args)
 {
+    myrt_launch(kernel, LaunchConfig{grid, block}, args);
+}
+
+void MyGPURuntime::myrt_set_sm_config(const SMConfig& config)
+{
+    scheduler_->set_sm_config(config);
+}
+
+void MyGPURuntime::myrt_set_spec(const GPUSpec& spec)
+{
+    scheduler_->set_spec(spec);
+}
+
+const GPUSpec& MyGPURuntime::myrt_spec() const
+{
+    return scheduler_->spec();
+}
+
+void MyGPURuntime::myrt_launch(KernelFunc kernel, const LaunchConfig& config, void** args)
+{
+    const dim3 grid = config.grid;
+    const dim3 block = config.block;
     if (grid.volume() == 0 || block.volume() == 0) {
         throw std::runtime_error("myrt_launch: grid and block must both be non-empty");
     }
@@ -67,58 +89,62 @@ void MyGPURuntime::myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** 
 
     const uint32_t threads_per_block = block.volume();
     const uint32_t warps = (threads_per_block + WARP_SIZE - 1) / WARP_SIZE;
+    const uint32_t blocks = grid.volume();
 
-    for (uint32_t bz = 0; bz < grid.z; bz++) {
-        for (uint32_t by = 0; by < grid.y; by++) {
-            for (uint32_t bx = 0; bx < grid.x; bx++) {
-                // Blocks are independent — own warps, own shared memory — so
-                // each is built fresh. The id is the flat index, x fastest.
-                const uint32_t block_id = (bz * grid.y + by) * grid.x + bx;
-                ThreadBlock tb = make_block(warps, block_id);
-
-                for (uint32_t t = 0; t < warps * WARP_SIZE; t++) {
-                    Thread& th = tb.warps[t / WARP_SIZE].threads[t % WARP_SIZE];
-                    // Rounding the warp count up leaves a tail past the end of
-                    // the launch. Retiring those lanes is what stops them from
-                    // running with coordinate 0 and rewriting thread 0's output.
-                    if (t >= threads_per_block) {
-                        th.active = false;
-                        continue;
-                    }
-                    const uint32_t tx = t % block.x;
-                    const uint32_t ty = (t / block.x) % block.y;
-                    const uint32_t tz = t / (block.x * block.y);
-
-                    th.regs[REG_GLOBAL_ID_X] = float(bx * block.x + tx);
-                    th.regs[REG_GLOBAL_ID_Y] = float(by * block.y + ty);
-                    th.regs[REG_GLOBAL_ID_Z] = float(bz * block.z + tz);
-
-                    // Same for every thread of the block, and not recoverable
-                    // from the coordinates above without an integer divide.
-                    th.regs[REG_BLOCK_ID_X] = float(bx);
-                    th.regs[REG_BLOCK_ID_Y] = float(by);
-                    th.regs[REG_BLOCK_ID_Z] = float(bz);
-                }
-                // The Scheduler accumulates, so clear it between blocks and fold
-                // the totals in here: statistics span every launch since the last
-                // myrt_sync().
-                scheduler_->reset_stats();
-
-                // steady_clock, not high_resolution_clock, which is permitted to
-                // be non-monotonic and could yield a negative interval.
-                const auto t0 = std::chrono::steady_clock::now();
-                scheduler_->run(program, tb,
-                                DeviceSpan{mem_->device_base(), mem_->device_size()});
-                const auto t1 = std::chrono::steady_clock::now();
-
-                // Both accumulate. Assigning the elapsed time instead would
-                // leave throughput dividing every block's work by one block's
-                // time.
-                elapsed_seconds_ += std::chrono::duration<double>(t1 - t0).count();
-                stats_ += scheduler_->stats();
-            }
+    // Built as the SMs ask for them rather than all at once. A warp is 32 KB, so
+    // a 256x256 launch would otherwise materialise tens of megabytes of blocks
+    // before the first instruction issued.
+    uint32_t next_id = 0;
+    const auto build = [&](ThreadBlock& tb) {
+        if (next_id >= blocks) {
+            return false;
         }
-    }
+        const uint32_t block_id = next_id++;
+        const uint32_t bx = block_id % grid.x;
+        const uint32_t by = (block_id / grid.x) % grid.y;
+        const uint32_t bz = block_id / (grid.x * grid.y);
+
+        tb = make_block(warps, block_id);
+        for (uint32_t t = 0; t < warps * WARP_SIZE; t++) {
+            Thread& th = tb.warps[t / WARP_SIZE].threads[t % WARP_SIZE];
+            // Rounding the warp count up leaves a tail past the end of the
+            // launch. Retiring those lanes is what stops them from running with
+            // coordinate 0 and rewriting thread 0's output.
+            if (t >= threads_per_block) {
+                th.active = false;
+                continue;
+            }
+            const uint32_t tx = t % block.x;
+            const uint32_t ty = (t / block.x) % block.y;
+            const uint32_t tz = t / (block.x * block.y);
+
+            th.regs[REG_GLOBAL_ID_X] = float(bx * block.x + tx);
+            th.regs[REG_GLOBAL_ID_Y] = float(by * block.y + ty);
+            th.regs[REG_GLOBAL_ID_Z] = float(bz * block.z + tz);
+
+            // Same for every thread of the block, and not recoverable from the
+            // coordinates above without an integer divide.
+            th.regs[REG_BLOCK_ID_X] = float(bx);
+            th.regs[REG_BLOCK_ID_Y] = float(by);
+            th.regs[REG_BLOCK_ID_Z] = float(bz);
+        }
+        return true;
+    };
+
+    // Once for the launch, where it used to be once a block. Blocks overlap when
+    // there is more than one SM, so their clocks cannot be added — and the
+    // counters that can be added are added here, in one place.
+    scheduler_->reset_stats();
+
+    // steady_clock, not high_resolution_clock, which is permitted to be
+    // non-monotonic and could yield a negative interval.
+    const auto t0 = std::chrono::steady_clock::now();
+    scheduler_->run_grid(program, DeviceSpan{mem_->device_base(), mem_->device_size()},
+                         config.shared_bytes, build);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    elapsed_seconds_ += std::chrono::duration<double>(t1 - t0).count();
+    stats_ += scheduler_->stats();
 }
 
 void MyGPURuntime::myrt_sync(bool report)

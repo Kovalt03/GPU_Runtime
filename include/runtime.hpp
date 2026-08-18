@@ -21,6 +21,19 @@ struct dim3 {
     }
 };
 
+// What a launch declares about itself beyond its shape.
+//
+// shared_bytes is how much of a block's scratchpad the kernel will use. It is
+// not a bound — ThreadBlock carries the whole scratchpad either way — but one of
+// the three things residency is the smallest of, and the reason a kernel that
+// stages through shared memory fits fewer blocks on an SM. CUDA states it the
+// same way, at the launch rather than in the kernel.
+struct LaunchConfig {
+    dim3 grid;
+    dim3 block;
+    size_t shared_bytes = 0;
+};
+
 // A kernel is a function that produces an instruction sequence, mirroring the
 // compile step a real toolchain performs ahead of a launch. It is called once
 // per launch, not once per thread: all threads run the same Program, and what
@@ -82,6 +95,21 @@ public:
     // std::runtime_error if the launch geometry is empty or if a block holds
     // more threads than the simulator will place in one ThreadBlock.
     void myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** args);
+
+    // The same, with what else a launch declares about itself. Kept apart from
+    // the four-argument form because every kernel and test calls that one, and a
+    // defaulted parameter there would have made a shared-memory claim easy to
+    // forget rather than easy to see.
+    void myrt_launch(KernelFunc kernel, const LaunchConfig& config, void** args);
+
+    // The machine the next launch runs on. Defaults to one SM holding one block,
+    // which is what every figure in benchmarks/ was taken on.
+    void myrt_set_sm_config(const SMConfig& config);
+    void myrt_set_spec(const GPUSpec& spec);
+
+    // What a benchmark prints at the head of its table. A figure whose machine is
+    // not stated beside it cannot be reproduced.
+    const GPUSpec& myrt_spec() const;
 
     // Nothing to wait for in a synchronous simulator; this reports the
     // statistics gathered since the last call and clears them, which is what

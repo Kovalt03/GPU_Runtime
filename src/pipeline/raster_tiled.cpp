@@ -397,6 +397,11 @@ void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
     const dim3 block{TILE_WIDTH, TILE_HEIGHT, 1};
     const dim3 grid{args.tiles_x, (args.height + TILE_HEIGHT - 1) / TILE_HEIGHT, 1};
 
+    // What this route stages, declared so that residency can charge it for it.
+    // The tile it fills is the whole scratchpad, which is what makes it the one
+    // kernel here whose occupancy shared memory decides — the trade the flat cost
+    // model could not express and this one can.
     void* raw[] = {const_cast<TiledRasterStageArgs*>(&args)};
-    rt.myrt_launch(build_shared_raster_program, grid, block, raw);
+    rt.myrt_launch(build_shared_raster_program,
+                   LaunchConfig{grid, block, SHARED_MEM_FLOATS * sizeof(float)}, raw);
 }

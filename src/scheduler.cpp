@@ -598,7 +598,9 @@ void WarpScheduler::invalidate_range(size_t offset, size_t bytes)
     const size_t first = offset / CACHE_LINE_BYTES;
     const size_t last = (offset + bytes - 1) / CACHE_LINE_BYTES;
     for (size_t line = first; line <= last; ++line) {
-        l1_.invalidate(line);
+        for (LineCache& l1 : l1s_) {
+            l1.invalidate(line);
+        }
         l2_.invalidate(line);
     }
 }
@@ -634,7 +636,7 @@ uint32_t access_components(Opcode op)
 // warps — reuse within one is what coalescing already accounted for.
 GlobalAccess WarpScheduler::cache_lookup(size_t line, const Instruction& instr)
 {
-    if (l1_.touch(line)) {
+    if (active_l1_->touch(line)) {
         ++stats_.l1_hits;
         return {L1_HIT_COST, L1_HIT_LATENCY};
     }
@@ -1025,180 +1027,354 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         stats_.weighted_lane_ops += lanes * instruction_cost(issued.op);
         issued_latency_ = instruction_latency(issued.op);
     }
+
+    // Ignored means nothing waits, so the answer is ready the instant it is
+    // issued. The queue this scheduler used to be never read a latency and so
+    // never needed the distinction; one loop serving both models does.
+    if (latency_ == LatencyModel::Ignored) {
+        issued_latency_ = 0;
+    }
     return true;
 }
 
 void WarpScheduler::release_barrier(ThreadBlock& block)
 {
-    // Called only once the queue has run dry, and that is the whole arrival
-    // test: if nobody can take a turn and somebody is waiting, then every warp
-    // with work left has reached the barrier. No arrival counter to keep in
-    // step with warp retirement — the queue already knows.
+    // Called only once no warp of this block can issue, and that is the whole
+    // arrival test: if nobody can take a turn and somebody is waiting, then every
+    // warp with work left has reached the barrier. No arrival counter to keep in
+    // step with warp retirement.
+    //
+    // Per block, not per SM. Two blocks sharing an SM have separate barriers, and
+    // one of them stalling is not the other's business.
     for (Warp& warp : block.warps) {
-        if (warp.at_barrier) {
-            warp.at_barrier = false;
-            ready_queue_.push(&warp);
-        }
+        warp.at_barrier = false;
     }
 }
-// Round-robin among the warps that are ready, which is what makes this reproduce
-// run() exactly when every latency is zero: nothing waits, so the same warp comes
-// up in the same order. That equality is the test — see
+void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan global)
+{
+    // One block, handed over once. Everything a grid does, with a source that
+    // runs dry immediately.
+    bool handed_over = false;
+
+    // Handed over rather than copied — a block is 32 KB a warp — and given back
+    // however the run ends. The caller owns it, and a kernel that meets the
+    // budget throws with its block still worth reading: the deadlock tests say
+    // *which* failure it was from the pcs it left behind.
+    struct GiveBack {
+        ThreadBlock& block;
+        std::unique_ptr<ThreadBlock>& held;
+
+        ~GiveBack()
+        {
+            if (held) {
+                block = std::move(*held);
+                held.reset();
+            }
+        }
+    } give_back{block, last_block_};
+
+    run_grid(program, global, 0, [&block, &handed_over](ThreadBlock& slot) {
+        if (handed_over) {
+            return false;
+        }
+        handed_over = true;
+        slot = std::move(block);
+        return true;
+    });
+}
+
+// The residency loop, and the only place warps are chosen.
+//
+// One loop serves both latency models: Ignored is Modelled with every latency at
+// zero, so nothing ever waits and the round-robin degenerates to the queue this
+// used to be. The equality is asserted rather than assumed —
 // ModelledSchedulingMatchesIgnoredWhenNothingWaits.
 //
-// When nobody can issue, time moves to the soonest a warp will be ready and the
-// gap is charged to stall_steps. Cycles skipped rather than stalls counted, so a
-// hundred-cycle wait is not the same reading as a hundred one-cycle waits.
-//
-// A barrier is looked at only once no live warp is merely waiting. Releasing on
-// "nobody ready" alone would open it while warps were still on their way — the
-// arrival test has to be that no live warp can issue again without the release,
-// and a warp with a pending result can.
-void WarpScheduler::run_modelled(const Program& program, ThreadBlock& block,
-                                 DeviceSpan global)
+// A cycle is one instruction an SM. They issue in parallel, which is the whole
+// of what several SMs buy: the same work retires in fewer cycles while the
+// counters that measure work do not move at all.
+void WarpScheduler::run_grid(const Program& program, DeviceSpan global,
+                             size_t shared_bytes, const NextBlock& next_block)
 {
-    const size_t warps = block.warps.size();
+    struct Slot {
+        std::unique_ptr<ThreadBlock> block;
+        std::vector<bool> live;
+        size_t remaining = 0;
+        size_t cursor = 0;
 
-    // Retired is not the same as unavailable now, which is the distinction run()
-    // does not need: its queue holds exactly the warps that can still run.
-    std::vector<bool> live(warps, true);
-    size_t remaining = warps;
+        bool occupied() const
+        {
+            return block != nullptr;
+        }
+    };
+
+    struct Unit {
+        std::vector<Slot> slots;
+        size_t cursor = 0;
+    };
+
+    // Sized here rather than in the constructor, so that set_cache_lines and
+    // set_sm_config can be called in either order and neither has to know about
+    // the other.
+    l1s_.assign(spec_.sms.sm_count == 0 ? 1 : spec_.sms.sm_count,
+                LineCache(spec_.l1_lines));
+    for (LineCache& l1 : l1s_) {
+        l1.clear();
+    }
+
+    std::vector<Unit> units(l1s_.size());
+    bool grid_exhausted = false;
+    bool loaded_any = false;  // a slot took a block this cycle
+    uint32_t per_sm = 0;      // decided by the first block, every block being alike
+
+    // One block into one free slot, if the grid still has one to give.
+    const auto give_one = [&](Unit& unit) {
+        if (grid_exhausted || unit.slots.size() >= per_sm) {
+            return false;
+        }
+        auto block = std::make_unique<ThreadBlock>();
+        if (!next_block(*block)) {
+            grid_exhausted = true;
+            return false;
+        }
+        Slot slot;
+        slot.live.assign(block->warps.size(), true);
+        slot.remaining = block->warps.size();
+        for (Warp& warp : block->warps) {
+            warp.at_barrier = false;
+            warp.ready_at = 0;
+        }
+        slot.block = std::move(block);
+        unit.slots.push_back(std::move(slot));
+        loaded_any = true;
+        return true;
+    };
+
+    // Breadth first: every SM gets its first block before any gets its second.
+    //
+    // Filling one SM to capacity and moving on looks equivalent and is not. A
+    // grid of 256 blocks on a machine of 108 SMs holding 32 each would land
+    // entirely on the first eight, and the other hundred would sit out a launch
+    // they were built for — measured at 80x where spreading gives 161x. Hardware's
+    // work distributor spreads for the same reason.
+    const auto fill_all = [&] {
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (Unit& unit : units) {
+                progress = give_one(unit) || progress;
+            }
+        }
+    };
+
+    // The first block decides residency, so it has to exist before the slots do.
+    {
+        auto first = std::make_unique<ThreadBlock>();
+        if (!next_block(*first)) {
+            return;  // an empty grid runs no cycles
+        }
+        per_sm =
+            spec_.residency(static_cast<uint32_t>(first->warps.size()), shared_bytes);
+        Slot slot;
+        slot.live.assign(first->warps.size(), true);
+        slot.remaining = first->warps.size();
+        for (Warp& warp : first->warps) {
+            warp.at_barrier = false;
+            warp.ready_at = 0;
+        }
+        slot.block = std::move(first);
+        units[0].slots.push_back(std::move(slot));
+    }
+    fill_all();
+
+    // A kernel that meets the budget throws, and run()'s caller still owns its
+    // block — the deadlock tests read the wreck afterwards to say *which* failure
+    // it was. Whatever is resident goes back before the exception leaves.
+    struct Handback {
+        std::vector<Unit>& units;
+        std::unique_ptr<ThreadBlock>& out;
+        bool armed = true;
+
+        ~Handback()
+        {
+            if (!armed) {
+                return;
+            }
+            for (Unit& unit : units) {
+                for (Slot& slot : unit.slots) {
+                    if (slot.occupied()) {
+                        out = std::move(slot.block);
+                        return;
+                    }
+                }
+            }
+        }
+    } handback{units, last_block_};
 
     uint64_t now = 0;
-    size_t cursor = 0;
-
-    while (remaining > 0) {
+    while (true) {
         if (now > cycle_budget_) {
             throw std::runtime_error(
-                "WarpScheduler::run: block did not finish within " +
+                "WarpScheduler::run: the launch did not finish within " +
                 std::to_string(cycle_budget_) +
                 " cycles — a lane is waiting on one this scheduler will never "
                 "issue, or the kernel does not terminate");
         }
 
-        // Ready: live, not waiting at a barrier, and its result has landed.
-        size_t chosen = warps;
-        for (size_t n = 0; n < warps; ++n) {
-            const size_t i = (cursor + n) % warps;
-            const Warp& w = block.warps[i];
-            if (live[i] && !w.at_barrier && w.ready_at <= now) {
-                chosen = i;
-                break;
+        uint32_t issued = 0;
+        uint32_t idle = 0;
+        uint64_t soonest = UINT64_MAX;
+        bool anything_resident = false;
+        bool released_any = false;
+        loaded_any = false;
+
+        for (size_t u = 0; u < units.size(); ++u) {
+            Unit& unit = units[u];
+            active_l1_ = &l1s_[u];
+
+            // Round-robin over the slots, and within a slot over its warps: an
+            // SM interleaves the blocks it holds as readily as their warps.
+            bool stepped = false;
+            for (size_t n = 0; n < unit.slots.size() && !stepped; ++n) {
+                Slot& slot = unit.slots[(unit.cursor + n) % unit.slots.size()];
+                if (!slot.occupied()) {
+                    continue;
+                }
+                anything_resident = true;
+
+                const size_t warps = slot.block->warps.size();
+                for (size_t w = 0; w < warps; ++w) {
+                    const size_t i = (slot.cursor + w) % warps;
+                    Warp& warp = slot.block->warps[i];
+                    if (!slot.live[i] || warp.at_barrier) {
+                        continue;
+                    }
+                    if (warp.ready_at > now) {
+                        soonest = std::min(soonest, warp.ready_at);
+                        continue;
+                    }
+
+                    const uint64_t before = stats_.warp_steps;
+                    if (!step_warp(program, warp, *slot.block, global)) {
+                        if (!warp.at_barrier) {
+                            slot.live[i] = false;
+                            --slot.remaining;
+                        }
+                    } else {
+                        warp.ready_at = now + issued_latency_;
+                    }
+
+                    // A warp discovered to have retired issued nothing and costs
+                    // no time, so the SM looks for another rather than spending
+                    // its turn on the discovery. One that arrived at a barrier
+                    // did issue the BARRIER and does spend it.
+                    if (stats_.warp_steps == before) {
+                        continue;
+                    }
+                    slot.cursor = (i + 1) % warps;
+                    ++issued;
+                    stepped = true;
+                    break;
+                }
+                if (stepped) {
+                    unit.cursor = (unit.cursor + 1) % unit.slots.size();
+                }
+            }
+
+            if (!stepped) {
+                // Nothing went out from this SM. Either its blocks are waiting,
+                // or one of them has every live warp at a barrier and nobody
+                // left to arrive.
+                for (Slot& slot : unit.slots) {
+                    if (!slot.occupied()) {
+                        continue;
+                    }
+                    bool waiting = false;
+                    bool at_barrier = false;
+                    for (size_t i = 0; i < slot.block->warps.size(); ++i) {
+                        if (!slot.live[i]) {
+                            continue;
+                        }
+                        const Warp& warp = slot.block->warps[i];
+                        if (warp.at_barrier) {
+                            at_barrier = true;
+                        } else if (warp.ready_at > now) {
+                            waiting = true;
+                        }
+                    }
+                    // A warp with a result still in flight can arrive; one at a
+                    // barrier cannot leave on its own. Releasing while somebody
+                    // is merely late would open the barrier early.
+                    if (at_barrier && !waiting) {
+                        release_barrier(*slot.block);
+                        released_any = true;
+                    }
+                }
+                if (!unit.slots.empty()) {
+                    ++idle;
+                }
+            }
+
+            // Retire the blocks that finished, and pull the next in.
+            for (Slot& slot : unit.slots) {
+                if (slot.occupied() && slot.remaining == 0) {
+                    last_block_ = std::move(slot.block);
+                    slot.live.clear();
+                    slot.cursor = 0;
+                }
+            }
+            unit.slots.erase(std::remove_if(unit.slots.begin(), unit.slots.end(),
+                                            [](const Slot& s) { return !s.occupied(); }),
+                             unit.slots.end());
+            give_one(unit);
+            if (!unit.slots.empty()) {
+                anything_resident = true;
             }
         }
 
-        if (chosen != warps) {
-            Warp& warp = block.warps[chosen];
-            cursor = (chosen + 1) % warps;
-
-            // Whether an instruction actually went out, which is not the same as
-            // whether the warp takes another turn: a warp discovered to have
-            // retired issued nothing and costs no time, while one arriving at a
-            // barrier issued the BARRIER and does.
-            const uint64_t before = stats_.warp_steps;
-            if (!step_warp(program, warp, block, global)) {
-                // Retired, or now waiting at a barrier. at_barrier tells them
-                // apart, and only the first is done for good.
-                if (!warp.at_barrier) {
-                    live[chosen] = false;
-                    --remaining;
-                }
-            } else {
-                // step_warp reports the latency of what it issued, which for a
-                // global access comes from the memory model rather than from the
-                // opcode alone.
-                warp.ready_at = now + issued_latency_;
-            }
-            if (stats_.warp_steps != before) {
-                ++now;
-            }
+        if (issued > 0) {
+            // Every SM that had nothing to send this cycle wasted an issue slot,
+            // which is what occupancy exists to keep from happening.
+            stats_.stall_steps += idle;
+            ++now;
             continue;
         }
 
-        // Nobody ready. If any live warp is merely waiting, move time to it.
-        uint64_t soonest = UINT64_MAX;
-        for (size_t i = 0; i < warps; ++i) {
-            const Warp& w = block.warps[i];
-            if (live[i] && !w.at_barrier) {
-                soonest = std::min(soonest, w.ready_at);
-            }
+        if (!anything_resident) {
+            break;  // every block retired and the grid is exhausted
         }
-        if (soonest != UINT64_MAX) {
-            stats_.stall_steps += soonest - now;
+
+        if (soonest != UINT64_MAX && soonest > now) {
+            // Nobody can issue and somebody will be able to. Time moves to them,
+            // and the gap is charged to the SMs that sat through it holding work.
+            // Not to all of them: an SM with no block is unemployed rather than
+            // stalled, and counting it would make a machine wider than its grid
+            // look busier than one that fits.
+            uint32_t waiting_units = 0;
+            for (const Unit& unit : units) {
+                waiting_units += unit.slots.empty() ? 0u : 1u;
+            }
+            stats_.stall_steps += (soonest - now) * waiting_units;
             now = soonest;
             continue;
         }
 
-        // Every live warp is at a barrier, so all of them have arrived: nothing
-        // can issue again without the release.
-        bool released = false;
-        for (Warp& warp : block.warps) {
-            if (warp.at_barrier) {
-                warp.at_barrier = false;
-                released = true;
-            }
-        }
-        if (!released) {
+        // Nobody issued and nobody is waiting on a result. A barrier opening or a
+        // slot taking the next block are the only things that can have changed,
+        // and if neither did, no later cycle will differ from this one.
+        if (!released_any && !loaded_any) {
             break;
         }
+
+        // Opening a barrier is not a cycle of work — the warps behind it issue in
+        // the next one. Charging time here would make a barrier dearer than the
+        // stall it already causes, and would break Ignored's own definition:
+        // cycles equal to issues, nothing ever waiting.
     }
 
-    stats_.cycles = now;
-}
-
-void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan global)
-{
-    // A previous run() may have thrown partway and left pointers here that now
-    // belong to a destroyed block.
-    ready_queue_ = {};
-
-    // One block's private cache. L2 is the device's and stays.
-    l1_.clear();
-
-    for (Warp& warp : block.warps) {
-        warp.at_barrier = false;
-        ready_queue_.push(&warp);
-    }
-
-    for (Warp& warp : block.warps) {
-        warp.ready_at = 0;
-    }
-
-    if (latency_ == LatencyModel::Modelled) {
-        run_modelled(program, block, global);
-        return;
-    }
-
-    // A turn is a cycle here, nothing ever waiting. Counted per turn rather than
-    // per warp, so the limit is on the block's total work and not on how the queue
-    // happened to interleave.
-    uint64_t steps = 0;
-    while (!ready_queue_.empty()) {
-        if (++steps > cycle_budget_) {
-            throw std::runtime_error(
-                "WarpScheduler::run: block did not finish within " +
-                std::to_string(cycle_budget_) +
-                " cycles — a lane is waiting on one this scheduler will never "
-                "issue, or the kernel does not terminate");
-        }
-
-        Warp* warp = ready_queue_.front();
-        ready_queue_.pop();
-        if (step_warp(program, *warp, block, global)) {
-            ready_queue_.push(warp);
-        }
-
-        // Equal to warp_steps while nothing waits, and its own counter so the two
-        // can part without a rate quietly changing meaning.
-        stats_.cycles = stats_.warp_steps;
-
-        // A warp that retires before reaching the barrier stops being waited
-        // for. Waiting for it instead would hang, and a simulator that hangs is
-        // harder to debug than one that carries on.
-        if (ready_queue_.empty()) {
-            release_barrier(block);
-        }
-    }
+    handback.armed = false;
+    stats_.cycles += now;
+    active_l1_ = nullptr;
 }
 
 void WarpScheduler::reset_stats()

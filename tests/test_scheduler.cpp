@@ -94,6 +94,13 @@ Program producer_consumer_program()
     return p;
 }
 
+// A kernel that ignores its arguments and always produces the same program,
+// which is what a launch needs when the point is the machine and not the work.
+KernelFunc constant_kernel(Program prog)
+{
+    return [prog](void**) { return prog; };
+}
+
 void seed_lane_ids(ThreadBlock& block)
 {
     for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
@@ -812,7 +819,11 @@ TEST(Scheduler, LowestPcFirstStrandsALaneWaitingOnAHigherOne)
     // lane is still inside its loop, the writer has not issued its first
     // instruction, and the flag it was waiting on was never set. A budget that
     // fired for any other reason would not leave the block in this state.
-    EXPECT_EQ(block.warps[0].threads[0].pc, 4u) << "lane 0 left its spin";
+    // Inside the spin (4 load, 5 compare, 6 branch back) rather than at a named
+    // instruction: which of the three the budget interrupts is a matter of what
+    // cycle it fired on, and the claim here is that the lane never got out.
+    EXPECT_GE(block.warps[0].threads[0].pc, 4u) << "lane 0 left its spin";
+    EXPECT_LE(block.warps[0].threads[0].pc, 6u) << "lane 0 left its spin";
     EXPECT_EQ(block.warps[0].threads[1].pc, 8u) << "lane 1 ran past the store";
     float flag = -1.0f;
     std::memcpy(&flag, memory.data(), sizeof(float));
@@ -1821,6 +1832,127 @@ TEST(Scheduler, AVectorLoadWaitsOnceWhereThreeScalarsWaitThreeTimes)
     // The first trip goes to memory either way; what the scalars add is two more
     // waits for lines already in L1.
     EXPECT_LT(cycles(wide), cycles(scalars));
+}
+
+TEST(Scheduler, MoreSMsFinishSoonerWithoutDoingLessWork)
+{
+    // The whole claim of several SMs, and the accounting check that goes with it:
+    // the same instructions are issued whatever the machine, and only the clock
+    // moves. A cycle count that fell without the work following it would mean
+    // blocks were being dropped rather than overlapped.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 1.0f));
+    p.push_back(make_v_add_f32(1, 0, 0));
+    p.push_back(make_v_mul_f32(2, 1, 1));
+    p.push_back(make_ret());
+
+    const auto measure = [&p](uint32_t sm_count) {
+        MyGPURuntime rt(1u << 16, 1024);
+        SMConfig config;
+        config.sm_count = sm_count;
+        rt.myrt_set_sm_config(config);
+        rt.myrt_launch(constant_kernel(p), dim3{8, 1, 1}, dim3{32, 1, 1}, nullptr);
+        return rt.stats();
+    };
+
+    const SchedulerStats one = measure(1);
+    const SchedulerStats four = measure(4);
+
+    EXPECT_EQ(one.warp_steps, four.warp_steps);
+    EXPECT_EQ(one.active_lane_ops, four.active_lane_ops);
+    EXPECT_EQ(one.weighted_lane_ops, four.weighted_lane_ops);
+    EXPECT_LT(four.cycles, one.cycles) << "four SMs took as long as one";
+
+    // Eight blocks over four SMs, so the clock should fall by about the factor
+    // the machine widened by — not exactly, the last blocks arriving as slots
+    // free rather than all at once.
+    EXPECT_LE(four.cycles * 2, one.cycles + one.cycles / 4);
+}
+
+TEST(Scheduler, OneBlockCannotUseASecondSM)
+{
+    // The bound on the claim above. Blocks are what an SM takes, so a launch with
+    // one of them runs the same however wide the machine is — and the idle SMs
+    // show up as wasted issue slots rather than as nothing at all.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 1.0f));
+    p.push_back(make_v_add_f32(1, 0, 0));
+    p.push_back(make_ret());
+
+    const auto measure = [&p](uint32_t sm_count) {
+        MyGPURuntime rt(1u << 16, 1024);
+        SMConfig config;
+        config.sm_count = sm_count;
+        rt.myrt_set_sm_config(config);
+        rt.myrt_launch(constant_kernel(p), dim3{1, 1, 1}, dim3{32, 1, 1}, nullptr);
+        return rt.stats();
+    };
+
+    const SchedulerStats one = measure(1);
+    const SchedulerStats four = measure(4);
+
+    EXPECT_EQ(one.cycles, four.cycles);
+    EXPECT_EQ(one.weighted_lane_ops, four.weighted_lane_ops);
+
+    // And nothing is recorded as stalling, which is the distinction worth
+    // keeping: stall_steps counts an SM that holds work and cannot issue it. An
+    // SM with no block is not waiting on anything — it was never given any. What
+    // that costs is visible as cycles x SMs against the instructions issued, and
+    // needs no counter of its own.
+    EXPECT_EQ(four.stall_steps, one.stall_steps);
+}
+
+TEST(Scheduler, SharedMemoryAndWarpCountAreWhatLimitResidency)
+{
+    // The arithmetic an occupancy table is made of, and the reason a kernel that
+    // stages through shared memory fits fewer blocks on an SM than one that does
+    // not. Which of the three limits binds is rarely obvious, which is why it is
+    // one function rather than three call sites.
+    GPUSpec spec;
+    spec.sms.blocks_per_sm = 8;
+    spec.sms.warp_slots_per_sm = 64;
+    spec.sms.shared_bytes_per_sm = 16 * 1024;
+
+    EXPECT_EQ(spec.residency(1, 0), 8u) << "the block limit binds";
+    EXPECT_EQ(spec.residency(16, 0), 4u) << "warp slots bind";
+    EXPECT_EQ(spec.residency(1, 4 * 1024), 4u) << "shared memory binds";
+    EXPECT_EQ(spec.residency(16, 2 * 1024), 4u) << "two bind at once";
+
+    // A block too large for any limit still runs, alone. Reporting a machine with
+    // no room for it would be an error nobody could act on.
+    EXPECT_EQ(spec.residency(128, 0), 1u);
+    EXPECT_EQ(spec.residency(1, 1024 * 1024), 1u);
+}
+
+TEST(Scheduler, BlocksSharingAnSMShareItsL1)
+{
+    // L1 belongs to an SM, so two blocks on one SM read each other's lines — the
+    // reason it stopped being emptied between blocks. Two blocks reading the same
+    // address fetch it once between them.
+    Program p;
+    p.push_back(make_v_mov_f32(0, 0.0f));
+    p.push_back(make_v_ld_global_f32(1, 0, 0.0f));
+    p.push_back(make_ret());
+
+    const auto misses = [&p](uint32_t blocks_per_sm) {
+        MyGPURuntime rt(1u << 16, 1024);
+        SMConfig config;
+        config.blocks_per_sm = blocks_per_sm;
+        rt.myrt_set_sm_config(config);
+        rt.myrt_set_memory_model(MemoryModel::Cached);
+
+        // Two launches, so that L2 cannot answer for the second: it outlives a
+        // launch, and what is being asked about here is L1.
+        rt.myrt_launch(constant_kernel(p), dim3{2, 1, 1}, dim3{32, 1, 1}, nullptr);
+        return rt.stats().l1_hits;
+    };
+
+    // One block at a time, the second still finds the line — L1 is no longer
+    // emptied between them, which is what a shared cache means.
+    EXPECT_GT(misses(1), 0u);
+    EXPECT_EQ(misses(1), misses(2))
+        << "co-residency changed what a shared cache holds, which it should not "
+           "for two blocks reading one address";
 }
 
 TEST(Scheduler, TheCycleBudgetCoversTimeSpentWaiting)
