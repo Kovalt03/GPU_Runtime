@@ -68,16 +68,28 @@ Program build_raster_program(void** args)
         // Started beyond the far plane so the first covering triangle takes it.
         const Reg<Scalar> best_z = k.constant(2.0f);
 
+        // The pixel this thread owns, which both buffers are addressed by. Costs
+        // what the frame address alone used to.
+        const Reg<Scalar> pixel =
+            k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
+
         // Where this pixel's depth lives, and — under EarlyZ — what the prepass
         // decided. One load before the loop rather than one a triangle: the
         // answer does not change while the walk runs.
-        const Reg<Scalar> pixel =
-            k.add(k.mul(py, k.constant(static_cast<float>(a.width))), px);
-        const Reg<Scalar> depth_addr =
-            k.add(k.constant(static_cast<float>(a.depth_offset)),
-                  k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
-        const Reg<Scalar> visible_z =
-            a.depth == DepthUse::EarlyZ ? k.load(depth_addr) : k.constant(2.0f);
+        //
+        // Emitted only where it is read. A route that never touches depth used to
+        // pay for this arithmetic anyway, which is 30,720 lane-ops a frame at
+        // 64x32 and was invisible until a benchmark was re-run for another
+        // reason. The flags exist so that only the chosen form reaches the
+        // instruction stream; this was the one place that forgot.
+        Reg<Scalar> depth_addr = pixel;
+        Reg<Scalar> visible_z = pixel;
+        if (a.depth != DepthUse::None) {
+            depth_addr = k.add(k.constant(static_cast<float>(a.depth_offset)),
+                               k.mul(pixel, k.constant(static_cast<float>(DEPTH_BYTES))));
+            visible_z =
+                a.depth == DepthUse::EarlyZ ? k.load(depth_addr) : k.constant(2.0f);
+        }
         const Reg<Vec3> best = k.vec3();
         k.set(best.component(0), 0.0f);
         k.set(best.component(1), 0.0f);
@@ -96,21 +108,27 @@ Program build_raster_program(void** args)
         const Reg<Scalar> i = k.constant(0.0f);
         const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
 
-        // Above the loop, so a constant is issued once for the launch rather
-        // than once a triangle. Emitted whatever the mode, six moves being
-        // cheaper than the branch it would take to declare them conditionally.
+        // Above the loop, so a constant is issued once for the launch rather than
+        // once a triangle — and only where the shade reads them. Ten moves is
+        // 20,480 lane-ops a frame at 64x32, which is what an unlit walk was
+        // quietly paying for a light it never used.
         const bool diffuse = a.shading.mode == ShadingMode::Diffuse;
-        const Reg<Vec3> light =
-            k.constant(a.shading.light_position.x, a.shading.light_position.y,
-                       a.shading.light_position.z);
-        const Reg<Vec3> base_colour = k.constant(
-            a.shading.base_colour.x, a.shading.base_colour.y, a.shading.base_colour.z);
-        const Reg<Scalar> world_base = k.constant(static_cast<float>(a.world_offset));
-        const Reg<Scalar> normal_base = k.constant(static_cast<float>(a.normal_offset));
-        const Reg<Scalar> world_stride =
-            k.constant(static_cast<float>(WORLD_VERTEX_BYTES));
-        const Reg<Scalar> normal_stride =
-            k.constant(static_cast<float>(FACE_NORMAL_BYTES));
+        Reg<Vec3> light = k.vec3();
+        Reg<Vec3> base_colour = k.vec3();
+        Reg<Scalar> world_base = k.scalar();
+        Reg<Scalar> normal_base = k.scalar();
+        Reg<Scalar> world_stride = k.scalar();
+        Reg<Scalar> normal_stride = k.scalar();
+        if (diffuse) {
+            light = k.constant(a.shading.light_position.x, a.shading.light_position.y,
+                               a.shading.light_position.z);
+            base_colour = k.constant(a.shading.base_colour.x, a.shading.base_colour.y,
+                                     a.shading.base_colour.z);
+            world_base = k.constant(static_cast<float>(a.world_offset));
+            normal_base = k.constant(static_cast<float>(a.normal_offset));
+            world_stride = k.constant(static_cast<float>(WORLD_VERTEX_BYTES));
+            normal_stride = k.constant(static_cast<float>(FACE_NORMAL_BYTES));
+        }
 
         // Chosen here, on the host, so only one form reaches the instruction
         // stream — a KernelFunc runs once per launch and the flag costs no lane
