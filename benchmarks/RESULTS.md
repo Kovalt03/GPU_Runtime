@@ -1050,12 +1050,16 @@ cmake --build build -j8
 ./build/benchmarks/reduction_bench
 ```
 
-| Warps | Route | Instructions | Warp steps | Lane ops |
-|---|---|---:|---:|---:|
-| 1 | shared | 68 | 68 | 2,176 |
-| 1 | shuffle | 33 | 33 | **1,056** |
-| 8 | shared | 68 | 544 | 17,408 |
-| 8 | shuffle | 33 | 264 | **8,448** |
+| Warps | Route | Instructions | Warp steps | Lane ops | Cycles |
+|---|---|---:|---:|---:|---:|
+| 1 | shared | 68 | 68 | 2,176 | 354 |
+| 1 | shuffle | 33 | 33 | **1,056** | **129** |
+| 1 | atomic a lane | **5** | **5** | **160** | 1,143 |
+| 1 | shuffle+atomic | 39 | 39 | 1,155 | 343 |
+| 8 | shared | 68 | 544 | 17,408 | 654 |
+| 8 | shuffle | 33 | 264 | **8,448** | **264** |
+| 8 | atomic a lane | **5** | 40 | 1,280 | 1,167 |
+| 8 | shuffle+atomic | 39 | 312 | 9,240 | 504 |
 
 Shared memory spends a round on a store, a barrier, a load, a second barrier to
 keep a fast lane from overwriting a slot a slow one has yet to read, and the
@@ -1063,6 +1067,27 @@ address arithmetic for both ends. The exchange spends it on one instruction.
 Computing which lane to take from costs three instructions in both and cancels
 out; it is written branchless so that a divergent wrap does not put warp splits
 into a measurement about something else.
+
+### The atomic routes answer a different question
+
+They leave the total **in memory**, so it accumulates across the block's warps
+where the two above leave a per-warp answer in a register. That is the reason to
+reach for one at all, and it is also what makes the choice between them real.
+
+**The issue count says the atomic wins and the clock says it loses by 3.3x.**
+Five instructions against thirty-nine, 160 lane-ops against 1,155 — and 1,143
+cycles against 343. Thirty-two lanes naming one address are thirty-two
+operations, and the unit works through them one at a time.
+
+That serialisation is charged rather than assumed: `atomic_access` counts how
+many lanes pile onto the deepest address and adds a step for each one past the
+first. Coalescing cannot help — the test `CoalescingCannotHelpAnAtomic` pins that
+an atomic costs the same under `Flat`, `Coalesced` and `Cached`, where a load of
+the same 32 addresses costs a thirty-second as much under the last two.
+
+**So the reduction is what carries a value out of a warp**, and the atomic is
+what carries it out of the block. Doing the first before the second is not an
+optimisation to reach for later — it is 3.3x here, and it grows with the warp.
 
 ### What priced the primitives
 

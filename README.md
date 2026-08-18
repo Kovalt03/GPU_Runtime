@@ -503,7 +503,7 @@ against `walk` and nothing else, and a BVH is what would close it.
 | Streams, concurrent kernels | modelled — launches queue, one stream runs in order and separate streams overlap. Work partitions between them exactly; cycles are charged to every stream that was resident, so they add to more than the wall clock and the surplus is the overlap |
 | Indirect launch | modelled — `myrt_launch_indirect` reads its grid from device memory when the launch reaches the machine, so the kernel before it in the stream decides its size. Reading it costs no lane-op at all |
 | Asynchronous copy (`cp.async`) | modelled — `V_CP_ASYNC_SHARED_GLOBAL_F32` moves global memory into shared without a register and without the warp waiting, and the warp meets it at `S_CP_ASYNC_WAIT`. Reading bytes still in flight is refused rather than answered. Worth 87% of a fill on its own and 2% of a renderer that stages once and reads 256 times |
-| Atomics | **absent** — nothing combines lanes into one number, which is why the culling pass in `stream_bench` is a single thread walking a buffer |
+| Atomics | modelled — `V_ATOM_ADD_GLOBAL_F32` reads, adds and writes back indivisibly, and hands each lane what was there before, which is how a compaction pass gives every surviving item a slot. Lanes naming one address are charged for serialising, so coalescing cannot help them and a warp reduction before the atomic is worth 3.3x |
 
 ### The three that matter most
 
@@ -518,12 +518,12 @@ that finds it — and flat lighting costs about half a coverage test here. Textu
 and shadows are what would carry it past the crossover, and the fragment stage has
 neither.
 
-**Atomics.** There is no instruction that combines what the lanes hold into one
-number, so anything whose answer is a single value has to be walked serially by one
-thread. That is what the culling pass in `stream_bench` does, and 810 of its 900
-cycles are the walk. Streams and indirect launch made the pass expressible — a
-kernel now decides how much work the kernel after it does — and this is what stands
-between that and a culling pass with the shape a real one has.
+**A kernel that reuses what it fetches.** `cp.async` is worth 87% of a fill on its
+own and 2% of the renderer it was put into, because a staged tile here is fetched
+once and read by all 256 threads of the block. The instruction's home is the other
+end of that ratio — a matrix multiply consumes a staged tile in a fixed, small
+number of operations — and this repository has no such kernel yet. It is the same
+gap `V_MMA` would fill, and the reason the two are next to each other on the list.
 
 ---
 
