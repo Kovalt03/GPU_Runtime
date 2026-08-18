@@ -963,6 +963,70 @@ cheaply than the first.
 
 ---
 
+## A memory system with a ceiling
+
+Every figure in this file before this one was taken with transactions counted and
+never queued. Two warps each needing four lines were served as though the other
+were not there — nothing saturated, because there was nothing to saturate.
+
+`BandwidthModel::Modelled` gives the memory system a rate: it delivers a fixed
+number of lines a cycle, and a request arriving while it is busy waits for the
+ones ahead. Latency stops being a constant and becomes a function of load.
+
+```
+cmake --build build -j8
+./build/benchmarks/bandwidth_bench
+```
+
+### The mechanism
+
+Eight warps streaming, every lane on a line of its own and none read twice —
+2,048 lines asked for.
+
+| Lines a cycle | Cycles | queued | vs none |
+|---|---:|---:|---:|
+| no ceiling | 3,416 | 0 | — |
+| 32 | 3,416 | 0 | 1.00x |
+| 8 | 3,399 | 6,720 | 1.00x |
+| 2 | 3,566 | 28,800 | 1.04x |
+| 1 | 3,806 | 59,520 | **1.11x** |
+
+**A queue is not a slowdown until it is.** At eight lines a cycle the requests
+wait 6,720 cycles between them and the kernel finishes in the same time: the warps
+were already waiting for memory, and waiting a little longer for a system that is
+busy costs nothing extra while something else is in flight. Only when the ceiling
+falls below what the kernel asks for does the clock move.
+
+### And what it does to a renderer
+
+The sweep *Several SMs* makes, with a ceiling of eight lines a cycle, and L1 cut
+to 16 lines so that the scene misses at all.
+
+| SMs | no ceiling | vs 1 SM | 8 lines a cycle | vs 1 SM |
+|---:|---:|---:|---:|---:|
+| 1 | 80,794 | 1.00x | 80,794 | 1.00x |
+| 8 | 10,553 | 7.66x | 10,553 | **7.66x** |
+| 32 | 9,593 | 8.42x | 9,593 | **8.42x** |
+
+**Nothing moves, to the cycle.** The scaling this file reports is not hiding a
+bandwidth wall.
+
+**Demand is the whole of it.** The streaming warps ask for 0.60 lines a cycle and
+the renderer for 0.02 — thirty times less. A ceiling binds when it is below what a
+kernel asks for and not otherwise, and eight lines a cycle is above both.
+
+### What this does and does not settle
+
+It settles the question README named first: the scaling figures stand, because the
+kernels this repository measures do not ask memory for enough to reach a ceiling.
+It does not make this a bandwidth model of a real machine — the server is one
+queue with a fixed service time, there is no distinction between read and write
+traffic, no row buffer, and the on-chip paths are still unlimited. What it can
+answer is whether a figure elsewhere in this file was resting on the absence of a
+ceiling, and the answer is no.
+
+---
+
 ## A tiled matrix multiply
 
 Two instructions were measured and neither had a kernel worth measuring in.
