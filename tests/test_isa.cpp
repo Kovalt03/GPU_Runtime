@@ -54,7 +54,8 @@ bool has_valid_shape_token(std::string_view name)
            name.find("_VEC4_") != std::string_view::npos ||
            name.find("_MAT3_") != std::string_view::npos ||
            name.find("_MAT4_") != std::string_view::npos ||
-           name.find("_16X16X16_") != std::string_view::npos;
+           name.find("_16X16X16_") != std::string_view::npos ||
+           name.find("_16X16_") != std::string_view::npos;
 }
 
 bool has_space_token(std::string_view name)
@@ -82,10 +83,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 38 opcodes, 0-indexed → RET == 37
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 37);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 34);
-    EXPECT_EQ(OPCODE_COUNT, 38);
+    // 39 opcodes, 0-indexed → RET == 38
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 38);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 35);
+    EXPECT_EQ(OPCODE_COUNT, 39);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -96,7 +97,7 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 25);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 26);
 }
 
 // ---------------------------------------------------------------------------

@@ -232,6 +232,11 @@ public:
     // and each has to land in a chosen one — an allocating load would hand back
     // eight registers that are not consecutive.
     void load_shared_into(Reg<Scalar> dst, Reg<Scalar> address, float offset = 0.0f);
+
+    // A whole fragment in one instruction, where the eight above are eight round
+    // trips. The registers come back consecutive, which is what the matrix
+    // instruction needs and what eight allocating loads could not promise.
+    Reg<Frag> load_shared_fragment(Reg<Scalar> address, float offset = 0.0f);
     void load_vec3_into(Reg<Vec3> dst, Reg<Scalar> address, float offset = 0.0f);
 
     // The block's own scratchpad. Addresses are byte offsets, as the global

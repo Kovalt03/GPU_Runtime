@@ -338,6 +338,13 @@ void IRBuilder::load_shared_into(Reg<Scalar> dst, Reg<Scalar> address, float off
     emit(make_v_ld_shared_f32(dst.first(), address.first(), offset));
 }
 
+Reg<Frag> IRBuilder::load_shared_fragment(Reg<Scalar> address, float offset)
+{
+    const Reg<Frag> out = alloc<Frag>();
+    emit(make_v_ld_shared_16x16_f32(out.first(), address.first(), offset));
+    return out;
+}
+
 Reg<Vec3> IRBuilder::load_vec3(Reg<Scalar> address, float offset)
 {
     const Reg<Vec3> dst = alloc<Vec3>();

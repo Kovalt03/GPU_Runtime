@@ -53,6 +53,12 @@ struct GemmArgs {
     // same staging — only the inner loop differs.
     bool matrix_unit = true;
 
+    // Whether a fragment is loaded in one instruction or eight.
+    //
+    // Only the matrix route has fragments; the arithmetic one reads a float at a
+    // time by construction. False is what the first figures were taken under.
+    bool wide_fragments = false;
+
     // How the tiles reach shared memory. AsyncDoubleBuffered issues the next
     // k-step's copies before this one is multiplied, which is the overlap the
     // renderer had no room for.

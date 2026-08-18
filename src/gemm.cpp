@@ -169,18 +169,24 @@ Program build_gemm_program(void** args)
               four));
 
     if (a.matrix_unit) {
-        // Sixteen loads and one instruction. The loads are what a real machine
-        // has ldmatrix for; this ISA does not, and the benchmark says what that
-        // costs.
-        const Reg<Frag> a_frag = k.fragment();
-        const Reg<Frag> b_frag = k.fragment();
-        for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
-            k.load_shared_into(a_frag.component(i), a_at,
-                               static_cast<float>(i * sizeof(float)));
-            k.load_shared_into(b_frag.component(i), b_at,
-                               static_cast<float>(i * sizeof(float)));
+        // Sixteen loads and one instruction, or two loads and one instruction.
+        // What the wide one saves is the waiting: this machine issues in order,
+        // so eight round trips to shared memory are eight waits with nothing
+        // between them.
+        if (a.wide_fragments) {
+            k.mma(accumulator, k.load_shared_fragment(a_at),
+                  k.load_shared_fragment(b_at));
+        } else {
+            const Reg<Frag> a_frag = k.fragment();
+            const Reg<Frag> b_frag = k.fragment();
+            for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+                k.load_shared_into(a_frag.component(i), a_at,
+                                   static_cast<float>(i * sizeof(float)));
+                k.load_shared_into(b_frag.component(i), b_at,
+                                   static_cast<float>(i * sizeof(float)));
+            }
+            k.mma(accumulator, a_frag, b_frag);
         }
-        k.mma(accumulator, a_frag, b_frag);
     } else {
         // The same product one multiply-add at a time. A lane's eight outputs
         // each need a whole row of A against a column of B, so the inner loop is

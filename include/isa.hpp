@@ -84,6 +84,21 @@ enum class Opcode : uint8_t {
     // charge every access the same way, and it outranks reading order.
     V_CP_ASYNC_SHARED_GLOBAL_F32,  // shared[reg[src1]] = global[reg[src0] + imm]
 
+    // A whole fragment out of shared memory: eight consecutive floats into the
+    // eight consecutive registers V_MMA_16X16X16_F32 reads.
+    //
+    // Hardware's ldmatrix, and the same argument V_LD_GLOBAL_VEC3_F32 made — a
+    // wide load is not several narrow ones. What it buys here is different,
+    // though. The wide global load buys transactions, because 32 lanes asking
+    // for twelve bytes touch fewer lines than three instructions do. Shared
+    // memory has no lines, so this buys **waiting**: one round trip instead of
+    // eight, in a machine that issues in order and has nothing to fill them with.
+    //
+    // The eight elements are consecutive because this ISA's fragment layout says
+    // so. Hardware's layout is chosen for the datapath, which is why its ldmatrix
+    // has to gather rather than read a run.
+    V_LD_SHARED_16X16_F32,  // reg[dst..+7] = shared[reg[src0] + imm ..+28]
+
     // Another block's shared memory, from a block in the same cluster.
     //
     // Hopper's distributed shared memory. src1 names which block of the cluster
@@ -284,6 +299,11 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// dst names the first of eight registers, as every wide shape does, and starts
+// on a multiple of four.
+Instruction make_v_ld_shared_16x16_f32(uint8_t dst, uint8_t addr_reg,
+                                       float offset = 0.0f);
 
 // address, then the rank of the block whose shared memory to read.
 Instruction make_v_ld_cluster_f32(uint8_t dst, uint8_t addr_reg, uint8_t rank_reg,

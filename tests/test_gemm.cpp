@@ -31,8 +31,13 @@ struct Measurement {
     uint64_t cycles = 0;
 };
 
-Measurement multiply(uint32_t m, uint32_t n, uint32_t k, bool matrix_unit,
-                     TileStaging staging)
+struct GemmOptions {
+    bool matrix_unit = true;
+    bool wide_fragments = false;
+    TileStaging staging = TileStaging::Synchronous;
+};
+
+Measurement multiply(uint32_t m, uint32_t n, uint32_t k, const GemmOptions& how)
 {
     const std::vector<float> a = ramp(static_cast<size_t>(m) * k, 7, 0.5f);
     const std::vector<float> b = ramp(static_cast<size_t>(k) * n, 5, 0.25f);
@@ -58,8 +63,9 @@ Measurement multiply(uint32_t m, uint32_t n, uint32_t k, bool matrix_unit,
     args.m = m;
     args.n = n;
     args.k = k;
-    args.matrix_unit = matrix_unit;
-    args.staging = staging;
+    args.matrix_unit = how.matrix_unit;
+    args.wide_fragments = how.wide_fragments;
+    args.staging = how.staging;
     run_gemm(rt, args);
 
     Measurement run;
@@ -90,7 +96,7 @@ TEST(Gemm, TheMatrixUnitComputesWhatTheHostDoes)
     constexpr uint32_t M = 32, N = 128, K = 32;
     const std::vector<float> want =
         gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
-    agrees(multiply(M, N, K, true, TileStaging::Synchronous).c, want, "matrix unit");
+    agrees(multiply(M, N, K, GemmOptions{}).c, want, "matrix unit");
 }
 
 TEST(Gemm, EveryRouteAgreesWithEveryOther)
@@ -101,11 +107,14 @@ TEST(Gemm, EveryRouteAgreesWithEveryOther)
     const std::vector<float> want =
         gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
 
-    agrees(multiply(M, N, K, true, TileStaging::AsyncDoubleBuffered).c, want,
-           "matrix unit, staged ahead");
-    agrees(multiply(M, N, K, false, TileStaging::Synchronous).c, want, "arithmetic");
-    agrees(multiply(M, N, K, false, TileStaging::AsyncDoubleBuffered).c, want,
-           "arithmetic, staged ahead");
+    agrees(
+        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered}).c,
+        want, "matrix unit, staged ahead");
+    agrees(multiply(M, N, K, GemmOptions{false, false, TileStaging::Synchronous}).c, want,
+           "arithmetic");
+    agrees(
+        multiply(M, N, K, GemmOptions{false, false, TileStaging::AsyncDoubleBuffered}).c,
+        want, "arithmetic, staged ahead");
 }
 
 TEST(Gemm, OneKStepIsAsMuchAKernelAsSeveral)
@@ -115,15 +124,17 @@ TEST(Gemm, OneKStepIsAsMuchAKernelAsSeveral)
     constexpr uint32_t M = 16, N = 64, K = 16;
     const std::vector<float> want =
         gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
-    agrees(multiply(M, N, K, true, TileStaging::AsyncDoubleBuffered).c, want,
-           "one k-step");
+    agrees(
+        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered}).c,
+        want, "one k-step");
 }
 
 TEST(Gemm, TheMatrixUnitIssuesAFractionOfTheWork)
 {
     constexpr uint32_t M = 32, N = 128, K = 32;
-    const Measurement mma = multiply(M, N, K, true, TileStaging::Synchronous);
-    const Measurement fma = multiply(M, N, K, false, TileStaging::Synchronous);
+    const Measurement mma = multiply(M, N, K, GemmOptions{});
+    const Measurement fma =
+        multiply(M, N, K, GemmOptions{false, false, TileStaging::Synchronous});
 
     EXPECT_LT(mma.weighted, fma.weighted / 2)
         << "one instruction against 128 multiply-adds a lane";
@@ -136,8 +147,9 @@ TEST(Gemm, StagingAheadPaysHereWhereItDidNotInTheRenderer)
     // fixed, small number of operations, so the fetch is a real fraction of the
     // work — the opposite of a tile read by 256 threads.
     constexpr uint32_t M = 32, N = 128, K = 64;
-    const Measurement sync = multiply(M, N, K, true, TileStaging::Synchronous);
-    const Measurement async = multiply(M, N, K, true, TileStaging::AsyncDoubleBuffered);
+    const Measurement sync = multiply(M, N, K, GemmOptions{});
+    const Measurement async =
+        multiply(M, N, K, GemmOptions{true, false, TileStaging::AsyncDoubleBuffered});
 
     EXPECT_LT(async.cycles, sync.cycles * 9 / 10) << "at least a tenth of the cycles";
 }
@@ -154,4 +166,42 @@ TEST(Gemm, AShapeWithATailIsRefused)
     args.n = 64;
     args.k = 24;  // not a whole number of tiles
     EXPECT_THROW(run_gemm(rt, args), std::runtime_error);
+}
+
+TEST(Gemm, AWideFragmentLoadComputesTheSameProduct)
+{
+    // Eight loads or one: the registers have to come back holding the same
+    // fragment, in the same order, or the multiply reads a transposed operand.
+    constexpr uint32_t M = 32, N = 128, K = 32;
+    const std::vector<float> want =
+        gemm_reference(ramp(M * K, 7, 0.5f), ramp(K * N, 5, 0.25f), M, N, K);
+
+    GemmOptions wide;
+    wide.matrix_unit = true;
+    wide.wide_fragments = true;
+    agrees(multiply(M, N, K, wide).c, want, "wide fragment load");
+
+    wide.staging = TileStaging::AsyncDoubleBuffered;
+    agrees(multiply(M, N, K, wide).c, want, "wide fragment load, staged ahead");
+}
+
+TEST(Gemm, AWideFragmentLoadBuysTimeRatherThanCapacity)
+{
+    // The distinction this instruction is priced on. Eight floats cost eight
+    // floats' worth of issue capacity however they are asked for — shared memory
+    // has banks rather than lines, so there is no transaction to save. What it
+    // saves is the seven waits it does not take.
+    constexpr uint32_t M = 32, N = 128, K = 64;
+    GemmOptions narrow;
+    narrow.matrix_unit = true;
+    GemmOptions wide = narrow;
+    wide.wide_fragments = true;
+
+    const Measurement eight = multiply(M, N, K, narrow);
+    const Measurement one = multiply(M, N, K, wide);
+
+    EXPECT_LT(one.cycles, eight.cycles * 3 / 4) << "the waiting is what it removes";
+    EXPECT_EQ(one.weighted, eight.weighted)
+        << "and the capacity is the same to the lane-op: eight floats are eight "
+           "floats however they are asked for";
 }

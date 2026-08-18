@@ -463,6 +463,23 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // Eight consecutive floats into eight consecutive registers. Checked as a
+    // VEC3 is and for the same reason: the range is implied by the opcode rather
+    // than written at the call site.
+    case Opcode::V_LD_SHARED_16X16_F32: {
+        require_register_range(instr.dst, MMA_FRAGMENT_REGISTERS,
+                               "V_LD_SHARED_16X16_F32 dst");
+        require_register_alignment(instr.dst, 4, "V_LD_SHARED_16X16_F32 dst");
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_SHARED_16X16_F32");
+        for (uint32_t i = 0; i < MMA_FRAGMENT_REGISTERS; ++i) {
+            thread.regs[instr.dst + i] =
+                load_f32(shared_bytes(block), SHARED_MEM_BYTES, addr + i * sizeof(float),
+                         "V_LD_SHARED_16X16_F32");
+        }
+        break;
+    }
+
     // Another block's shared memory. The cluster is a list the scheduler set when
     // it placed the blocks together, so a rank that exists is a block that is
     // certainly resident; a block with no cluster is a cluster of one.

@@ -55,6 +55,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
     case Opcode::V_ATOM_ADD_GLOBAL_F32: return "V_ATOM_ADD_GLOBAL_F32";
+    case Opcode::V_LD_SHARED_16X16_F32: return "V_LD_SHARED_16X16_F32";
     case Opcode::V_LD_CLUSTER_F32: return "V_LD_CLUSTER_F32";
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
@@ -281,6 +282,11 @@ Instruction make_s_cp_async_wait(uint32_t outstanding)
     return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
+Instruction make_v_ld_shared_16x16_f32(uint8_t dst, uint8_t addr_reg, float offset)
+{
+    return {Opcode::V_LD_SHARED_16X16_F32, dst, addr_reg, 0, offset};
+}
+
 Instruction make_v_ld_cluster_f32(uint8_t dst, uint8_t addr_reg, uint8_t rank_reg,
                                   float offset)
 {
@@ -376,6 +382,12 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::V_LD_SHARED_F32:
     case Opcode::V_ST_SHARED_F32: return 8;
 
+    // Eight floats, so eight times a float. No discount: shared memory has banks
+    // rather than lines, and this machine does not model a bank conflict — so
+    // there is no transaction for a wide load to save, and claiming one would be
+    // inventing a saving. What it does save is on the other line, in latency.
+    case Opcode::V_LD_SHARED_16X16_F32: return 8 * 8;
+
     // Still on-chip, and still not this block's: the request leaves the SM and
     // comes back. Twice a local one, which puts it an order below a cache line
     // and an order above nothing — the position hardware's distributed shared
@@ -459,6 +471,11 @@ uint32_t instruction_latency(Opcode op)
 
     // Shared memory is on-chip and an order below a cache hit.
     case Opcode::V_LD_SHARED_F32: return 30;
+
+    // Deeper than one float and far shallower than eight of them: the address is
+    // computed once and the bank sequence runs once. A third again, chosen the way
+    // the rest of this table is.
+    case Opcode::V_LD_SHARED_16X16_F32: return 40;
 
     // Twice that, for the trip out of the SM and back. The point of the
     // instruction is that this is not the 200 an L2 hit costs.
