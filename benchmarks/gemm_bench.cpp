@@ -42,7 +42,13 @@ std::vector<float> ramp(size_t n, int period, float scale)
     return v;
 }
 
-Reading measure(uint32_t m, uint32_t n, uint32_t k, bool matrix_unit, TileStaging staging)
+struct Route {
+    bool matrix_unit = true;
+    bool wide_fragments = false;
+    TileStaging staging = TileStaging::Synchronous;
+};
+
+Reading measure(uint32_t m, uint32_t n, uint32_t k, const Route& how)
 {
     const std::vector<float> a = ramp(static_cast<size_t>(m) * k, 7, 0.5f);
     const std::vector<float> b = ramp(static_cast<size_t>(k) * n, 5, 0.25f);
@@ -65,8 +71,9 @@ Reading measure(uint32_t m, uint32_t n, uint32_t k, bool matrix_unit, TileStagin
     args.m = m;
     args.n = n;
     args.k = k;
-    args.matrix_unit = matrix_unit;
-    args.staging = staging;
+    args.matrix_unit = how.matrix_unit;
+    args.wide_fragments = how.wide_fragments;
+    args.staging = how.staging;
     run_gemm(rt, args);
 
     return Reading{rt.stats().weighted_lane_ops, rt.stats().cycles,
@@ -97,6 +104,7 @@ struct Row {
     Reading fma_sync;
     Reading mma_sync;
     Reading mma_async;
+    Reading mma_wide;
 };
 
 }  // namespace
@@ -119,27 +127,35 @@ int main(int argc, char** argv)
     std::printf(
         "  C[%ux%u] = A * B, a block of %u warps holding a %ux%u strip in registers\n\n",
         M, N, GEMM_WARPS, GEMM_TILE, GEMM_TILE_N);
-    std::printf("  %6s %14s %14s %10s %14s %10s\n", "K", "fma, sync", "mma, sync",
-                "change", "mma, staged", "change");
+    std::printf("  %6s %14s %14s %10s %14s %10s %14s %10s\n", "K", "fma, sync",
+                "mma, sync", "change", "mma, staged", "change", "+wide frags", "change");
 
     std::vector<Row> rows;
     for (const uint32_t k : {32u, 64u, 128u}) {
-        const Row row{k, measure(M, N, k, false, TileStaging::Synchronous),
-                      measure(M, N, k, true, TileStaging::Synchronous),
-                      measure(M, N, k, true, TileStaging::AsyncDoubleBuffered)};
+        const Row row{
+            k, measure(M, N, k, Route{false, false, TileStaging::Synchronous}),
+            measure(M, N, k, Route{true, false, TileStaging::Synchronous}),
+            measure(M, N, k, Route{true, false, TileStaging::AsyncDoubleBuffered}),
+            measure(M, N, k, Route{true, true, TileStaging::AsyncDoubleBuffered})};
         rows.push_back(row);
-        std::printf("  %6u %14s %14s %9.1f%% %14s %9.1f%%\n", k,
+        std::printf("  %6u %14s %14s %9.1f%% %14s %9.1f%% %14s %9.1f%%\n", k,
                     with_commas(row.fma_sync.cycles).c_str(),
                     with_commas(row.mma_sync.cycles).c_str(),
                     change(row.fma_sync.cycles, row.mma_sync.cycles),
                     with_commas(row.mma_async.cycles).c_str(),
-                    change(row.mma_sync.cycles, row.mma_async.cycles));
+                    change(row.mma_sync.cycles, row.mma_async.cycles),
+                    with_commas(row.mma_wide.cycles).c_str(),
+                    change(row.mma_async.cycles, row.mma_wide.cycles));
     }
 
-    std::printf("\n  Issued work, same rows: fma %s, mma %s, staged ahead %s\n",
+    std::printf("\n  Issued work, same rows: fma %s, mma %s, staged ahead %s, wide %s\n",
                 with_commas(rows.back().fma_sync.weighted).c_str(),
                 with_commas(rows.back().mma_sync.weighted).c_str(),
-                with_commas(rows.back().mma_async.weighted).c_str());
+                with_commas(rows.back().mma_async.weighted).c_str(),
+                with_commas(rows.back().mma_wide.weighted).c_str());
+    std::printf(
+        "  The last two are equal: a fragment is eight floats however it is "
+        "asked for.\n  What the wide load removes is the seven waits.\n");
 
     std::ofstream csv(prefix + ".csv");
     if (!csv) {
@@ -151,7 +167,8 @@ int main(int argc, char** argv)
         const std::pair<const char*, const Reading*> routes[] = {
             {"fma,sync", &r.fma_sync},
             {"mma,sync", &r.mma_sync},
-            {"mma,async", &r.mma_async}};
+            {"mma,async", &r.mma_async},
+            {"mma,async,wide", &r.mma_wide}};
         for (const auto& [name, reading] : routes) {
             csv << M << ',' << N << ',' << r.k << ',' << name << ',' << reading->weighted
                 << ',' << reading->cycles << ',' << reading->stalls << '\n';
@@ -165,8 +182,9 @@ int main(int argc, char** argv)
        << "C[" << M << "x" << N << "] = A * B, a block of " << GEMM_WARPS
        << " warps holding a " << GEMM_TILE << "x" << GEMM_TILE_N
        << " strip of C in\nregisters for the whole K loop. Cycles.\n\n"
-       << "| K | fma, sync | mma, sync | change | mma, staged ahead | change |\n"
-       << "|---:|---:|---:|---:|---:|---:|\n";
+       << "| K | fma, sync | mma, sync | change | mma, staged ahead | change | "
+          "+ wide fragments | change |\n"
+       << "|---:|---:|---:|---:|---:|---:|---:|---:|\n";
     for (const Row& r : rows) {
         std::snprintf(buf, sizeof(buf),
                       "| %u | %s | %s | **%.1f%%** | %s | **%.1f%%** |\n", r.k,
