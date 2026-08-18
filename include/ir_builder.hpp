@@ -137,6 +137,7 @@ public:
     // Which block this thread runs in. Needed by anything a block owns
     // collectively, such as the tile of the screen it covers — a global
     // coordinate cannot be divided back down to it.
+    Reg<Scalar> cluster_rank() const;
     Reg<Scalar> block_x() const;
     Reg<Scalar> block_y() const;
     Reg<Scalar> block_z() const;
@@ -256,6 +257,14 @@ public:
     // Must sit outside any if_: every thread of the block has to reach it, and
     // the scheduler throws when one does not.
     void barrier();
+
+    // One level wider: every warp of every block of the cluster. What makes a
+    // block's writes safe for its neighbours to read.
+    void barrier_cluster();
+
+    // A float from another block of the cluster, by its rank. Rank 0 with no
+    // cluster is this block's own shared memory.
+    Reg<Scalar> load_cluster(Reg<Scalar> address, Reg<Scalar> rank, float offset = 0.0f);
 
     // Regroups the block's threads so that equal keys share a warp. A rendezvous
     // like barrier(), and under the same rule about divergent control flow.

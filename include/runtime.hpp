@@ -33,6 +33,17 @@ struct LaunchConfig {
     dim3 grid;
     dim3 block;
     size_t shared_bytes = 0;
+
+    // How many blocks are placed together and can read each other's shared
+    // memory. One is what everything before this declared, and it means no
+    // cluster at all rather than a cluster of one — though a kernel written for
+    // clusters still runs, reading rank 0 and finding itself.
+    //
+    // The blocks of a cluster are placed together or not at all, and none of them
+    // is freed until all of them have retired. That is what makes a neighbour's
+    // shared memory safe to address, and it is also what makes a cluster larger
+    // than the machine can hold a launch that cannot start.
+    uint32_t cluster_size = 1;
 };
 
 // Where an indirect launch reads its grid, and everything else a launch declares.
@@ -83,6 +94,13 @@ using KernelFunc = std::function<Program(void**)>;
 inline constexpr uint8_t REG_GLOBAL_ID_X = 253;
 inline constexpr uint8_t REG_GLOBAL_ID_Y = 254;
 inline constexpr uint8_t REG_GLOBAL_ID_Z = 255;
+
+// Which block of its cluster this one is, seeded like the block ids below.
+//
+// A rank cannot be recovered from a block id without an integer division, and a
+// kernel reading a neighbour's shared memory needs to know which neighbour it is
+// itself. Zero for a launch that declared no cluster.
+inline constexpr uint8_t REG_CLUSTER_RANK = 249;
 
 // Which block a thread belongs to — CUDA's blockIdx, and the other half of the
 // indexing model. A global coordinate cannot be turned back into one, the ISA
@@ -247,6 +265,7 @@ private:
         dim3 grid;
         dim3 block;
         size_t shared_bytes = 0;
+        uint32_t cluster_size = 1;
         StreamId stream = DEFAULT_STREAM;
         bool indirect = false;
         size_t grid_offset = 0;

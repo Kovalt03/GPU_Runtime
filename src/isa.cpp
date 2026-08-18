@@ -55,6 +55,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
     case Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32: return "V_CP_ASYNC_SHARED_GLOBAL_F32";
     case Opcode::V_ATOM_ADD_GLOBAL_F32: return "V_ATOM_ADD_GLOBAL_F32";
+    case Opcode::V_LD_CLUSTER_F32: return "V_LD_CLUSTER_F32";
     // CONTROL FLOW
     case Opcode::BRA:              return "BRA";
     case Opcode::BRA_DIV:          return "BRA_DIV";
@@ -69,6 +70,7 @@ std::string_view opcode_name(Opcode op)
     // SYNC
     case Opcode::BARRIER:          return "BARRIER";
     case Opcode::REORDER:          return "REORDER";
+    case Opcode::BARRIER_CLUSTER:  return "BARRIER_CLUSTER";
     case Opcode::RET:              return "RET";
     }
 
@@ -279,6 +281,17 @@ Instruction make_s_cp_async_wait(uint32_t outstanding)
     return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
 }
 
+Instruction make_v_ld_cluster_f32(uint8_t dst, uint8_t addr_reg, uint8_t rank_reg,
+                                  float offset)
+{
+    return {Opcode::V_LD_CLUSTER_F32, dst, addr_reg, rank_reg, offset};
+}
+
+Instruction make_barrier_cluster()
+{
+    return {Opcode::BARRIER_CLUSTER, 0, 0, 0, 0.0f};
+}
+
 Instruction make_reorder(uint8_t key_reg)
 {
     return {Opcode::REORDER, 0, key_reg, 0, 0.0f};
@@ -363,6 +376,12 @@ uint32_t instruction_cost(Opcode op)
     case Opcode::V_LD_SHARED_F32:
     case Opcode::V_ST_SHARED_F32: return 8;
 
+    // Still on-chip, and still not this block's: the request leaves the SM and
+    // comes back. Twice a local one, which puts it an order below a cache line
+    // and an order above nothing — the position hardware's distributed shared
+    // memory holds between shared and L2.
+    case Opcode::V_LD_CLUSTER_F32: return 16;
+
     // Off-chip. The dominant cost in any real kernel.
     case Opcode::V_LD_GLOBAL_F32:
     case Opcode::V_ST_GLOBAL_F32: return 100;
@@ -394,6 +413,7 @@ uint32_t instruction_cost(Opcode op)
     // rather than as weight on this line. S_SYNCWARP is the same argument one
     // level down.
     case Opcode::BARRIER:
+    case Opcode::BARRIER_CLUSTER:
     case Opcode::S_SYNCWARP: return 1;
 
     // Not nothing: every thread of the block is sorted and moved. Priced at a
@@ -440,6 +460,10 @@ uint32_t instruction_latency(Opcode op)
     // Shared memory is on-chip and an order below a cache hit.
     case Opcode::V_LD_SHARED_F32: return 30;
 
+    // Twice that, for the trip out of the SM and back. The point of the
+    // instruction is that this is not the 200 an L2 hit costs.
+    case Opcode::V_LD_CLUSTER_F32: return 60;
+
     // Not answered here. What a global load costs in time depends on where the
     // line was found, which is a question for the memory model — the scheduler
     // takes it from global_access_cost instead.
@@ -467,6 +491,7 @@ uint32_t instruction_latency(Opcode op)
     case Opcode::BRA:
     case Opcode::BRA_DIV:
     case Opcode::BARRIER:
+    case Opcode::BARRIER_CLUSTER:
     case Opcode::S_SYNCWARP:
     case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::RET: return 0;

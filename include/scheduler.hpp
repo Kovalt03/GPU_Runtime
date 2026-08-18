@@ -226,6 +226,10 @@ struct GridLaunch {
     // about it.
     size_t shared_bytes = 0;
 
+    // How many blocks are placed together and can read each other's shared
+    // memory. One means no cluster.
+    uint32_t cluster_size = 1;
+
     // Launches carrying the same id run in order: none of this one's blocks is
     // placed until every block of the one before it has retired. Different ids
     // are unordered with respect to each other, which is the whole of what a
@@ -426,6 +430,9 @@ private:
 
     // Every warp of the block has arrived, so let them all go.
     void release_barrier(ThreadBlock& block);
+
+    // The same question one level wider, for BARRIER_CLUSTER.
+    bool cluster_has_arrived(const ThreadBlock& block) const;
 
     // thread.pc has already been advanced past instr; branches overwrite it,
     // computing their target from instr_pc rather than from the advanced value.

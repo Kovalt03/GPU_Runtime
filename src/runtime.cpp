@@ -109,6 +109,12 @@ void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
         th.regs[REG_BLOCK_ID_X] = float(bx);
         th.regs[REG_BLOCK_ID_Y] = float(by);
         th.regs[REG_BLOCK_ID_Z] = float(bz);
+
+        // Which block of its cluster this is. Not recoverable from the block id
+        // without an integer division, and a kernel reading a neighbour's shared
+        // memory has to know which neighbour it is itself.
+        th.regs[REG_CLUSTER_RANK] =
+            float(launch.cluster_size <= 1 ? 0 : block_id % launch.cluster_size);
     }
 }
 
@@ -151,6 +157,7 @@ void MyGPURuntime::myrt_launch_async(KernelFunc kernel, const LaunchConfig& conf
     launch.grid = config.grid;
     launch.block = config.block;
     launch.shared_bytes = config.shared_bytes;
+    launch.cluster_size = config.cluster_size;
     launch.stream = stream;
 
     // Called once for the whole launch, not once per thread: every thread runs
@@ -226,6 +233,7 @@ void MyGPURuntime::drain()
         launches[i].program = &queue_[i].program;
         launches[i].shared_bytes = queue_[i].shared_bytes;
         launches[i].stream = queue_[i].stream;
+        launches[i].cluster_size = queue_[i].cluster_size;
 
         // Built as the SMs ask for them rather than all at once. A warp is 32 KB,
         // so a 256x256 launch would otherwise materialise tens of megabytes of

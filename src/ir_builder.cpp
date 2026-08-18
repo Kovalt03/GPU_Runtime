@@ -261,6 +261,11 @@ Reg<Scalar> IRBuilder::thread_z() const
     return Reg<Scalar>(REG_GLOBAL_ID_Z);
 }
 
+Reg<Scalar> IRBuilder::cluster_rank() const
+{
+    return Reg<Scalar>(REG_CLUSTER_RANK);
+}
+
 Reg<Scalar> IRBuilder::block_x() const
 {
     return Reg<Scalar>(REG_BLOCK_ID_X);
@@ -400,6 +405,18 @@ void IRBuilder::barrier()
 void IRBuilder::reorder(Reg<Scalar> key)
 {
     emit(make_reorder(key.first()));
+}
+
+void IRBuilder::barrier_cluster()
+{
+    emit(make_barrier_cluster());
+}
+
+Reg<Scalar> IRBuilder::load_cluster(Reg<Scalar> address, Reg<Scalar> rank, float offset)
+{
+    const Reg<Scalar> out = alloc<Scalar>();
+    emit(make_v_ld_cluster_f32(out.first(), address.first(), rank.first(), offset));
+    return out;
 }
 
 Label IRBuilder::label()

@@ -111,6 +111,21 @@ struct ThreadBlock {
     std::array<float, SHARED_MEM_FLOATS> shared_mem{};  // shared by all warps here
     uint32_t block_id = 0;
 
+    // The blocks of this block's cluster, in rank order, including itself.
+    //
+    // Set by the scheduler when it places a cluster and cleared when the cluster
+    // retires, so it points at blocks that are certainly resident — hardware
+    // makes the same promise, and it is why a cluster's blocks are placed and
+    // freed together rather than one at a time.
+    //
+    // Null for a block launched outside a cluster, which is then a cluster of
+    // one: rank 0 is itself and no other rank exists.
+    const std::vector<ThreadBlock*>* cluster = nullptr;
+
+    // Set when a warp reaches BARRIER_CLUSTER, so that the release can tell the
+    // two rendezvous apart — one waits for this block, the other for all of them.
+    bool at_cluster_barrier = false;
+
     // Which register the block is being regrouped by, once a warp has reached a
     // REORDER. The rendezvous is a barrier's, and this is what tells the release
     // that there is work to do at the end of it.

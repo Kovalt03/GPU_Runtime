@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <stdexcept>
 #include <string>
 #include <sys/types.h>
@@ -462,12 +463,37 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // Another block's shared memory. The cluster is a list the scheduler set when
+    // it placed the blocks together, so a rank that exists is a block that is
+    // certainly resident; a block with no cluster is a cluster of one.
+    case Opcode::V_LD_CLUSTER_F32: {
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_CLUSTER_F32");
+        const auto rank =
+            static_cast<size_t>(decode_address(thread.regs[instr.src1] * sizeof(float),
+                                               "V_LD_CLUSTER_F32 rank")) /
+            sizeof(float);
+
+        const size_t peers = block.cluster == nullptr ? 1 : block.cluster->size();
+        if (rank >= peers) {
+            throw std::runtime_error("V_LD_CLUSTER_F32: rank " + std::to_string(rank) +
+                                     " in a cluster of " + std::to_string(peers));
+        }
+        const ThreadBlock& from =
+            block.cluster == nullptr ? block : *(*block.cluster)[rank];
+        thread.regs[instr.dst] =
+            load_f32(reinterpret_cast<const uint8_t*>(from.shared_mem.data()),
+                     SHARED_MEM_BYTES, addr, "V_LD_CLUSTER_F32");
+        break;
+    }
+
     // Warp state, and handled before the lane loop is reached. Named here so
     // that -Wswitch keeps watching this switch for the next opcode. The matrix
     // multiply is there too, for the stronger reason: no lane holds enough of A
     // or B to compute anything on its own, and REORDER moves whole threads.
     case Opcode::S_CP_ASYNC_WAIT:
     case Opcode::REORDER:
+    case Opcode::BARRIER_CLUSTER:
     case Opcode::V_MMA_16X16X16_F32: break;
 
     // decode_cmp_op(instr.imm) recovers the condition. The result is written as
@@ -844,6 +870,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     }
 
     if (program[warp.pc].op == Opcode::BARRIER ||
+        program[warp.pc].op == Opcode::BARRIER_CLUSTER ||
         program[warp.pc].op == Opcode::REORDER) {
         // Every live lane has to have arrived. min-PC issue means the warp
         // reaches a barrier with only the lanes that got there; any that
@@ -878,6 +905,12 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         stats_.warp_steps += 1;
         stats_.active_lane_ops += live;
         stats_.weighted_lane_ops += live * instruction_cost(rendezvous.op);
+
+        if (rendezvous.op == Opcode::BARRIER_CLUSTER) {
+            // Which rendezvous this is, for the release: one waits for this
+            // block's warps and the other for every block of the cluster.
+            block.at_cluster_barrier = true;
+        }
 
         if (rendezvous.op == Opcode::REORDER) {
             // Which register to sort by, left for the release: the threads cannot
@@ -1367,9 +1400,45 @@ void WarpScheduler::release_barrier(ThreadBlock& block)
         regroup(block, block.reorder_key);
         block.reorder_key = ThreadBlock::NO_REORDER;
     }
+    block.at_cluster_barrier = false;
     for (Warp& warp : block.warps) {
         warp.at_barrier = false;
     }
+}
+
+// Whether every live warp of every block of the cluster has arrived.
+//
+// A block waiting at a cluster barrier cannot be released on its own account:
+// its neighbours may still be writing the shared memory it is about to read,
+// which is the whole reason the wider rendezvous exists.
+bool WarpScheduler::cluster_has_arrived(const ThreadBlock& block) const
+{
+    if (block.cluster == nullptr) {
+        return true;  // a cluster of one, and it is here
+    }
+    for (const ThreadBlock* peer : *block.cluster) {
+        bool any_live = false;
+        for (const Warp& warp : peer->warps) {
+            for (const Thread& thread : warp.threads) {
+                if (thread.active) {
+                    any_live = true;
+                    break;
+                }
+            }
+            if (any_live && !warp.at_barrier) {
+                // A live warp that has not arrived. One whose threads have all
+                // retired never will, and is not waited for.
+                bool warp_live = false;
+                for (const Thread& thread : warp.threads) {
+                    warp_live = warp_live || thread.active;
+                }
+                if (warp_live) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 void WarpScheduler::run(const Program& program, ThreadBlock& block, DeviceSpan global)
 {
@@ -1433,6 +1502,17 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                                 DeviceSpan global,
                                 std::vector<SchedulerStats>* per_launch)
 {
+    // The blocks placed together, and how many of them are still running.
+    //
+    // Held in a deque so that the addresses stay put: a block addresses its
+    // neighbours through this, and a vector reallocating underneath would leave a
+    // kernel reading a moved list.
+    struct ClusterState {
+        std::vector<ThreadBlock*> blocks;
+        uint32_t running = 0;
+    };
+    std::deque<ClusterState> clusters;
+
     struct Slot {
         std::unique_ptr<ThreadBlock> block;
         std::vector<bool> live;
@@ -1440,9 +1520,19 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         size_t cursor = 0;
         size_t launch = 0;
 
+        // Null outside a cluster. A slot whose block has finished is held until
+        // its cluster has, because a neighbour may still be reading its shared
+        // memory — hardware co-schedules a cluster for the same reason.
+        ClusterState* cluster = nullptr;
+
         bool occupied() const
         {
             return block != nullptr;
+        }
+
+        bool finished() const
+        {
+            return occupied() && remaining == 0;
         }
     };
 
@@ -1533,6 +1623,9 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
             if (p.finished() || (p.exhausted && p.peeked == nullptr)) {
                 continue;
             }
+            if (launches[i].cluster_size > 1) {
+                continue;  // placed together, by give_cluster
+            }
             if (!stream_clear(i)) {
                 continue;
             }
@@ -1573,6 +1666,103 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         return false;
     };
 
+    // A whole cluster at once, across the SMs, or not at all.
+    //
+    // The blocks have to be co-resident for one to address another's shared
+    // memory, so this looks for room for all of them before taking any. Spread
+    // over the units rather than piled on one: a cluster is a group that can talk,
+    // not a group that has to share an SM, and hardware places one across a GPC.
+    const auto give_cluster = [&](size_t i) {
+        Pending& p = pending[i];
+        const uint32_t size = launches[i].cluster_size;
+
+        std::vector<ThreadBlock*> placed;
+        std::vector<std::pair<size_t, size_t>> where;  // unit, slot
+        clusters.push_back(ClusterState{});
+        ClusterState& state = clusters.back();
+
+        for (uint32_t n = 0; n < size; ++n) {
+            if (!p.peeked) {
+                auto block = std::make_unique<ThreadBlock>();
+                if (!launches[i].next_block(*block)) {
+                    p.exhausted = true;
+                    break;
+                }
+                p.warps = static_cast<uint32_t>(block->warps.size());
+                p.peeked = std::move(block);
+            }
+
+            Unit* room = nullptr;
+            for (Unit& unit : units) {
+                if (fits(unit, i)) {
+                    room = &unit;
+                    break;
+                }
+            }
+            if (room == nullptr) {
+                break;  // the machine cannot hold the rest of it
+            }
+
+            Slot slot;
+            slot.launch = i;
+            slot.cluster = &state;
+            slot.live.assign(p.peeked->warps.size(), true);
+            slot.remaining = p.peeked->warps.size();
+            for (Warp& warp : p.peeked->warps) {
+                warp.at_barrier = false;
+                warp.ready_at = 0;
+            }
+            placed.push_back(p.peeked.get());
+            slot.block = std::move(p.peeked);
+            room->slots.push_back(std::move(slot));
+            room->warps_resident += p.warps;
+            room->shared_resident += launches[i].shared_bytes;
+            ++p.resident;
+            where.emplace_back(static_cast<size_t>(room - units.data()),
+                               room->slots.size() - 1);
+        }
+
+        if (placed.size() != size) {
+            // Nothing takes a slot unless all of it does. Undoing is cheaper than
+            // discovering halfway through a launch that a cluster is short one
+            // block and nobody can pass its barrier.
+            for (auto it = where.rbegin(); it != where.rend(); ++it) {
+                Unit& unit = units[it->first];
+                Slot& slot = unit.slots[it->second];
+                unit.warps_resident -= static_cast<uint32_t>(slot.block->warps.size());
+                unit.shared_resident -= launches[i].shared_bytes;
+                --p.resident;
+                p.peeked = std::move(slot.block);
+                unit.slots.pop_back();
+            }
+            clusters.pop_back();
+            if (placed.empty() && p.exhausted) {
+                return false;  // the grid ended on a cluster boundary
+            }
+            if (p.exhausted) {
+                throw std::runtime_error(
+                    "run_streams: the grid ends " + std::to_string(placed.size()) +
+                    " blocks into a cluster of " + std::to_string(size) +
+                    " — a clustered launch has to be a whole number of them");
+            }
+            // Room for some of it and no more. Waiting will not make the machine
+            // bigger: the blocks have to be co-resident, so this is a launch that
+            // cannot start rather than one that runs a piece at a time.
+            throw std::runtime_error(
+                "run_streams: a cluster of " + std::to_string(size) +
+                " blocks does not fit a machine holding " +
+                std::to_string(units.size() * spec_.sms.blocks_per_sm) + " at once");
+        }
+
+        state.blocks = placed;
+        state.running = size;
+        for (ThreadBlock* block : placed) {
+            block->cluster = &state.blocks;
+        }
+        loaded_any = true;
+        return true;
+    };
+
     // Breadth first: every SM gets its first block before any gets its second.
     //
     // Filling one SM to capacity and moving on looks equivalent and is not. A
@@ -1584,6 +1774,13 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         bool progress = true;
         while (progress) {
             progress = false;
+            for (size_t i = 0; i < launches.size(); ++i) {
+                if (launches[i].cluster_size > 1 && !pending[i].finished() &&
+                    !(pending[i].exhausted && pending[i].peeked == nullptr) &&
+                    stream_clear(i)) {
+                    progress = give_cluster(i) || progress;
+                }
+            }
             for (Unit& unit : units) {
                 progress = give_one(unit) || progress;
             }
@@ -1744,8 +1941,26 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                     // A warp with a result still in flight can arrive; one at a
                     // barrier cannot leave on its own. Releasing while somebody
                     // is merely late would open the barrier early.
-                    if (at_barrier && !waiting) {
+                    if (!at_barrier || waiting) {
+                        continue;
+                    }
+                    if (!slot.block->at_cluster_barrier) {
                         release_barrier(*slot.block);
+                        released_any = true;
+                        continue;
+                    }
+                    // A cluster barrier opens for all of them at once. Letting
+                    // this block through alone would take its warps out of the
+                    // arrival test its neighbours are still being weighed
+                    // against, and none of them would ever pass.
+                    if (cluster_has_arrived(*slot.block)) {
+                        if (slot.block->cluster == nullptr) {
+                            release_barrier(*slot.block);
+                        } else {
+                            for (ThreadBlock* peer : *slot.block->cluster) {
+                                release_barrier(*peer);
+                            }
+                        }
                         released_any = true;
                     }
                 }
@@ -1768,20 +1983,40 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
 
             // Retire the blocks that finished, and pull the next in.
             for (Slot& slot : unit.slots) {
-                if (slot.occupied() && slot.remaining == 0) {
-                    unit.warps_resident -=
-                        static_cast<uint32_t>(slot.block->warps.size());
-                    unit.shared_resident -= launches[slot.launch].shared_bytes;
-                    --pending[slot.launch].resident;
-                    last_block_ = std::move(slot.block);
-                    slot.live.clear();
-                    slot.cursor = 0;
+                if (!slot.finished()) {
+                    continue;
                 }
+                if (slot.cluster != nullptr) {
+                    // Counted down once, and the block stays where it is until the
+                    // last of its cluster has finished: a neighbour may still be
+                    // reading the shared memory it owns.
+                    if (slot.live.size() > 0) {
+                        --slot.cluster->running;
+                        slot.live.clear();
+                    }
+                    if (slot.cluster->running > 0) {
+                        continue;
+                    }
+                }
+                unit.warps_resident -= static_cast<uint32_t>(slot.block->warps.size());
+                unit.shared_resident -= launches[slot.launch].shared_bytes;
+                --pending[slot.launch].resident;
+                slot.block->cluster = nullptr;
+                last_block_ = std::move(slot.block);
+                slot.live.clear();
+                slot.cursor = 0;
             }
             unit.slots.erase(std::remove_if(unit.slots.begin(), unit.slots.end(),
                                             [](const Slot& s) { return !s.occupied(); }),
                              unit.slots.end());
             give_one(unit);
+            for (size_t i = 0; i < launches.size(); ++i) {
+                if (launches[i].cluster_size > 1 && !pending[i].finished() &&
+                    !(pending[i].exhausted && pending[i].peeked == nullptr) &&
+                    stream_clear(i)) {
+                    give_cluster(i);
+                }
+            }
             if (!unit.slots.empty()) {
                 anything_resident = true;
             }

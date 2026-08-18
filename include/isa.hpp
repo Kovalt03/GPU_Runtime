@@ -84,6 +84,17 @@ enum class Opcode : uint8_t {
     // charge every access the same way, and it outranks reading order.
     V_CP_ASYNC_SHARED_GLOBAL_F32,  // shared[reg[src1]] = global[reg[src0] + imm]
 
+    // Another block's shared memory, from a block in the same cluster.
+    //
+    // Hopper's distributed shared memory. src1 names which block of the cluster
+    // by its rank, and rank 0 with no cluster declared is the block's own — a
+    // lone block is a cluster of one, so a kernel written for this does not have
+    // to be written twice.
+    //
+    // The space token is the fourth, beside GLOBAL and SHARED: it is shared
+    // memory, but not this block's, and the difference is what it costs.
+    V_LD_CLUSTER_F32,  // reg[dst] = shared[reg[src0] + imm] of block reg[src1]
+
     // Read, add, write back, indivisibly, and hand the lane what was there
     // before. The fourth memory verb, and the only one whose answer depends on
     // what the other lanes are doing at the same instant.
@@ -141,6 +152,12 @@ enum class Opcode : uint8_t {
 
     // CUDA's __syncthreads().
     BARRIER,  // wait for every live warp of the block    (all operands unused)
+
+    // CUDA's cluster.sync(). One level wider: every live warp of every block in
+    // the cluster, which is what makes a block's writes safe for its neighbours
+    // to read. A block outside a cluster meets only itself here, so this is a
+    // BARRIER for it.
+    BARRIER_CLUSTER,  // wait for every live warp of the cluster
 
     // Regroup the block's threads so that lanes wanting the same thing share a
     // warp. Ada's shader execution reordering, and OptiX's optixReorder.
@@ -267,6 +284,12 @@ Instruction make_s_ballot(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_any(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_all(uint8_t dst, uint8_t src0, uint32_t participants);
 Instruction make_s_syncwarp(uint32_t participants);
+
+// address, then the rank of the block whose shared memory to read.
+Instruction make_v_ld_cluster_f32(uint8_t dst, uint8_t addr_reg, uint8_t rank_reg,
+                                  float offset = 0.0f);
+
+Instruction make_barrier_cluster();
 
 // The key is a lane register, and threads are grouped by equal keys. Anything
 // whole works: what it means is the caller's, and hardware treats it the same

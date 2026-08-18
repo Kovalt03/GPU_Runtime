@@ -419,3 +419,96 @@ TEST(Streams, AnIndirectGridMustLieInDeviceMemory)
     rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr);
     EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
 }
+
+// ---------------------------------------------------------------------------
+// Clusters — blocks placed together, and addressing each other's shared memory
+// ---------------------------------------------------------------------------
+
+TEST(Streams, ABlockReadsItsNeighboursSharedMemory)
+{
+    // What distributed shared memory is for: one block stages something and the
+    // others read it across rather than fetching it again.
+    MyGPURuntime rt = make_runtime();
+    SMConfig cfg;
+    cfg.sm_count = 4;
+    cfg.blocks_per_sm = 1;
+    rt.myrt_set_sm_config(cfg);
+
+    void* out = rt.myrt_malloc(4 * sizeof(float));
+    const size_t base = rt.myrt_device_offset(out);
+
+    // Rank 0 writes its own shared memory; everyone reads rank 0's and stores it.
+    const Program prog{
+        make_v_mov_f32(1, 0.0f),  // shared address 0
+        make_v_mov_f32(2, 7.0f),  // the value
+        make_v_cmp_f32(3, REG_CLUSTER_RANK, 1, CmpOp::GT),
+        make_bra_div(3, 2),  // ranks above 0 skip the store
+        make_v_st_shared_f32(1, 2),
+        make_barrier_cluster(),
+        make_v_mov_f32(4, 0.0f),         // rank 0
+        make_v_ld_cluster_f32(5, 1, 4),  // read rank 0's shared memory
+        make_v_mov_f32(6, 4.0f),
+        make_v_mul_f32(7, REG_CLUSTER_RANK, 6),
+        make_v_mov_f32(8, static_cast<float>(base)),
+        make_v_add_f32(7, 7, 8),
+        make_v_st_global_f32(7, 5),
+        make_ret(),
+    };
+
+    LaunchConfig config{dim3{4, 1, 1}, dim3{32, 1, 1}};
+    config.cluster_size = 4;
+    rt.myrt_launch_async(constant_kernel(prog), config, nullptr);
+    rt.myrt_wait();
+
+    const std::vector<float> back = read_back(rt, out, 4);
+    for (uint32_t rank = 0; rank < 4; ++rank) {
+        EXPECT_FLOAT_EQ(back[rank], 7.0f) << "rank " << rank << " read nothing";
+    }
+}
+
+TEST(Streams, ARankOutsideTheClusterIsRefused)
+{
+    MyGPURuntime rt = make_runtime();
+    const Program prog{
+        make_v_mov_f32(1, 0.0f),
+        make_v_mov_f32(2, 3.0f),  // rank 3 of a cluster of one
+        make_v_ld_cluster_f32(3, 1, 2),
+        make_ret(),
+    };
+    rt.myrt_launch_async(constant_kernel(prog),
+                         LaunchConfig{dim3{1, 1, 1}, dim3{32, 1, 1}}, nullptr);
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+}
+
+TEST(Streams, ALoneBlockIsAClusterOfOne)
+{
+    // A kernel written for clusters runs unchanged without one: rank 0 is itself.
+    MyGPURuntime rt = make_runtime();
+    void* out = rt.myrt_malloc(sizeof(float));
+    const size_t base = rt.myrt_device_offset(out);
+
+    rt.myrt_launch(constant_kernel(Program{
+                       make_v_mov_f32(1, 0.0f),
+                       make_v_mov_f32(2, 5.0f),
+                       make_v_st_shared_f32(1, 2),
+                       make_barrier_cluster(),
+                       make_v_ld_cluster_f32(3, 1, 1),
+                       make_v_mov_f32(4, static_cast<float>(base)),
+                       make_v_st_global_f32(4, 3),
+                       make_ret(),
+                   }),
+                   dim3{1, 1, 1}, dim3{32, 1, 1}, nullptr);
+
+    EXPECT_FLOAT_EQ(read_back(rt, out, 1)[0], 5.0f);
+}
+
+TEST(Streams, AClusterTooBigForTheMachineIsRefused)
+{
+    // The blocks have to be co-resident, so a cluster the machine cannot hold is
+    // a launch that cannot start rather than one that runs a piece at a time.
+    MyGPURuntime rt = make_runtime();
+    LaunchConfig config{dim3{8, 1, 1}, dim3{32, 1, 1}};
+    config.cluster_size = 8;  // the default machine holds one block
+    rt.myrt_launch_async(constant_kernel(Program{make_ret()}), config, nullptr);
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+}
