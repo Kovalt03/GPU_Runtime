@@ -265,3 +265,112 @@ TEST(Bvh, AMeshBuildsTheSameTreeAsItsFlattenedForm)
     EXPECT_EQ(bvh.triangle_count(), cube.triangle_count());
     EXPECT_GT(bvh.node_count(), 1u);
 }
+
+TEST(Bvh, InvertingATransformUndoesIt)
+{
+    // The whole of what a TLAS leaf does with a matrix. A wrong inverse puts an
+    // instance's geometry somewhere plausible rather than nowhere, so this is
+    // checked here rather than left to a frame comparison.
+    Float4x4 model = Float4x4::identity();
+    model.at(0, 3) = 1.5f;
+    model.at(1, 3) = -0.5f;
+    model.at(0, 0) = 0.0f;   // a rotation about z, which puts zeroes on the
+    model.at(0, 1) = -2.0f;  // diagonal and is what the pivoting is for
+    model.at(1, 0) = 0.5f;
+    model.at(1, 1) = 0.0f;
+
+    const Float4x4 back = inverse(model);
+    const Float4x4 product = model * back;
+    for (uint32_t row = 0; row < 4; ++row) {
+        for (uint32_t col = 0; col < 4; ++col) {
+            EXPECT_NEAR(product.at(row, col), row == col ? 1.0f : 0.0f, 1e-5f)
+                << "element " << row << "," << col;
+        }
+    }
+
+    EXPECT_THROW(inverse(Float4x4{}), std::runtime_error);
+}
+
+TEST(Bvh, TheUpperLevelBoundsWhereTheCopiesWent)
+{
+    // A TLAS node has to hold its instances the way a BLAS node holds its
+    // triangles, or a ray that misses it skips geometry that was there.
+    const std::vector<Float3> world = scattered_triangles(100);
+    const Bvh blas = build_bvh(world);
+
+    std::vector<Float4x4> models;
+    for (uint32_t i = 0; i < 8; ++i) {
+        Float4x4 m = Float4x4::identity();
+        m.at(0, 3) = static_cast<float>(i) * 12.0f;
+        m.at(1, 1) = 0.5f + static_cast<float>(i) * 0.1f;
+        models.push_back(m);
+    }
+
+    const Tlas tlas = build_tlas(blas, models);
+    EXPECT_EQ(tlas.instance_count(), models.size());
+    EXPECT_EQ(tlas.tree.order.size(), models.size());
+
+    // Spread this far apart, the root has to span every copy.
+    const Float3 lo = tlas.tree.bounds_min();
+    const Float3 hi = tlas.tree.bounds_max();
+    EXPECT_LT(lo.x, blas.bounds_min().x + 1e-3f);
+    EXPECT_GT(hi.x, blas.bounds_max().x + 7.0f * 12.0f - 1e-3f);
+
+    // And every instance is in exactly one leaf, permuted into place.
+    std::vector<uint32_t> covered(models.size(), 0);
+    for (uint32_t n = 0; n < tlas.tree.node_count(); ++n) {
+        const float* node = &tlas.tree.nodes[n * BVH_NODE_FLOATS];
+        const uint32_t count = static_cast<uint32_t>(node[7]);
+        for (uint32_t i = 0; i < count; ++i) {
+            ++covered[static_cast<uint32_t>(node[6]) + i];
+        }
+    }
+    for (uint32_t i = 0; i < covered.size(); ++i) {
+        EXPECT_EQ(covered[i], 1u) << "instance slot " << i;
+    }
+}
+
+TEST(Bvh, AnInstanceMatrixArrivesInverted)
+{
+    // The device transforms the ray, not the geometry, so what it is handed is
+    // world-to-object. The order matters as much as the values: the build
+    // permutes the instances, so instances[k] has to be the inverse of the model
+    // that ended up at position k, not of the k-th one the caller passed.
+    const Bvh blas = build_bvh(scattered_triangles(40));
+
+    std::vector<Float4x4> models;
+    for (uint32_t i = 0; i < 6; ++i) {
+        Float4x4 m = Float4x4::identity();
+        m.at(0, 3) = 20.0f - static_cast<float>(i) * 7.0f;  // deliberately not
+        m.at(2, 3) = static_cast<float>(i % 3) * 5.0f;      // in tree order
+        models.push_back(m);
+    }
+
+    const Tlas tlas = build_tlas(blas, models);
+    for (uint32_t slot = 0; slot < tlas.instance_count(); ++slot) {
+        const Float4x4& original = models[tlas.tree.order[slot]];
+        const float* stored = &tlas.instances[slot * TLAS_INSTANCE_FLOATS];
+
+        Float4x4 held{};
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                held.at(row, col) = stored[row * 4 + col];
+            }
+        }
+
+        const Float4x4 product = original * held;
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                EXPECT_NEAR(product.at(row, col), row == col ? 1.0f : 0.0f, 1e-4f)
+                    << "slot " << slot << ", element " << row << "," << col;
+            }
+        }
+    }
+}
+
+TEST(Bvh, AnUpperLevelOverNothingIsRefused)
+{
+    const Bvh blas = build_bvh(scattered_triangles(8));
+    EXPECT_THROW(build_tlas(blas, {}), std::runtime_error);
+    EXPECT_THROW(build_tlas(Bvh{}, {Float4x4::identity()}), std::runtime_error);
+}

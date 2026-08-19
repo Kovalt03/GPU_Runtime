@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "math3d.hpp"
 
@@ -145,6 +146,60 @@ Float4 transform(const Float4x4& a, Float3 v, float w)
 float radians(float degrees)
 {
     return degrees * (PI / 180.0f);
+}
+
+Float4x4 inverse(const Float4x4& m)
+{
+    // [m | I], reduced until the left half is the identity. Four columns of
+    // scratch rather than a cofactor expansion: the pivoting is what makes it
+    // safe on a matrix with a zero on the diagonal, which a rotation about an
+    // axis routinely has.
+    float a[4][8]{};
+    for (uint32_t row = 0; row < 4; ++row) {
+        for (uint32_t col = 0; col < 4; ++col) {
+            a[row][col] = m.at(row, col);
+        }
+        a[row][4 + row] = 1.0f;
+    }
+
+    for (uint32_t col = 0; col < 4; ++col) {
+        uint32_t pivot = col;
+        for (uint32_t row = col + 1; row < 4; ++row) {
+            if (std::fabs(a[row][col]) > std::fabs(a[pivot][col])) {
+                pivot = row;
+            }
+        }
+        if (std::fabs(a[pivot][col]) < 1e-12f) {
+            throw std::runtime_error("inverse: the matrix is singular");
+        }
+        if (pivot != col) {
+            for (uint32_t k = 0; k < 8; ++k) {
+                std::swap(a[col][k], a[pivot][k]);
+            }
+        }
+
+        const float scale = 1.0f / a[col][col];
+        for (uint32_t k = 0; k < 8; ++k) {
+            a[col][k] *= scale;
+        }
+        for (uint32_t row = 0; row < 4; ++row) {
+            if (row == col) {
+                continue;
+            }
+            const float factor = a[row][col];
+            for (uint32_t k = 0; k < 8; ++k) {
+                a[row][k] -= factor * a[col][k];
+            }
+        }
+    }
+
+    Float4x4 out{};
+    for (uint32_t row = 0; row < 4; ++row) {
+        for (uint32_t col = 0; col < 4; ++col) {
+            out.at(row, col) = a[row][4 + col];
+        }
+    }
+    return out;
 }
 
 Float4x4 look_at(Float3 eye, Float3 target, Float3 up)

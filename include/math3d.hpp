@@ -71,6 +71,18 @@ float radians(float degrees);
 // step 6 ray tracer already assumes for its camera.
 Float4x4 look_at(Float3 eye, Float3 target, Float3 up);
 
+// The inverse, by Gauss-Jordan with partial pivoting.
+//
+// General rather than the cheap affine formula, because nothing here promises a
+// matrix is affine — a caller composes what it likes, and a wrong answer from a
+// shortcut that did not hold would show up as geometry in the wrong place rather
+// than as a failure.
+//
+// Throws std::runtime_error on a singular matrix, which for a transform means an
+// instance flattened to nothing. Silently handing back garbage would put its
+// triangles anywhere.
+Float4x4 inverse(const Float4x4& m);
+
 // fov_y is in degrees, aspect is width / height. Maps the frustum onto the
 // [-1, 1] clip cube. near_z and far_z are positive distances in front of the
 // camera, despite the camera looking down -z.

@@ -51,9 +51,24 @@ inline constexpr uint32_t BVH_NODE_BYTES = BVH_NODE_FLOATS * sizeof(float);
 // more triangles once a ray arrives. Four is the usual answer and the default.
 inline constexpr uint32_t BVH_DEFAULT_LEAF = 4;
 
+// An axis-aligned box, which is what a tree is built over whatever the leaves
+// turn out to hold. Triangles reduce to one and so do whole objects.
+struct Box {
+    Float3 lo;
+    Float3 hi;
+};
+
 struct Bvh {
     // BVH_NODE_FLOATS each, root first. Uploaded as it stands.
     std::vector<float> nodes;
+
+    // Where each leaf's items came from: order[i] is the index, in the caller's
+    // list, of the item now sitting at position i. A leaf names a range of these
+    // positions, so a caller has to permute its own list to match.
+    //
+    // build_bvh does that permutation for triangles below; a tree over instances
+    // has to do it with this, its items not being something this file knows.
+    std::vector<uint32_t> order;
 
     // The triangles, permuted so that a leaf is a contiguous range rather than a
     // list of indices. Costs one reordering on the host and saves the device a
@@ -82,6 +97,65 @@ struct Bvh {
 // one.
 Bvh build_bvh(const std::vector<Float3>& world, BvhSplit split = BvhSplit::SAH,
               uint32_t leaf_size = BVH_DEFAULT_LEAF);
+
+// The same, over boxes a caller has worked out itself. What the triangle build
+// runs on underneath, and what a tree over objects needs: an instance's box is
+// its geometry's transformed, which this file has no way to compute.
+//
+// Leaves the permutation in `order` and `triangles` empty.
+Bvh build_bvh_over(const std::vector<Box>& boxes, BvhSplit split = BvhSplit::SAH,
+                   uint32_t leaf_size = BVH_DEFAULT_LEAF);
+
+// --- the second level --------------------------------------------------------
+// A tree over objects rather than over triangles.
+//
+// The lower level (a BLAS) is built once over geometry in its own space; the
+// upper one (a TLAS) is built over where the copies of it ended up. A ray walks
+// the upper tree in world space, and at a leaf it moves into the instance's
+// space and walks the lower one there.
+//
+// Moving the ray rather than the geometry is the whole trick. Transforming a
+// scene's triangles for every instance would cost a tree apiece; transforming
+// one ray costs two MATVECs, and the parameter t survives it — a hit at t in
+// object space is the hit at t in world space, provided the direction is carried
+// as a vector and left unnormalised.
+
+// Sixteen floats an instance: the world-to-object matrix and nothing else yet.
+// A material belongs here and is not here, nothing reading one.
+inline constexpr uint32_t TLAS_INSTANCE_FLOATS = 16;
+inline constexpr uint32_t TLAS_INSTANCE_BYTES = TLAS_INSTANCE_FLOATS * sizeof(float);
+
+// Where one copy of the geometry went, and how to get a ray into its space.
+struct TlasInstance {
+    // World to object. The inverse is what a ray needs; the forward matrix only
+    // ever serves to work out the box the instance occupies, which the build
+    // does once here.
+    Float4x4 inverse_model;
+};
+
+struct Tlas {
+    // Over the instances' world-space boxes. A leaf names a range of `instances`
+    // below, the build having already permuted them.
+    Bvh tree;
+
+    // Sixteen floats each, in the tree's order, ready to upload.
+    std::vector<float> instances;
+
+    uint32_t instance_count() const;
+};
+
+// Builds one over the boxes each instance's geometry lands in.
+//
+// `blas` supplies the object-space bounds, so a caller passes the tree it
+// already built rather than the geometry again. An instance's box is the AABB of
+// the eight transformed corners of that one — loose for a rotation, and the
+// standard answer, since keeping it tight would mean re-deriving bounds from
+// geometry the upper level does not read.
+//
+// Throws std::runtime_error if there are no instances or a matrix cannot be
+// inverted.
+Tlas build_tlas(const Bvh& blas, const std::vector<Float4x4>& models,
+                BvhSplit split = BvhSplit::SAH, uint32_t leaf_size = 1);
 
 // How many nodes a ray from `origin` through `direction` would visit, counted on
 // the host.

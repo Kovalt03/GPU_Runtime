@@ -272,24 +272,21 @@ Float3 Bvh::bounds_max() const
     return Float3{nodes[3], nodes[4], nodes[5]};
 }
 
-Bvh build_bvh(const std::vector<Float3>& world, BvhSplit split, uint32_t leaf_size)
+Bvh build_bvh_over(const std::vector<Box>& boxes, BvhSplit split, uint32_t leaf_size)
 {
-    if (world.empty() || world.size() % 3 != 0) {
-        throw std::runtime_error("build_bvh: " + std::to_string(world.size()) +
-                                 " vertices is not a non-empty multiple of three");
+    if (boxes.empty()) {
+        throw std::runtime_error("build_bvh_over: a tree over nothing has no root");
     }
     if (leaf_size == 0) {
-        throw std::runtime_error("build_bvh: a leaf that holds no triangles");
+        throw std::runtime_error("build_bvh_over: a leaf that holds nothing");
     }
 
-    const uint32_t count = static_cast<uint32_t>(world.size() / 3);
-    std::vector<Ref> refs(count);
-    for (uint32_t i = 0; i < count; ++i) {
+    std::vector<Ref> refs(boxes.size());
+    for (uint32_t i = 0; i < boxes.size(); ++i) {
         Ref& r = refs[i];
         r.triangle = i;
-        for (uint32_t v = 0; v < 3; ++v) {
-            r.bounds.add(world[i * 3 + v]);
-        }
+        r.bounds.add(boxes[i].lo);
+        r.bounds.add(boxes[i].hi);
         r.centroid = (r.bounds.lo + r.bounds.hi) * 0.5f;
     }
 
@@ -299,13 +296,91 @@ Bvh build_bvh(const std::vector<Float3>& world, BvhSplit split, uint32_t leaf_si
     Bvh bvh;
     bvh.nodes = std::move(builder.nodes);
     bvh.max_depth = builder.max_depth;
-    bvh.triangles.reserve(world.size());
+    bvh.order.reserve(refs.size());
     for (const Ref& r : refs) {
+        bvh.order.push_back(r.triangle);
+    }
+    return bvh;
+}
+
+Bvh build_bvh(const std::vector<Float3>& world, BvhSplit split, uint32_t leaf_size)
+{
+    if (world.empty() || world.size() % 3 != 0) {
+        throw std::runtime_error("build_bvh: " + std::to_string(world.size()) +
+                                 " vertices is not a non-empty multiple of three");
+    }
+
+    std::vector<Box> boxes(world.size() / 3);
+    for (size_t i = 0; i < boxes.size(); ++i) {
+        Bounds b;
         for (uint32_t v = 0; v < 3; ++v) {
-            bvh.triangles.push_back(world[r.triangle * 3 + v]);
+            b.add(world[i * 3 + v]);
+        }
+        boxes[i] = Box{b.lo, b.hi};
+    }
+
+    Bvh bvh = build_bvh_over(boxes, split, leaf_size);
+
+    // The permutation applied, so a leaf is a run of vertices rather than a run
+    // of indices into one.
+    bvh.triangles.reserve(world.size());
+    for (const uint32_t triangle : bvh.order) {
+        for (uint32_t v = 0; v < 3; ++v) {
+            bvh.triangles.push_back(world[triangle * 3 + v]);
         }
     }
     return bvh;
+}
+
+uint32_t Tlas::instance_count() const
+{
+    return static_cast<uint32_t>(instances.size() / TLAS_INSTANCE_FLOATS);
+}
+
+Tlas build_tlas(const Bvh& blas, const std::vector<Float4x4>& models, BvhSplit split,
+                uint32_t leaf_size)
+{
+    if (models.empty()) {
+        throw std::runtime_error("build_tlas: no instances to place");
+    }
+    if (blas.nodes.empty()) {
+        throw std::runtime_error("build_tlas: the lower level has no root");
+    }
+
+    const Float3 lo = blas.bounds_min();
+    const Float3 hi = blas.bounds_max();
+
+    // Eight corners transformed, and the box around where they land. Loose under
+    // a rotation, and the standard answer — tightening it would mean deriving
+    // bounds from geometry this level never reads.
+    std::vector<Box> boxes;
+    boxes.reserve(models.size());
+    for (const Float4x4& model : models) {
+        Bounds world;
+        for (uint32_t corner = 0; corner < 8; ++corner) {
+            const Float3 p{(corner & 1) ? hi.x : lo.x, (corner & 2) ? hi.y : lo.y,
+                           (corner & 4) ? hi.z : lo.z};
+            const Float4 t = transform(model, p, 1.0f);
+            world.add(Float3{t.x, t.y, t.z});
+        }
+        boxes.push_back(Box{world.lo, world.hi});
+    }
+
+    Tlas tlas;
+    tlas.tree = build_bvh_over(boxes, split, leaf_size);
+
+    // In the tree's order, since a leaf names a range of positions rather than a
+    // list of indices — the same trade build_bvh makes for triangles.
+    tlas.instances.reserve(tlas.tree.order.size() * TLAS_INSTANCE_FLOATS);
+    for (const uint32_t index : tlas.tree.order) {
+        const Float4x4 world_to_object = inverse(models[index]);
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                tlas.instances.push_back(world_to_object.at(row, col));
+            }
+        }
+    }
+    return tlas;
 }
 
 uint32_t nodes_visited(const Bvh& bvh, Float3 origin, Float3 direction)
