@@ -55,3 +55,7 @@ target_link_libraries(gemm_bench PRIVATE gpurt project_warnings)
 # What happens when the memory system has a ceiling.
 add_executable(bandwidth_bench bandwidth_bench.cpp)
 target_link_libraries(bandwidth_bench PRIVATE gpurt project_warnings)
+
+# The last algorithm here that was still linear in the scene.
+add_executable(bvh_bench bvh_bench.cpp)
+target_link_libraries(bvh_bench PRIVATE gpurt project_warnings)

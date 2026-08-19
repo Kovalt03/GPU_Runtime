@@ -288,6 +288,10 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
 ./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
 
+# A tree against every triangle for every pixel
+./build/benchmarks/bvh_bench                # benchmarks/result/bvh.{md,csv}
+./build/benchmarks/bvh_bench --leaf 8       # triangles a leaf may hold
+
 # What happens when the memory system has a ceiling
 ./build/benchmarks/bandwidth_bench          # benchmarks/result/bandwidth.{md,csv}
 
@@ -571,14 +575,18 @@ this project exists to measure.
 
 | Hardware | Here |
 |---|---|
-| BVH / acceleration structure | **absent** — every pixel walks every triangle, O(pixels x triangles) |
-| Traversal and intersection units | **absent** — intersection is a kernel, the same choice made for rasterisation |
+| BVH / acceleration structure | **built** — SAH or a median split, leaf size a parameter, and a stack in shared memory because an instruction names its registers immediately |
+| Traversal and intersection units | **absent** — traversal is instructions in the same kernel, the same choice made for rasterisation. So the divergence a tree causes is charged rather than hidden, which is where the interesting number is |
+| Ray reordering hardware | **absent as a unit**, present as an instruction: `REORDER` exists and the tree is the first thing here that gives it real divergence to regroup |
 | Index buffer as BLAS input | **absent** — and note it is real hardware's too: DXR and Vulkan RT both name one. What differs is when it is read, the builder consuming it once where the raster side reads it every draw |
-| Instance transforms (TLAS) | **absent** |
+| Instance transforms (TLAS) | **absent** — one tree over one flattened scene. A TLAS is a second level over instances, and instancing is not built either |
+| Wide nodes | **absent** — two children a node. Hardware fetches four or eight bounds at once to spend one cache line rather than two |
 
-The rasteriser has binning and shared-memory staging to cut its walk; the
-tracer has only the walk. That asymmetry is why `render_bench` compares it
-against `walk` and nothing else, and a BVH is what would close it.
+The tree removes 16.4x of the lane work on 4,096 triangles and the warp keeps
+2.9x of it: two adjacent pixels are two rays that leave the root for different
+children, and from there the lanes are at different pcs. Divergence goes from
+16.5% to 85.1%. That gap is the measurement worth having — it is the argument
+ray-reordering hardware exists to make, arrived at rather than assumed.
 
 ### Memory
 
@@ -670,6 +678,7 @@ gpu-runtime-sim/
 │   ├── math3d.hpp
 │   ├── half.hpp            # f16 conversion and packing, written out by hand
 │   ├── mesh.hpp            # Mesh, load_obj, ACMR scoring, Forsyth reorder
+│   ├── bvh.hpp             # a tree over triangles: SAH or median, leaf size
 │   ├── gemm.hpp            # a tiled matrix multiply, one flag a hardware feature
 │   └── pipeline/
 │       ├── types.hpp        # strides, ScreenTriangle, Fragment and ShadeFn
@@ -692,6 +701,7 @@ gpu-runtime-sim/
 │   ├── math3d.cpp
 │   ├── half.cpp
 │   ├── mesh.cpp
+│   ├── bvh.cpp
 │   ├── gemm.cpp
 │   └── pipeline/
 │       ├── raster_emit.hpp   # private: the emitters the raster kernels share,
@@ -720,6 +730,7 @@ gpu-runtime-sim/
 │   ├── test_ir_builder.cpp
 │   ├── test_math3d.cpp
 │   ├── test_mesh.cpp
+│   ├── test_bvh.cpp
 │   ├── test_gemm.cpp
 │   ├── test_pipeline.cpp
 │   ├── reference.hpp        # host oracles, built into the test target only
@@ -741,6 +752,7 @@ gpu-runtime-sim/
 │   ├── cluster_bench.cpp    # a block reading its neighbour's shared memory
 │   ├── gemm_bench.cpp       # the tiled multiply, one feature at a time
 │   ├── bandwidth_bench.cpp  # what happens when the memory system has a ceiling
+│   ├── bvh_bench.cpp        # a tree, and what SIMT takes back from it
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```

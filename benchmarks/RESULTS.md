@@ -13,6 +13,7 @@ cmake --build build -j8
 ./build/benchmarks/cache_bench      #         plus benchmarks/result/cache.{md,csv}
 ./build/benchmarks/model_bench      #         plus benchmarks/result/models.{md,csv}
 ./build/benchmarks/occupancy_bench  #         plus benchmarks/result/occupancy.{md,csv}
+./build/benchmarks/bvh_bench        #         plus benchmarks/result/bvh.{md,csv}
 ```
 
 **Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
@@ -1006,6 +1007,74 @@ Nothing stopped a kernel keeping its uniforms in global memory, and under
 `Coalesced` a warp reading one address was already one transaction. What the
 space adds is that it **cannot be anything else**: an address that varies by lane
 cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
+## A tree, and what SIMT takes back from it
+
+The ray tracer tested every triangle for every pixel. Its cost grew with the
+scene however little of it a ray could meet, and it was the last algorithm here
+still written that way.
+
+A bounding volume hierarchy removes exactly that, and the result splits in two.
+
+| Triangles | Linear | div | BVH | div | Depth | Issued | Lane work |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 30,356 | 15.4% | 44,793 | 58.9% | 4 | **0.68x** | 1.40x |
+| 64 | 109,564 | 16.5% | 101,625 | 67.2% | 6 | **1.08x** | 2.75x |
+| 256 | 425,458 | 16.6% | 317,135 | 77.8% | 9 | **1.34x** | 5.04x |
+| 1,024 | 1,688,334 | 16.6% | 889,189 | 82.6% | 11 | **1.90x** | 9.08x |
+| 4,096 | 6,723,594 | 16.5% | 2,291,905 | 85.1% | 14 | **2.93x** | 16.42x |
+
+64x32, SAH, four triangles a leaf, small triangles scattered through the view
+from a fixed seed. Unordered traversal.
+
+**The tree removes 16.42x of the work and the warp keeps 2.93x of it.** Lane work
+is what a lane actually did; issued slots are what the scheduler spent. They were
+within a few percent of each other on every route in this file until now, because
+every kernel before this one had all 32 lanes doing nearly the same thing.
+
+A tree does not. Two adjacent pixels are two rays, and two rays leave the root
+for different children almost immediately — after which the lanes are at
+different pcs and the warp issues for them separately. Divergence goes from 16.5%
+to 85.1%, and the 5.6x gap between the two columns is what that costs.
+
+**This is the argument for reordering rays**, and it is why `REORDER` exists on
+real hardware. `Regrouping the threads before they disagree` measured SER on a
+synthetic key and closed at -75% scattered, +13% coherent; this is the first
+divergence in the repository that was not put there to be measured.
+
+**A tree loses under 64 triangles.** Traversing costs about 25 instructions a
+node against 30 for an intersection, so a scene small enough to walk is cheaper
+walked. The crossing is between 16 and 64 here, and it moves with how much the
+triangles overlap.
+
+### Entering the nearer child first
+
+| Triangles | Unordered | Nearest | Ordering |
+|---:|---:|---:|---:|
+| 16 | 44,793 | 57,965 | **0.77x** |
+| 64 | 101,625 | 150,181 | **0.68x** |
+| 256 | 317,135 | 358,210 | **0.89x** |
+| 1,024 | 889,189 | 579,885 | **1.53x** |
+| 4,096 | 2,291,905 | 1,048,573 | **2.19x** |
+
+Entering the nearer child first lets the running best cut the far subtree off.
+Finding out which is nearer costs two slab tests at every interior node, paid
+whether or not the cut ever happens.
+
+**It has a crossing point, and it is not near the other one.** Below 256
+triangles the extra tests cost more than the subtrees they save; by 4,096 they
+are worth 2.19x. Which side a scene falls on is a property of the scene.
+
+Both together take 4,096 triangles from 6,723,594 issued slots to 1,048,573 —
+**6.41x** — and the tree is still the thing doing the work.
+
+**What this does not settle.** The traversal stack is one entry a level in shared
+memory, so a deeper tree takes more of the scratchpad and the occupancy that
+costs is not measured here. Nor is a wider node: two children a node is the
+simplest tree and not the one hardware builds, which fetches four or eight bounds
+at once to spend one cache line rather than two.
 
 ---
 
