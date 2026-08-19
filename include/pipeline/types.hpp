@@ -112,6 +112,40 @@ enum class InstanceTransform {
     ComposePass,
 };
 
+// --- what a vertex shader is handed ------------------------------------------
+// The vertex a pass-1 thread is working on, before anything has been done to it.
+//
+// The fragment stage got a callback first, and the reason pass 1 did not was
+// that it is short enough to write out: fifty-eight lines, half of them stores,
+// against two hundred of coverage and depth. What changes that is a stage which
+// has to *compute* a varying rather than carry one — a normal turned by a model
+// matrix, a texture coordinate generated, a position blended from a bone
+// palette. None of those is expressible by copying.
+struct Vertex {
+    // Write the position here. Object space, since pass 1 applies the matrices
+    // afterwards — a shader that wanted to skip them would have nothing to
+    // write, and pass 2 reads screen coordinates either way.
+    Reg<Vec3> out;
+
+    // Where the vertex was, as the buffer holds it.
+    Reg<Vec3> position;
+
+    // Which vertex and which instance, for a shader indexing a buffer of its
+    // own. The instance is zero on a launch that has none.
+    Reg<Scalar> index;
+    Reg<Scalar> instance;
+
+    // The attributes this launch declared, loaded and not yet stored. A shader
+    // may overwrite them, which is the difference between carrying a varying and
+    // producing one.
+    std::array<Reg<Scalar>, MAX_VARYINGS> varyings{};
+    uint32_t varying_count = 0;
+};
+
+// Emits the instructions that place a vertex. Called once as the kernel is
+// built, like everything else here.
+using VertexFn = std::function<void(IRBuilder&, const Vertex&)>;
+
 // --- shading -----------------------------------------------------------------
 // How a hit is coloured, shared by both renderers so that a frame from one can
 // be held against a frame from the other.

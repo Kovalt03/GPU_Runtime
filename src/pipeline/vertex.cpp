@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 
@@ -102,6 +103,42 @@ Program build_vertex_program(void** args)
         k.load_into(position.component(2), addr, world_base + 8.0f);
         k.set(position.component(3), 1.0f);
 
+        // The varyings, loaded before the shader rather than after the matrices,
+        // so that a shader can read them and write over them. A launch with no
+        // shader stores them straight through and nothing has moved.
+        std::array<Reg<Scalar>, MAX_VARYINGS> attributes{};
+        const Reg<Scalar> attribute_addr =
+            a.varying_count == 0
+                ? id
+                : k.add(k.constant(static_cast<float>(a.attribute_offset)),
+                        k.mul(id, k.constant(static_cast<float>(a.varying_count) *
+                                             sizeof(float))));
+        for (uint32_t i = 0; i < a.varying_count; ++i) {
+            attributes[i] = k.load(attribute_addr, static_cast<float>(i * sizeof(float)));
+        }
+
+        // The shader, if there is one. It writes where the vertex actually is,
+        // and the matrices below act on that instead of on what was loaded.
+        if (a.shade) {
+            Vertex vertex;
+            vertex.out = k.vec3();
+            vertex.position = k.vec3();
+            for (uint32_t c = 0; c < 3; ++c) {
+                k.copy_into(vertex.position.component(c), position.component(c));
+                k.copy_into(vertex.out.component(c), position.component(c));
+            }
+            vertex.index = id;
+            vertex.instance = instance;
+            vertex.varyings = attributes;
+            vertex.varying_count = a.varying_count;
+            a.shade(k, vertex);
+
+            for (uint32_t c = 0; c < 3; ++c) {
+                k.copy_into(position.component(c), vertex.out.component(c));
+            }
+            attributes = vertex.varyings;
+        }
+
         // Instanced and not composed, mvp holds the model matrix alone and the
         // view-projection follows it. This is the extra MATVEC a vertex that a
         // composition pass exists to remove.
@@ -147,19 +184,13 @@ Program build_vertex_program(void** args)
         // cannot recover it once w is gone.
         k.store(out_addr, inv_w, screen_base + 12.0f);
 
-        // The varyings, copied through. A vertex's attributes sit in a buffer of
-        // their own and land in the slots after the four above, so that pass 2
-        // reads a vertex once and has everything about it.
-        if (a.varying_count > 0) {
-            const Reg<Scalar> from = k.add(
-                k.constant(static_cast<float>(a.attribute_offset)),
-                k.mul(id,
-                      k.constant(static_cast<float>(a.varying_count) * sizeof(float))));
-            for (uint32_t i = 0; i < a.varying_count; ++i) {
-                const float at = static_cast<float>(i * sizeof(float));
-                k.store(out_addr, k.load(from, at),
-                        screen_base + static_cast<float>(SCREEN_VERTEX_BYTES) + at);
-            }
+        // The varyings, into the slots after the four above, so that pass 2 reads
+        // a vertex once and has everything about it. Loaded before the shader
+        // and stored after it: what lands here is whatever the shader left.
+        for (uint32_t i = 0; i < a.varying_count; ++i) {
+            const float at = static_cast<float>(i * sizeof(float));
+            k.store(out_addr, attributes[i],
+                    screen_base + static_cast<float>(SCREEN_VERTEX_BYTES) + at);
         }
     });
 

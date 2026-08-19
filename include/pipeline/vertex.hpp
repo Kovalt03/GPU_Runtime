@@ -33,6 +33,14 @@ struct VertexStageArgs {
     size_t attribute_offset = 0;
     uint32_t varying_count = 0;
 
+    // Emits the instructions that place a vertex, when there are any.
+    //
+    // Runs before the matrices, on the position as the buffer holds it, and
+    // writes where the vertex actually is. Empty is what every launch before
+    // this declared and the kernel it builds is the one that existed then — a
+    // load, the matrices, a store.
+    VertexFn shade;
+
     // Where the view-projection is, if it is not baked into the program.
     //
     // Zero means bake it: sixteen moves, and a program that serves one matrix.

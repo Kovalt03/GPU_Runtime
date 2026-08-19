@@ -3523,3 +3523,140 @@ TEST(Pipeline, ReorderingNeedsMoreThanOneWarpToMoveThreadsBetween)
     args.shading.mode = ShadingMode::Diffuse;
     EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
 }
+
+TEST(Pipeline, AVertexShaderMovesTheVertexBeforeTheMatricesDo)
+{
+    // Pass 1 had no callback because it is short enough to write out — fifty
+    // eight lines against two hundred of coverage and depth. What changes that
+    // is a stage which has to compute a varying rather than carry one, and a
+    // position blended from a bone palette is the first of those.
+    //
+    // The shader writes object space and the matrices act on what it wrote, so
+    // halving a position has to halve the triangle rather than move it.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+
+    const auto lit_pixels = [&](const VertexFn& shade) {
+        MyGPURuntime rt(1u << 25);
+        DeviceGeometry geometry = upload(rt, world);
+        DeviceFrame frame = allocate_frame(rt, target);
+
+        VertexStageArgs pass1;
+        pass1.view_projection = target.camera.view_projection(target.aspect());
+        pass1.world_offset = rt.myrt_device_offset(geometry.world);
+        pass1.screen_offset = rt.myrt_device_offset(geometry.screen);
+        pass1.vertex_count = geometry.vertex_count;
+        pass1.width = WIDTH;
+        pass1.height = HEIGHT;
+        pass1.shade = shade;
+        run_vertex_stage(rt, pass1);
+        rt.myrt_sync(false);
+
+        RasterStageArgs pass2;
+        pass2.screen_offset = pass1.screen_offset;
+        pass2.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+        pass2.width = WIDTH;
+        pass2.height = HEIGHT;
+        pass2.triangle_count = geometry.triangle_count;
+        run_raster_stage(rt, pass2);
+
+        const std::vector<Float3> pixels = read_back(rt, frame);
+        uint32_t lit = 0;
+        for (const Float3& pixel : pixels) {
+            lit += pixel.x + pixel.y + pixel.z > 0.01f ? 1u : 0u;
+        }
+        release(rt, frame);
+        release(rt, geometry);
+        return lit;
+    };
+
+    const uint32_t untouched = lit_pixels(nullptr);
+    ASSERT_GT(untouched, 0u) << "nothing was drawn, so nothing was compared";
+
+    const uint32_t shrunk = lit_pixels([](IRBuilder& k, const Vertex& v) {
+        const Reg<Scalar> scale = k.constant(0.4f);
+        for (uint32_t c = 0; c < 3; ++c) {
+            k.copy_into(v.out.component(c), k.mul(v.position.component(c), scale));
+        }
+    });
+    EXPECT_LT(shrunk, untouched) << "the shader did not reach the matrices";
+
+    // And a shader that writes back what it was given is the launch that has
+    // none — the same frame, reached through the callback.
+    const uint32_t passed_through = lit_pixels([](IRBuilder& k, const Vertex& v) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            k.copy_into(v.out.component(c), v.position.component(c));
+        }
+    });
+    EXPECT_EQ(passed_through, untouched);
+}
+
+TEST(Pipeline, AVertexShaderMayProduceAVaryingRatherThanCarryOne)
+{
+    // The distinction the callback exists for. Without it a varying is whatever
+    // the attribute buffer held; with it the stage can compute one, which is
+    // what a normal turned by a model matrix or a generated texture coordinate
+    // needs.
+    //
+    // Here the varying is made out of the vertex index, so the attribute buffer
+    // is not read at all and the frame still comes out coloured.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> world = shader_triangle();
+    constexpr uint32_t VARYINGS = 3;
+
+    MyGPURuntime rt(1u << 25);
+    void* geometry = rt.myrt_malloc(world.size() * sizeof(Float3));
+    void* screen = rt.myrt_malloc(world.size() * screen_vertex_bytes(VARYINGS));
+    rt.myrt_memcpy(geometry, world.data(), world.size() * sizeof(Float3),
+                   Direction::HostToDevice);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    VertexStageArgs pass1;
+    pass1.view_projection = target.camera.view_projection(target.aspect());
+    pass1.world_offset = rt.myrt_device_offset(geometry);
+    pass1.screen_offset = rt.myrt_device_offset(screen);
+    pass1.vertex_count = static_cast<uint32_t>(world.size());
+    pass1.width = WIDTH;
+    pass1.height = HEIGHT;
+    pass1.varying_count = VARYINGS;
+
+    // attribute_offset stays zero: nothing is read from it.
+    pass1.shade = [](IRBuilder& k, const Vertex& v) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            k.copy_into(v.out.component(c), v.position.component(c));
+        }
+        // One channel a vertex, from the index rather than from a buffer.
+        for (uint32_t i = 0; i < VARYINGS; ++i) {
+            const Reg<Scalar> mine =
+                k.sub(v.index, k.constant(static_cast<float>(i) - 0.5f));
+            k.copy_into(v.varyings[i], k.min(k.gt(mine, k.constant(0.0f)),
+                                             k.lt(mine, k.constant(1.0f))));
+        }
+    };
+    run_vertex_stage(rt, pass1);
+    rt.myrt_sync(false);
+
+    RasterStageArgs pass2;
+    pass2.screen_offset = pass1.screen_offset;
+    pass2.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    pass2.width = WIDTH;
+    pass2.height = HEIGHT;
+    pass2.triangle_count = 1;
+    pass2.varying_count = VARYINGS;
+    pass2.shading.mode = ShadingMode::Custom;
+    pass2.shading.shade = [](IRBuilder& k, const Fragment& f) {
+        for (uint32_t c = 0; c < 3; ++c) {
+            k.copy_into(f.out.component(c), f.varyings[c]);
+        }
+    };
+    run_raster_stage(rt, pass2);
+
+    const std::vector<Float3> pixels = read_back(rt, frame);
+    uint32_t coloured = 0;
+    for (const Float3& pixel : pixels) {
+        coloured += pixel.x + pixel.y + pixel.z > 0.01f ? 1u : 0u;
+    }
+    EXPECT_GT(coloured, 0u) << "the produced varying never reached a pixel";
+
+    release(rt, frame);
+}
