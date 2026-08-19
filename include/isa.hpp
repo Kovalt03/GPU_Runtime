@@ -53,6 +53,7 @@ enum class Opcode : uint8_t {
     // src1 are VEC4. All three start at a register index that is a multiple of
     // 4, the alignment the scheme above reserves for VEC4 and wider.
     V_MATVEC_MAT4_F32,  // reg[dst..+3] = mat4(reg[src0..+15]) * vec4(reg[src1..+3])
+    V_MATMUL_MAT4_F32,  // reg[dst..+15] = mat4(reg[src0..+15]) * mat4(reg[src1..+15])
 
     // Compare
     V_CMP_F32,  // reg[dst] = (reg[src0] OP reg[src1]) ? 1.0f : 0.0f
@@ -287,6 +288,7 @@ Instruction make_v_norm_vec3_f32(uint8_t dst, uint8_t src0);
 
 // MATRIX (MAT4)
 Instruction make_v_matvec_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1);
+Instruction make_v_matmul_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1);
 
 // CMP
 Instruction make_v_cmp_f32(uint8_t dst, uint8_t src0, uint8_t src1, CmpOp op);

@@ -597,6 +597,36 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // The same product with a matrix on the right, and the same reason for the
+    // temporary: every output reads a whole row and a whole column, so writing
+    // into dst in place would destroy operands still to be read. Composing a
+    // transform onto itself is exactly the case.
+    case Opcode::V_MATMUL_MAT4_F32: {
+        require_register_range(instr.dst, MAT4_REGISTERS, "V_MATMUL_MAT4_F32 dst");
+        require_register_range(instr.src0, MAT4_REGISTERS, "V_MATMUL_MAT4_F32 src0");
+        require_register_range(instr.src1, MAT4_REGISTERS, "V_MATMUL_MAT4_F32 src1");
+        require_register_alignment(instr.dst, 4, "V_MATMUL_MAT4_F32 dst");
+        require_register_alignment(instr.src0, 4, "V_MATMUL_MAT4_F32 src0");
+        require_register_alignment(instr.src1, 4, "V_MATMUL_MAT4_F32 src1");
+
+        const float* a = &thread.regs[instr.src0];
+        const float* b = &thread.regs[instr.src1];
+        float out[MAT4_REGISTERS];
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < 4; ++i) {
+                    sum += a[row * 4 + i] * b[i * 4 + col];
+                }
+                out[row * 4 + col] = sum;
+            }
+        }
+        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+            thread.regs[instr.dst + i] = out[i];
+        }
+        break;
+    }
+
     case Opcode::V_CMP_F32: {
         thread.regs[instr.dst] =
             compare(decode_cmp_op(instr.imm), thread.regs[instr.src0],

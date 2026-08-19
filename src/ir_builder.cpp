@@ -191,6 +191,13 @@ Reg<Vec4> IRBuilder::transform(Reg<Mat4> m, Reg<Vec4> v)
     return dst;
 }
 
+Reg<Mat4> IRBuilder::compose(Reg<Mat4> a, Reg<Mat4> b)
+{
+    const Reg<Mat4> dst = alloc<Mat4>();
+    emit(make_v_matmul_mat4_f32(dst.first(), a.first(), b.first()));
+    return dst;
+}
+
 void IRBuilder::fma(Reg<Scalar> acc, Reg<Scalar> a, Reg<Scalar> b)
 {
     // Accumulates into acc rather than allocating, matching V_FMA_F32.

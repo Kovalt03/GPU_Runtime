@@ -83,10 +83,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 43 opcodes, 0-indexed → RET == 42
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 42);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 39);
-    EXPECT_EQ(OPCODE_COUNT, 43);
+    // 44 opcodes, 0-indexed → RET == 43
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 43);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 40);
+    EXPECT_EQ(OPCODE_COUNT, 44);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -94,10 +94,11 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_MUL_F32), 0);
     EXPECT_EQ(static_cast<int>(Opcode::V_ADD_VEC3_F32), 9);
     EXPECT_EQ(static_cast<int>(Opcode::V_MATVEC_MAT4_F32), 15);
-    EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 16);
-    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 17);
-    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 18);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 29);
+    EXPECT_EQ(static_cast<int>(Opcode::V_MATMUL_MAT4_F32), 16);
+    EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 17);
+    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 18);
+    EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 19);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 30);
 }
 
 // ---------------------------------------------------------------------------
@@ -380,4 +381,12 @@ TEST(Isa, ProgramIsContiguous)
     EXPECT_EQ(&prog[2] - base, 2);
     EXPECT_EQ(
         reinterpret_cast<const char*>(&prog[1]) - reinterpret_cast<const char*>(base), 8);
+}
+
+TEST(Isa, ComposingCostsFourTransforms)
+{
+    // 4x4x4 multiply-adds against 4x4, and the ratio is the whole reason a
+    // composition pass has a crossing point rather than always winning.
+    EXPECT_EQ(instruction_cost(Opcode::V_MATMUL_MAT4_F32),
+              4 * instruction_cost(Opcode::V_MATVEC_MAT4_F32));
 }

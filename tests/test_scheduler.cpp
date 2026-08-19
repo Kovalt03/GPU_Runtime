@@ -2627,3 +2627,56 @@ TEST(Scheduler, TheQueueIsEmptyWhenALaunchBegins)
     EXPECT_EQ(f.sched.stats().memory_queue_cycles, first)
         << "the second launch did not inherit the first one's backlog";
 }
+
+TEST(Scheduler, ComposingTwoTransformsIsApplyingThemInTurn)
+{
+    // The identity a caller relies on when it folds a model matrix into a
+    // view-projection: one MATMUL then one MATVEC has to land where two MATVECs
+    // would. The crossing point between the two rests on their being
+    // interchangeable, so this is what says the choice is only about cost.
+    //
+    // Neither matrix is symmetric and they do not commute, so an operand order
+    // mistake shows rather than cancelling.
+    const float a[16] = {1.0f, 2.0f, 0.0f, 3.0f, 0.0f, 1.0f, 4.0f, 0.0f,
+                         5.0f, 0.0f, 1.0f, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    const float b[16] = {2.0f, 0.0f, 1.0f, 0.0f, 3.0f, 1.0f, 0.0f, 4.0f,
+                         0.0f, 2.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+    const float v[4] = {1.5f, -2.0f, 0.5f, 1.0f};
+
+    const auto seed = [&](Fixture& f) {
+        for (uint32_t i = 0; i < 16; ++i) {
+            f.lane(0).regs[i] = a[i];
+            f.lane(0).regs[16 + i] = b[i];
+        }
+        for (uint32_t i = 0; i < 4; ++i) {
+            f.lane(0).regs[32 + i] = v[i];
+        }
+    };
+
+    Fixture folded;
+    seed(folded);
+    folded.run(Program{make_v_matmul_mat4_f32(36, 0, 16),
+                       make_v_matvec_mat4_f32(52, 36, 32), make_ret()});
+
+    Fixture twice;
+    seed(twice);
+    twice.run(Program{make_v_matvec_mat4_f32(52, 16, 32),
+                      make_v_matvec_mat4_f32(56, 0, 52), make_ret()});
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        EXPECT_NEAR(folded.lane(0).regs[52 + i], twice.lane(0).regs[56 + i], 1e-4f)
+            << "component " << i;
+    }
+}
+
+TEST(Scheduler, ComposingRefusesOperandsItCannotRead)
+{
+    // Sixteen registers each, all three 4-aligned. A matrix starting one short
+    // of the end would read past the file, and one starting off-alignment would
+    // be a matrix the wide loads cannot produce.
+    Fixture f;
+    EXPECT_THROW(f.run(Program{make_v_matmul_mat4_f32(250, 0, 16), make_ret()}),
+                 std::runtime_error);
+    EXPECT_THROW(f.run(Program{make_v_matmul_mat4_f32(36, 1, 16), make_ret()}),
+                 std::runtime_error);
+}

@@ -45,6 +45,7 @@ std::string_view opcode_name(Opcode op)
     case Opcode::V_NORM_VEC3_F32:  return "V_NORM_VEC3_F32";
     // MATRIX (MAT4)
     case Opcode::V_MATVEC_MAT4_F32: return "V_MATVEC_MAT4_F32";
+    case Opcode::V_MATMUL_MAT4_F32: return "V_MATMUL_MAT4_F32";
     // CMP
     case Opcode::V_CMP_F32:        return "V_CMP_F32";
     // MEM
@@ -177,6 +178,11 @@ Instruction make_v_norm_vec3_f32(uint8_t dst, uint8_t src0)
 Instruction make_v_matvec_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1)
 {
     return {Opcode::V_MATVEC_MAT4_F32, dst, src0, src1, 0.0f};
+}
+
+Instruction make_v_matmul_mat4_f32(uint8_t dst, uint8_t src0, uint8_t src1)
+{
+    return {Opcode::V_MATMUL_MAT4_F32, dst, src0, src1, 0.0f};
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +398,12 @@ uint32_t instruction_cost(Opcode op)
     // Sixteen products and twelve sums.
     case Opcode::V_MATVEC_MAT4_F32: return 16;
 
+    // Four times a matrix-vector, and priced as such: 4x4x4 multiply-adds where
+    // MATVEC is 4x4. What it buys is not a discount but a place to do the work
+    // once — an instance's model matrix folded into the view-projection is one
+    // of these against an extra MATVEC at every vertex.
+    case Opcode::V_MATMUL_MAT4_F32: return 64;
+
     // 4,096 multiply-adds across 32 lanes is 128 a lane, and this is priced at an
     // eighth of that. The number is not the arithmetic: it is the claim that a
     // matrix unit retires the work about eight times faster than the lanes would
@@ -596,7 +608,8 @@ uint32_t instruction_latency(Opcode op)
     case Opcode::V_SCALE_VEC3_F32:
     case Opcode::V_DOT_VEC3_F32:
     case Opcode::V_CROSS_VEC3_F32:
-    case Opcode::V_MATVEC_MAT4_F32: return 4;
+    case Opcode::V_MATVEC_MAT4_F32:
+    case Opcode::V_MATMUL_MAT4_F32: return 4;
     }
 
     return 4;

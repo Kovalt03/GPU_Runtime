@@ -190,6 +190,11 @@ public:
 
     Reg<Vec4> transform(Reg<Mat4> m, Reg<Vec4> v);
 
+    // a * b, both MAT4. What makes composing a transform once cheaper than
+    // applying two at every vertex — and what decides where the crossing is,
+    // since this costs four of the transform above.
+    Reg<Mat4> compose(Reg<Mat4> a, Reg<Mat4> b);
+
     // accumulator += a * b, over a 16x16x16 tile, by the whole warp. In place,
     // which is what lets a K loop carry its answer in registers.
     void mma(Reg<Frag> accumulator, Reg<Frag> a, Reg<Frag> b);
