@@ -24,9 +24,9 @@ file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/output)
 add_executable(hello_shader hello_shader.cpp)
 target_link_libraries(hello_shader PRIVATE gpurt project_warnings)
 
-# A mesh bound to a skeleton, drawn once a frame and written out as an
-# animation. The last thing here a single image cannot show.
-add_executable(skinned_render skinned_render.cpp)
-target_link_libraries(skinned_render PRIVATE gpurt project_warnings)
-target_compile_definitions(skinned_render PRIVATE
+# A camera going round something: the shortest animation that shows a shape is
+# a shape, and one that needs no skeleton to go wrong in.
+add_executable(orbit orbit.cpp)
+target_link_libraries(orbit PRIVATE gpurt project_warnings)
+target_compile_definitions(orbit PRIVATE
     GPURT_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets")

@@ -40,8 +40,6 @@ add_library(gpurt STATIC
     src/half.cpp
     src/mesh.cpp
     src/bvh.cpp
-    src/skeleton.cpp
-    src/skin.cpp
     src/app_run.cpp
     src/pipeline/vertex.cpp
     src/pipeline/clip.cpp

@@ -244,9 +244,9 @@ leaving the stale binaries in place.
 # A shader of your own — read this one first
 ./build/kernels/hello_shader
 
-# A mesh bound to a skeleton, written out as an animation
-./build/kernels/skinned_render               # result/images/skinned.{gif,ppm}
-./build/kernels/skinned_render --rig <dir> --motion <dir>/walk.bvh
+# A camera going round something, written out as an animation
+./build/kernels/orbit                        # result/images/orbit_cube.gif
+./build/kernels/orbit --shape sphere
 
 # Render (PPM, no image library needed)
 ./build/kernels/ray_triangle 256 256
@@ -581,7 +581,7 @@ this project exists to measure.
 |---|---|---|
 | Input Assembler | fixed | **partly** — an index buffer is fetched and expanded, but by the raster kernel itself rather than a block ahead of it |
 | Post-transform vertex cache | fixed | **absent** — pass 1 transforms each unique vertex once, which is the saving the cache exists to make, but nothing reuses a result *within* a launch. `simulated_cache_misses` scores meshes against the cache the hardware would have |
-| Vertex shader | programmable | `build_vertex_program`, one thread per vertex, and a caller's `VertexFn` runs inside it — which is what skinning is |
+| Vertex shader | programmable | `build_vertex_program`, one thread per vertex, and a caller's `VertexFn` runs inside it |
 | Primitive assembly, clip, cull | fixed | back-face culling inside the kernel, near-plane clipping as a pass of its own, and frustum culling per instance — the last of those decides the next launch's grid, so the host never learns how much survived |
 | Rasteriser (edge functions, quad generation) | fixed | `build_raster_program`, one thread per pixel |
 | Hi-Z / early-Z | fixed | **partly** — `DepthUse::EarlyZ` and a depth prepass are built and measured; the hierarchical form is not |
@@ -678,7 +678,6 @@ gpu-runtime-sim/
 │   ├── format.sh
 │   └── test.sh
 ├── assets/                  # meshes the benchmarks and tests render
-│   ├── arm.bvh              # four joints and four frames, written by hand
 │   ├── cube.obj
 │   ├── grid.obj
 │   ├── sphere.obj
@@ -702,8 +701,6 @@ gpu-runtime-sim/
 │   ├── half.hpp            # f16 conversion and packing, written out by hand
 │   ├── mesh.hpp            # Mesh, load_obj, ACMR scoring, Forsyth reorder
 │   ├── bvh.hpp             # a tree over triangles: SAH or median, leaf size
-│   ├── skeleton.hpp        # Biovision Hierarchy — joints, channels, a pose
-│   ├── skin.hpp            # binding a mesh to one, and the shader that moves it
 │   ├── gemm.hpp            # a tiled matrix multiply, one flag a hardware feature
 │   └── pipeline/
 │       ├── types.hpp        # strides, ScreenTriangle, Fragment and ShadeFn
@@ -728,8 +725,6 @@ gpu-runtime-sim/
 │   ├── half.cpp
 │   ├── mesh.cpp
 │   ├── bvh.cpp
-│   ├── skeleton.cpp
-│   ├── skin.cpp
 │   ├── gemm.cpp
 │   └── pipeline/
 │       ├── raster_emit.hpp   # private: the emitters the raster kernels share,
@@ -745,8 +740,8 @@ gpu-runtime-sim/
 ├── kernels/
 │   ├── ppm.hpp
 │   ├── gif.hpp             # an animated GIF, LZW written out rather than linked
+│   ├── orbit.cpp           # a camera going round a cube and a sphere
 │   ├── hello_shader.cpp    # the shortest program with a shader of its own
-│   ├── skinned_render.cpp  # a skeleton, a mesh bound to it, and a GIF
 │   ├── ray_triangle.cpp
 │   ├── raster_triangle.cpp
 │   └── mesh_render.cpp     # renders an .obj down every route and compares
@@ -763,8 +758,6 @@ gpu-runtime-sim/
 │   ├── test_mesh.cpp
 │   ├── test_bvh.cpp
 │   ├── test_cull.cpp
-│   ├── test_skeleton.cpp
-│   ├── test_skin.cpp
 │   ├── test_gif.cpp
 │   ├── test_gemm.cpp
 │   ├── test_pipeline.cpp

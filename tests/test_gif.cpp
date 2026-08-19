@@ -23,6 +23,16 @@ std::vector<uint8_t> bytes_of(const std::string& path)
                                 std::istreambuf_iterator<char>());
 }
 
+std::vector<gif_detail::Rgb> palette_of(const std::vector<uint8_t>& data)
+{
+    std::vector<gif_detail::Rgb> palette;
+    for (uint32_t i = 0; i < 256; ++i) {
+        palette.push_back(
+            gif_detail::Rgb{data[13 + i * 3], data[14 + i * 3], data[15 + i * 3]});
+    }
+    return palette;
+}
+
 // The decoder the encoder is checked against. Written from the format rather
 // than from the encoder, which is the only way agreeing means anything — an
 // encoder held against its own inverse agrees with itself however wrong it is.
@@ -146,9 +156,9 @@ TEST(Gif, AnAnimationSurvivesBeingWrittenAndReadBack)
                 const bool banded = x < WIDTH / 2;
                 pixels.push_back(banded
                                      ? Float3{0.2f, 0.4f, 0.6f}
-                                     : Float3{static_cast<float>((x + frame) % 6) / 5.0f,
-                                              static_cast<float>(y % 6) / 5.0f,
-                                              static_cast<float>((x * y) % 6) / 5.0f});
+                                     : Float3{static_cast<float>((x + frame) % 3) / 2.0f,
+                                              static_cast<float>(y % 2),
+                                              static_cast<float>((x * y) % 2)});
             }
         }
         animation.push_back(pixels);
@@ -157,17 +167,23 @@ TEST(Gif, AnAnimationSurvivesBeingWrittenAndReadBack)
     const std::string path = scratch("round_trip.gif");
     write_gif(path, animation, WIDTH, HEIGHT);
 
-    const std::vector<std::vector<uint8_t>> read = decode(bytes_of(path));
+    const std::vector<uint8_t> file = bytes_of(path);
+    const std::vector<std::vector<uint8_t>> read = decode(file);
+    const std::vector<gif_detail::Rgb> palette = palette_of(file);
+
+    // The palette is built from the frames, so a pixel decodes to the nearest
+    // entry rather than to a fixed index. A handful of colours against 256 slots
+    // makes nearest exact, which is the property this rests on — and the reason
+    // the frames use a few colours rather than a gradient.
     ASSERT_EQ(read.size(), animation.size());
     for (size_t f = 0; f < animation.size(); ++f) {
         ASSERT_EQ(read[f].size(), static_cast<size_t>(WIDTH) * HEIGHT) << "frame " << f;
         for (size_t i = 0; i < read[f].size(); ++i) {
+            const gif_detail::Rgb got = palette[read[f][i]];
             const Float3& wanted = animation[f][i];
-            const uint32_t expected =
-                gif_detail::level_of(wanted.x) * GIF_LEVELS * GIF_LEVELS +
-                gif_detail::level_of(wanted.y) * GIF_LEVELS +
-                gif_detail::level_of(wanted.z);
-            ASSERT_EQ(read[f][i], expected) << "frame " << f << ", pixel " << i;
+            ASSERT_NEAR(got.r, gif_detail::byte_of(wanted.x), 2) << "frame " << f;
+            ASSERT_NEAR(got.g, gif_detail::byte_of(wanted.y), 2) << "frame " << f;
+            ASSERT_NEAR(got.b, gif_detail::byte_of(wanted.z), 2) << "frame " << f;
         }
     }
 }
@@ -181,27 +197,37 @@ TEST(Gif, ALongRunReachesTheDictionaryCeilingAndCarriesOn)
     constexpr uint32_t WIDTH = 200;
     constexpr uint32_t HEIGHT = 200;
 
+    // Four colours, so the palette reproduces them exactly and what is being
+    // checked is the compressor rather than the quantiser. What fills the
+    // dictionary is the sequence: a run length that keeps growing means every
+    // pattern is new, which is what four thousand entries are spent on.
+    const Float3 shades[4] = {Float3{0.0f, 0.0f, 0.0f}, Float3{1.0f, 0.0f, 0.0f},
+                              Float3{0.0f, 1.0f, 0.0f}, Float3{0.0f, 0.0f, 1.0f}};
     std::vector<Float3> pixels;
-    for (uint32_t i = 0; i < WIDTH * HEIGHT; ++i) {
-        // A sequence with no short repeats, so the dictionary fills.
-        const uint32_t v = (i * 2654435761u) >> 24;
-        pixels.push_back(Float3{static_cast<float>(v % 6) / 5.0f,
-                                static_cast<float>((v / 6) % 6) / 5.0f,
-                                static_cast<float>((v / 36) % 6) / 5.0f});
+    uint32_t run = 1;
+    uint32_t at = 0;
+    while (pixels.size() < static_cast<size_t>(WIDTH) * HEIGHT) {
+        for (uint32_t i = 0; i < run && pixels.size() < WIDTH * HEIGHT; ++i) {
+            pixels.push_back(shades[at % 4]);
+        }
+        ++at;
+        run = run % 37 + 1;
     }
 
     const std::string path = scratch("ceiling.gif");
     write_gif(path, {pixels}, WIDTH, HEIGHT);
 
-    const std::vector<std::vector<uint8_t>> read = decode(bytes_of(path));
+    const std::vector<uint8_t> file = bytes_of(path);
+    const std::vector<std::vector<uint8_t>> read = decode(file);
+    const std::vector<gif_detail::Rgb> palette = palette_of(file);
+
     ASSERT_EQ(read.size(), 1u);
     ASSERT_EQ(read[0].size(), static_cast<size_t>(WIDTH) * HEIGHT);
     for (size_t i = 0; i < read[0].size(); ++i) {
-        const uint32_t expected =
-            gif_detail::level_of(pixels[i].x) * GIF_LEVELS * GIF_LEVELS +
-            gif_detail::level_of(pixels[i].y) * GIF_LEVELS +
-            gif_detail::level_of(pixels[i].z);
-        ASSERT_EQ(read[0][i], expected) << "pixel " << i;
+        const gif_detail::Rgb got = palette[read[0][i]];
+        EXPECT_NEAR(got.r, gif_detail::byte_of(pixels[i].x), 2) << "pixel " << i;
+        EXPECT_NEAR(got.g, gif_detail::byte_of(pixels[i].y), 2) << "pixel " << i;
+        EXPECT_NEAR(got.b, gif_detail::byte_of(pixels[i].z), 2) << "pixel " << i;
     }
 }
 

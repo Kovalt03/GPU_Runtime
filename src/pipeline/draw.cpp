@@ -84,8 +84,9 @@ DeviceGeometry upload_positions(MyGPURuntime& rt, const std::vector<Float3>& wor
         static_cast<size_t>(geometry.vertex_count) * WORLD_VERTEX_BYTES;
     geometry.world = rt.myrt_malloc(world_bytes);
     if (stage == VertexStage::Projects) {
-        geometry.screen = rt.myrt_malloc(static_cast<size_t>(geometry.vertex_count) *
-                                         SCREEN_VERTEX_BYTES);
+        geometry.screen_bytes =
+            static_cast<size_t>(geometry.vertex_count) * SCREEN_VERTEX_BYTES;
+        geometry.screen = rt.myrt_malloc(geometry.screen_bytes);
     }
 
     std::vector<float> flat;

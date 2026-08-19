@@ -294,6 +294,20 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
     if (args.instance_count == 0) {
         throw std::runtime_error("run_vertex_stage: a draw of no instances");
     }
+
+    // A vertex is wider than the buffer expects the moment varyings are
+    // declared, and writing past it corrupts whatever was allocated next rather
+    // than failing.
+    const size_t wanted = static_cast<size_t>(args.vertex_count) * args.instance_count *
+                          screen_vertex_bytes(args.varying_count);
+    if (args.screen_bytes != 0 && wanted > args.screen_bytes) {
+        throw std::runtime_error(
+            "run_vertex_stage: " + std::to_string(args.varying_count) +
+            " varyings make a vertex " +
+            std::to_string(screen_vertex_bytes(args.varying_count)) +
+            " bytes, so this launch wants " + std::to_string(wanted) +
+            " and the buffer holds " + std::to_string(args.screen_bytes));
+    }
     if (args.instance_count > 1 && args.instance_offset == 0) {
         throw std::runtime_error(
             "run_vertex_stage: " + std::to_string(args.instance_count) +

@@ -111,6 +111,31 @@ Program build_raytrace_program(void** args)
         // one.
         const Reg<Scalar> anything_hit = k.constant(0.0f);
 
+        // What a bounce carries between turns. `accumulated` is the pixel so
+        // far; `attenuation` is how much of the next surface still reaches it,
+        // and a surface that reflects nothing sets it to zero.
+        // Allocated only when they are used. Ten registers is nothing on a walk
+        // that fits and everything on one that does not — the two-level
+        // traversal was already at the ceiling, and taking them unconditionally
+        // put it over.
+        const bool bouncing = a.bounces > 1;
+        const Reg<Vec3> accumulated =
+            bouncing ? k.constant(0.0f, 0.0f, 0.0f) : Reg<Vec3>{};
+        const Reg<Vec3> attenuation =
+            bouncing ? k.constant(1.0f, 1.0f, 1.0f) : Reg<Vec3>{};
+        const Reg<Vec3> best_normal =
+            bouncing ? k.constant(0.0f, 0.0f, 1.0f) : Reg<Vec3>{};
+        const Reg<Scalar> bounce = bouncing ? k.constant(0.0f) : Reg<Scalar>{};
+        const Label bounce_top = k.label();
+        if (bouncing) {
+            k.place(bounce_top);
+
+            // Reset for this turn. The traversal below writes them as it goes
+            // and a second turn has to start where the first did.
+            k.copy_into(best_t, k.constant(std::numeric_limits<float>::max()));
+            k.copy_into(anything_hit, k.constant(0.0f));
+        }
+
         // What the triangle loop runs over. Linear, these are the whole scene and
         // never change; traversing a tree, a leaf writes both before entering.
         //
@@ -456,6 +481,24 @@ Program build_raytrace_program(void** args)
         const Reg<Vec3> h = k.cross(dir, e2);
         const Reg<Scalar> a_dot = k.dot(e1, h);
 
+        // Which material this triangle is made of.
+        //
+        // The two buffers are parallel — a triangle is nine floats and a
+        // material index is one — so the offset into one scales onto the other
+        // by a constant, and the loop's own cursor is enough. No triangle number
+        // is kept anywhere and there is no integer division to recover one.
+        const auto per_triangle_material = [&] {
+            if (a.material_offset == 0) {
+                return material;
+            }
+            const float scale =
+                static_cast<float>(sizeof(float)) / (3 * WORLD_VERTEX_BYTES);
+            return k.load(
+                k.mul(k.sub(cursor, k.constant(static_cast<float>(a.triangles_offset))),
+                      k.constant(scale)),
+                static_cast<float>(a.material_offset));
+        };
+
         // The four exits, each written twice — the condition to leave on, and
         // the condition to have survived. Emitted through one call so the pair
         // stays in view: they are not each other's negation once NaN is in play,
@@ -571,8 +614,17 @@ Program build_raytrace_program(void** args)
                     // costs registers rather than a second pass over anything.
                     k.copy_into(best_u, u);
                     k.copy_into(best_v, v);
-                    k.copy_into(best_material, material);
+                    k.copy_into(best_material, per_triangle_material());
                     k.copy_into(anything_hit, one);
+                    if (bouncing) {
+                        // The edges the intersection already built, crossed. Not
+                        // normalised here — the bounce below does it once for
+                        // the winner rather than once per candidate.
+                        const Reg<Vec3> n = k.cross(e1, e2);
+                        for (uint32_t c = 0; c < 3; ++c) {
+                            k.copy_into(best_normal.component(c), n.component(c));
+                        }
+                    }
                 } else {
                     shade(best);
                 }
@@ -604,8 +656,14 @@ Program build_raytrace_program(void** args)
             if (deferred) {
                 blend(best_u, u);
                 blend(best_v, v);
-                blend(best_material, material);
+                blend(best_material, per_triangle_material());
                 blend(anything_hit, one);
+                if (bouncing) {
+                    const Reg<Vec3> n = k.cross(e1, e2);
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        blend(best_normal.component(c), n.component(c));
+                    }
+                }
             } else {
                 blend(best.component(0), shaded.component(0));
                 blend(best.component(1), shaded.component(1));
@@ -633,9 +691,130 @@ Program build_raytrace_program(void** args)
             k.place(done);
         }
 
+        // One turn of the walk is over. Add what this surface returns, aim at
+        // where the next one would be, and go round again.
+        if (bouncing) {
+            const Reg<Vec3> table_colour = k.vec3();
+            const Reg<Scalar> reflectivity = k.constant(0.0f);
+            const Reg<Scalar> lit = k.constant(0.0f);
+
+            // A miss leaves best_t at the ceiling it was reset to, and a point
+            // that far along the ray overflows. The attenuation is about to be
+            // zeroed either way, but zero times an infinity is a NaN and that
+            // spreads into the pixel — so the distance is clamped rather than
+            // the arithmetic being skipped, which would split the warp.
+            const Reg<Scalar> reach = k.min(best_t, k.constant(1.0e6f));
+            {
+                IRBuilder::Scratch scope(k);
+                const Reg<Scalar> entry = k.mul(
+                    best_material, k.constant(static_cast<float>(4 * sizeof(float))));
+                const Reg<Vec3> loaded =
+                    k.load_vec3(entry, static_cast<float>(a.material_table_offset));
+                const Reg<Scalar> r =
+                    k.load(entry, static_cast<float>(a.material_table_offset + 12));
+
+                // Two-sided, because a mesh built by concatenating boxes has no
+                // winding worth trusting and a face turned away should be dim
+                // rather than black.
+                // Directional, not a point light: the position is read as a
+                // direction and the hit point never enters the arithmetic.
+                //
+                // A point light needs one, and a ray that met nothing has none —
+                // only the ceiling best_t was reset to. Taking a point that far
+                // out and normalising towards a light beside the scene loses
+                // every digit and returns a NaN, which survives being multiplied
+                // by an attenuation of zero and reaches the pixel. A walk that
+                // bounces wants a light at infinity anyway.
+                const Reg<Vec3> n = k.normalize(best_normal);
+                const Reg<Scalar> raw = k.dot(n, k.normalize(light));
+                const Reg<Scalar> lambert = k.max(raw, k.sub(zero, raw));
+
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(table_colour.component(c), loaded.component(c));
+                }
+                k.copy_into(reflectivity, r);
+
+                // Ambient and the lit term, so nothing is wholly black.
+                k.copy_into(lit, k.constant(0.3f));
+                k.fma(lit, lambert, k.constant(0.7f));
+            }
+
+            // A miss returns the sky and ends the walk: nothing beyond it can
+            // add anything, which zeroing the attenuation says without a branch.
+            const Reg<Scalar> missed = k.sub(one, anything_hit);
+            for (uint32_t c = 0; c < 3; ++c) {
+                const float sky = c == 2 ? 0.35f : (c == 1 ? 0.25f : 0.18f);
+
+                // hit  : attenuation * colour * lit * (1 - reflectivity)
+                // miss : attenuation * sky
+                const Reg<Scalar> surface = k.mul(k.mul(table_colour.component(c), lit),
+                                                  k.sub(one, reflectivity));
+                const Reg<Scalar> gives =
+                    k.add(k.mul(anything_hit, surface), k.mul(missed, k.constant(sky)));
+                k.fma(accumulated.component(c), attenuation.component(c), gives);
+
+                // What the next turn may still contribute. A miss leaves nothing.
+                k.copy_into(
+                    attenuation.component(c),
+                    k.mul(attenuation.component(c), k.mul(anything_hit, reflectivity)));
+            }
+
+            {
+                IRBuilder::Scratch scope(k);
+
+                // d - 2 (d . n) n, and the origin lifted off the surface so the
+                // next walk does not meet the triangle it just left.
+                const Reg<Vec3> n = k.normalize(best_normal);
+                const Reg<Vec3> point = k.add(origin, k.scale(dir, reach));
+                const Reg<Scalar> along = k.dot(dir, n);
+                const Reg<Vec3> reflected = k.sub(dir, k.scale(n, k.add(along, along)));
+
+                // Off the surface along the reflected ray rather than along the
+                // normal: a grazing bounce leaves at a shallow angle, and the
+                // normal would push it through a neighbouring face.
+                const Reg<Vec3> lifted =
+                    k.add(point, k.scale(k.normalize(reflected), k.constant(1e-3f)));
+
+                // A ray that met nothing keeps the ray it had. Aiming it from
+                // where a miss "ended" would put the origin a million units out
+                // and trace from there — the intersection arithmetic loses every
+                // digit it has at that distance and hands back NaN, which then
+                // survives being multiplied by an attenuation of zero.
+                //
+                // Blended rather than branched: the remaining turns of a
+                // finished walk cost traversal either way, and splitting the
+                // warp on "did this pixel finish" is the cost this whole
+                // arrangement avoids.
+                for (uint32_t c = 0; c < 3; ++c) {
+                    const Reg<Scalar> next_origin =
+                        k.add(origin.component(c),
+                              k.mul(anything_hit,
+                                    k.sub(lifted.component(c), origin.component(c))));
+                    const Reg<Scalar> next_dir =
+                        k.add(dir.component(c),
+                              k.mul(anything_hit,
+                                    k.sub(reflected.component(c), dir.component(c))));
+                    k.copy_into(origin.component(c), next_origin);
+                    k.copy_into(dir.component(c), next_dir);
+                    k.copy_into(inv_dir.component(c), k.rcp(next_dir));
+                    k.copy_into(world_inv.component(c), inv_dir.component(c));
+                    k.copy_into(world_origin.component(c), origin.component(c));
+                    k.copy_into(world_dir.component(c), dir.component(c));
+                }
+            }
+
+            k.fma(bounce, one, one);
+            k.branch_to(bounce_top,
+                        k.lt(bounce, k.constant(static_cast<float>(a.bounces))));
+
+            for (uint32_t c = 0; c < 3; ++c) {
+                k.copy_into(best.component(c), accumulated.component(c));
+            }
+        }
+
         // The shading, once the traversal is over and everything a shader wants
         // is in four registers.
-        if (deferred) {
+        if (deferred && !bouncing) {
             if (a.shade_when == ShadeWhen::DeferredReordered) {
                 // A rendezvous, so it belongs exactly here: every thread of the
                 // block has finished traversing and none has started shading.
@@ -696,6 +875,26 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
         throw std::runtime_error(
             "run_raytrace_stage: reordering moves threads between the warps of a "
             "block, and a block one row tall is one warp — raise block_rows");
+    }
+    if (args.bounces == 0) {
+        throw std::runtime_error("run_raytrace_stage: a walk of no bounces");
+    }
+    if (args.bounces > 1) {
+        if (args.shade_when != ShadeWhen::Deferred) {
+            throw std::runtime_error(
+                "run_raytrace_stage: a bounce carries the hit past the traversal, "
+                "which is what ShadeWhen::Deferred means — set it");
+        }
+        if (args.material_offset == 0 || args.material_table_offset == 0) {
+            throw std::runtime_error(
+                "run_raytrace_stage: bouncing needs a material a triangle and a "
+                "table to look it up in");
+        }
+        if (args.traversal == Traversal::Tlas) {
+            throw std::runtime_error(
+                "run_raytrace_stage: a second level and a second bounce do not "
+                "fit the register file together — one tree at a time");
+        }
     }
     if (args.shade_when != ShadeWhen::Inline &&
         args.shading.mode == ShadingMode::Diffuse) {

@@ -184,6 +184,30 @@ struct RaytraceStageArgs {
     // is six more registers carried through the whole traversal.
     ShadeWhen shade_when = ShadeWhen::Inline;
 
+    // How many times a ray may turn at a surface before the walk gives up.
+    //
+    // One is the primary ray alone, which is every figure taken before this
+    // existed. More than one is what a ray tracer is for and what a rasteriser
+    // cannot do at all: a reflection is the same traversal again from where the
+    // last one stopped, and there is no screen-space stand-in for it.
+    //
+    // Every bounce runs whether or not it can contribute — a surface that
+    // reflects nothing leaves the attenuation at zero and the remaining bounces
+    // add nothing. Branching out would save the traversal and split the warp on
+    // a condition that differs per pixel, which is the trade emit_keep makes for
+    // coverage, made the same way.
+    uint32_t bounces = 1;
+
+    // Four floats a material: a colour and how much of the light it returns
+    // along the mirror direction. A triangle's material index sits in a buffer
+    // beside the triangles, one float each.
+    //
+    // Indexed from the cursor the loop already has rather than from a triangle
+    // number it does not: the two buffers are parallel, so the offset from one
+    // scales onto the other by a constant the host can work out.
+    size_t material_offset = 0;
+    size_t material_table_offset = 0;
+
     // How many rows of pixels a block covers.
     //
     // One is what every figure in benchmarks/ was taken on, and it means a block

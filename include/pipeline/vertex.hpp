@@ -41,6 +41,12 @@ struct VertexStageArgs {
     // load, the matrices, a store.
     VertexFn shade;
 
+    // How large the screen buffer is, when a caller knows. Zero means unchecked,
+    // which is what every launch declaring no varyings can afford — the buffer
+    // and the vertex are the same four floats then, and there is nothing to get
+    // wrong.
+    size_t screen_bytes = 0;
+
     // Where the view-projection is, if it is not baked into the program.
     //
     // Zero means bake it: sixteen moves, and a program that serves one matrix.

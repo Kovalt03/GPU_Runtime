@@ -206,6 +206,13 @@ struct DeviceGeometry {
     void* tlas_instances = nullptr;
     uint32_t tlas_depth = 0;
 
+    // How large the screen buffer actually is. A launch declaring varyings writes
+    // a wider vertex than the four floats this reserves, and the overrun lands
+    // in whatever was allocated next — the framebuffer, in the run that found
+    // it, three rows of which came out holding raw float bytes. run_vertex_stage
+    // refuses rather than writing past it.
+    size_t screen_bytes = 0;
+
     uint32_t vertex_count = 0;
     uint32_t triangle_count = 0;
 
