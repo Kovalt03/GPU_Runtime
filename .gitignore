@@ -7,7 +7,7 @@ compile_commands.json
 .cache/
 
 # Rendered images and accumulated runs — only .gitkeep is tracked
-benchmarks/result/*
-!benchmarks/result/.gitkeep
+test/benchmark/output/*
+!test/benchmark/output/.gitkeep
 
 .DS_Store

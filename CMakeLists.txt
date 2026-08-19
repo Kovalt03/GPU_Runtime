@@ -28,33 +28,33 @@ target_compile_options(project_warnings INTERFACE
 # the kernels and the benchmark link this and add a main().
 # ---------------------------------------------------------------------------
 add_library(gpurt STATIC
-    src/gpu_spec.cpp
-    src/isa.cpp
-    src/memory.cpp
-    src/thread.cpp
-    src/scheduler.cpp
-    src/runtime.cpp
-    src/ir_builder.cpp
-    src/math3d.cpp
-    src/gemm.cpp
-    src/half.cpp
-    src/mesh.cpp
-    src/bvh.cpp
-    src/app_run.cpp
-    src/pipeline/vertex.cpp
-    src/pipeline/clip.cpp
-    src/pipeline/cull.cpp
-    src/pipeline/swap_chain.cpp
-    src/pipeline/draw.cpp
-    src/pipeline/raster.cpp
-    src/pipeline/raster_tiled.cpp
-    src/pipeline/raytrace.cpp
+    gpurt/gpu_spec.cpp
+    gpurt/isa.cpp
+    gpurt/memory.cpp
+    gpurt/thread.cpp
+    gpurt/scheduler.cpp
+    gpurt/runtime.cpp
+    gpurt/ir_builder.cpp
+    gpurt/math3d.cpp
+    gpurt/gemm.cpp
+    gpurt/half.cpp
+    gpurt/mesh.cpp
+    gpurt/bvh.cpp
+    gpurt/app_run.cpp
+    gpurt/pipeline/vertex.cpp
+    gpurt/pipeline/clip.cpp
+    gpurt/pipeline/cull.cpp
+    gpurt/pipeline/swap_chain.cpp
+    gpurt/pipeline/draw.cpp
+    gpurt/pipeline/raster.cpp
+    gpurt/pipeline/raster_tiled.cpp
+    gpurt/pipeline/raytrace.cpp
 )
-target_include_directories(gpurt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(gpurt PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/gpurt)
 target_link_libraries(gpurt PRIVATE project_warnings)
 
 enable_testing()
-add_subdirectory(tests)
+add_subdirectory(test/unit)
 
 # ---------------------------------------------------------------------------
 # Formatting — `cmake --build build --target format` / `format-check`.
@@ -74,5 +74,5 @@ add_custom_target(format-check
     VERBATIM
 )
 
-add_subdirectory(kernels)
-add_subdirectory(benchmarks)
+add_subdirectory(apps)
+add_subdirectory(test/benchmark)

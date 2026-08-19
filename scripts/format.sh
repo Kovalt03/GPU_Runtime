@@ -27,9 +27,9 @@ find_clang_format() {
 CLANG_FORMAT="$(find_clang_format)"
 
 # Only our own sources — build/ holds fetched dependencies.
-# Later stages add kernels/ and benchmarks/, so skip directories not there yet.
+# Skip a directory that is not there, so a partial checkout still formats.
 SEARCH_DIRS=()
-for d in include src tests kernels benchmarks; do
+for d in gpurt apps test; do
     [[ -d "$ROOT/$d" ]] && SEARCH_DIRS+=("$ROOT/$d")
 done
 

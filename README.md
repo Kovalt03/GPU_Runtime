@@ -16,7 +16,7 @@ primary — an intersection error shows up as a wrong gradient rather than
 disappearing into flat shading.
 
 ```
-$ ./build/kernels/ray_triangle 256 256
+$ ./build/apps/ray_triangle 256 256
 rendering 256x256 — 65536 pixels, 2048 blocks of 32 threads
 [STATS] divergence: 2.6%, throughput: 0.20 GIOPS
 ```
@@ -40,7 +40,7 @@ grows only with the perimeter.
                        │  Mesh · Camera · two launches
   ┌────────────────────▼─────────────────────────────┐
   │              Graphics Pipeline                   │
-  │       include/pipeline/ · include/math3d.hpp     │
+  │       gpurt/pipeline/ · include/math3d.hpp     │
   │   vertex stage → tile binning → raster stage     │
   │   host-side Float3 / Float4x4, staged in shared  │
   └────────────────────┬─────────────────────────────┘
@@ -123,7 +123,7 @@ Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
 
 `F32` rather than `FP32` because that is the mnemonic standard — PTX `add.f32`,
 AMD `v_add_f32`, WGSL / SPIR-V / Rust `f32`. The rule is machine-checked by
-`OpcodeNamesFollowScheme` in `tests/test_isa.cpp`, so it cannot drift as
+`OpcodeNamesFollowScheme` in `test/unit/test_isa.cpp`, so it cannot drift as
 opcodes are added.
 
 ---
@@ -135,7 +135,7 @@ reads the frame back. What makes it a *program* rather than a configuration is
 the fragment shader: a C++ callable that runs once, as the kernel is assembled,
 and emits instructions.
 
-`kernels/hello_shader.cpp` is the whole of it in about eighty lines. The two
+`apps/hello_shader.cpp` is the whole of it in about eighty lines. The two
 parts that are not bookkeeping:
 
 ```cpp
@@ -242,76 +242,76 @@ leaving the stale binaries in place.
 
 ```bash
 # A shader of your own — read this one first
-./build/kernels/hello_shader
+./build/apps/hello_shader
 
 # A camera going round something, written out as an animation
-./build/kernels/orbit                        # result/images/orbit_cube.gif
-./build/kernels/orbit --shape sphere
+./build/apps/orbit                        # result/images/orbit_cube.gif
+./build/apps/orbit --shape sphere
 
 # Render (PPM, no image library needed)
-./build/kernels/ray_triangle 256 256
-sips -s format png benchmarks/result/result.ppm --out result.png   # macOS
-convert benchmarks/result/result.ppm result.png                    # ImageMagick
+./build/apps/ray_triangle 256 256
+sips -s format png test/benchmark/output/result.ppm --out result.png   # macOS
+convert test/benchmark/output/result.ppm result.png                    # ImageMagick
 
 # Benchmarks
 ./build/benchmarks/divergence_bench
-./build/benchmarks/divergence_bench --csv   # benchmarks/result/divergence.csv
+./build/benchmarks/divergence_bench --csv   # test/benchmark/output/divergence.csv
 
 # Four routes to one frame — walk, tiled, shared memory, ray tracer
-./build/benchmarks/render_bench             # benchmarks/result/render_bench.{md,csv}
+./build/benchmarks/render_bench             # test/benchmark/output/render_bench.{md,csv}
 
 # An .obj down every route, compared pixel for pixel
-./build/kernels/mesh_render assets/sphere.obj
+./build/apps/mesh_render assets/sphere.obj
 
 # Summing a warp: shared memory against the lane exchange
-./build/benchmarks/reduction_bench          # benchmarks/result/reduction.{md,csv}
+./build/benchmarks/reduction_bench          # test/benchmark/output/reduction.{md,csv}
 
 # A cache against a growing working set
-./build/benchmarks/cache_bench              # benchmarks/result/cache.{md,csv}
+./build/benchmarks/cache_bench              # test/benchmark/output/cache.{md,csv}
 
 # The flat model's conclusions, put to the other cost models
-./build/benchmarks/model_bench              # benchmarks/result/models.{md,csv}
+./build/benchmarks/model_bench              # test/benchmark/output/models.{md,csv}
 
 # What several SMs buy, and what stops a kernel from using them
-./build/benchmarks/occupancy_bench          # benchmarks/result/occupancy.{md,csv}
+./build/benchmarks/occupancy_bench          # test/benchmark/output/occupancy.{md,csv}
 
 # What a second queue buys, and a grid the host never learns
-./build/benchmarks/stream_bench             # benchmarks/result/stream.{md,csv}
+./build/benchmarks/stream_bench             # test/benchmark/output/stream.{md,csv}
 
 # A copy the warp does not wait for, on its own and in a renderer
-./build/benchmarks/async_bench              # benchmarks/result/async.{md,csv}
+./build/benchmarks/async_bench              # test/benchmark/output/async.{md,csv}
 
 # One instruction against 4,096 multiply-adds
-./build/benchmarks/mma_bench                # benchmarks/result/mma.{md,csv}
+./build/benchmarks/mma_bench                # test/benchmark/output/mma.{md,csv}
 
 # What regrouping a block's threads is worth, and when it is a tax
-./build/benchmarks/ser_bench                # benchmarks/result/ser.{md,csv}
+./build/benchmarks/ser_bench                # test/benchmark/output/ser.{md,csv}
 
 # A block reading its neighbour's shared memory
-./build/benchmarks/cluster_bench            # benchmarks/result/cluster.{md,csv}
+./build/benchmarks/cluster_bench            # test/benchmark/output/cluster.{md,csv}
 
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
-./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
+./build/benchmarks/gemm_bench               # test/benchmark/output/gemm.{md,csv}
 
 # The device deciding how much to draw
-./build/benchmarks/cull_bench                # benchmarks/result/cull.{md,csv}
+./build/benchmarks/cull_bench                # test/benchmark/output/cull.{md,csv}
 ./build/benchmarks/cull_bench --machine machines/four-sm.spec
 
 # Reordering the threads, on divergence the scene put there
-./build/benchmarks/material_bench            # benchmarks/result/material.{md,csv}
+./build/benchmarks/material_bench            # test/benchmark/output/material.{md,csv}
 
 # One tree over the copies, or one over all of them
-./build/benchmarks/tlas_bench                # benchmarks/result/tlas.{md,csv}
+./build/benchmarks/tlas_bench                # test/benchmark/output/tlas.{md,csv}
 
 # Where an instance's model matrix meets the view-projection
-./build/benchmarks/instance_bench            # benchmarks/result/instance.{md,csv}
+./build/benchmarks/instance_bench            # test/benchmark/output/instance.{md,csv}
 
 # A tree against every triangle for every pixel
-./build/benchmarks/bvh_bench                # benchmarks/result/bvh.{md,csv}
+./build/benchmarks/bvh_bench                # test/benchmark/output/bvh.{md,csv}
 ./build/benchmarks/bvh_bench --leaf 8       # triangles a leaf may hold
 
 # What happens when the memory system has a ceiling
-./build/benchmarks/bandwidth_bench          # benchmarks/result/bandwidth.{md,csv}
+./build/benchmarks/bandwidth_bench          # test/benchmark/output/bandwidth.{md,csv}
 
 # Any of them on another machine — machines/ holds the files
 ./build/benchmarks/render_bench --machine machines/a100.spec
@@ -550,13 +550,13 @@ Every figure above is reproducible from a committed scene, and each names the
 tool that produced it: the frame-level tables come from
 `./build/benchmarks/render_bench`, which defines its scenes in code and drives
 the same routes the tests call; the per-pass index-buffer figures come from
-`./build/kernels/mesh_render` reading `assets/`, because the draw routes clear
+`./build/apps/mesh_render` reading `assets/`, because the draw routes clear
 the counters between passes and a caller otherwise reads pass 2 alone; the ACMR
 numbers come from `simulated_cache_misses`, which scores a mesh rather than
 running one; the reduction comes from `./build/benchmarks/reduction_bench`.
 
 Both renderers take their camera from one `DrawTarget`, so a comparison between
-them cannot be of two different views. `benchmarks/RESULTS.md` carries the full
+them cannot be of two different views. `test/benchmark/RESULTS.md` carries the full
 tables, the method, and a prediction about divergence that the measurements
 contradicted.
 
@@ -670,121 +670,59 @@ the sharpest figure in this repository rests on.
 gpu-runtime-sim/
 ├── .clang-format
 ├── CMakeLists.txt
-├── docs/
-│   └── triangle.png
-├── scripts/
-│   ├── build.sh
-│   ├── check.sh
-│   ├── format.sh
-│   └── test.sh
+├── scripts/                 # build / test / bench / format / check
 ├── assets/                  # meshes the benchmarks and tests render
-│   ├── cube.obj
-│   ├── grid.obj
-│   ├── sphere.obj
-│   └── tetrahedron.obj
 ├── machines/                # a machine a benchmark can be pointed at
-│   ├── default.spec
-│   ├── one-sm.spec
-│   ├── four-sm.spec
-│   ├── v100.spec
-│   └── a100.spec
-├── include/
-│   ├── app_run.hpp         # --out and run directories, shared by the executables
-│   ├── gpu_spec.hpp        # the machine in one place: SMs, caches, prices
-│   ├── isa.hpp
-│   ├── memory.hpp
-│   ├── thread.hpp
-│   ├── scheduler.hpp
-│   ├── runtime.hpp
-│   ├── ir_builder.hpp
-│   ├── math3d.hpp
-│   ├── half.hpp            # f16 conversion and packing, written out by hand
-│   ├── mesh.hpp            # Mesh, load_obj, ACMR scoring, Forsyth reorder
-│   ├── bvh.hpp             # a tree over triangles: SAH or median, leaf size
-│   ├── gemm.hpp            # a tiled matrix multiply, one flag a hardware feature
-│   └── pipeline/
-│       ├── types.hpp        # strides, ScreenTriangle, Fragment and ShadeFn
-│       ├── vertex.hpp
-│       ├── raster.hpp
-│       ├── raster_tiled.hpp
-│       ├── raytrace.hpp
-│       ├── clip.hpp         # near-plane clipping, compacted with an atomic
-│       ├── cull.hpp         # frustum culling, and the grid the draw after it reads
-│       ├── swap_chain.hpp   # two frames, and a clear that overlaps the draw
-│       └── draw.hpp          # the routes, each taking a mesh or a vertex list
-├── src/
-│   ├── app_run.cpp
-│   ├── gpu_spec.cpp
-│   ├── isa.cpp
-│   ├── memory.cpp
-│   ├── thread.cpp
-│   ├── scheduler.cpp
-│   ├── runtime.cpp
-│   ├── ir_builder.cpp
-│   ├── math3d.cpp
-│   ├── half.cpp
-│   ├── mesh.cpp
-│   ├── bvh.cpp
-│   ├── gemm.cpp
-│   └── pipeline/
-│       ├── raster_emit.hpp   # private: the emitters the raster kernels share,
-│       │                     #   including the branch/blend the flag selects
-│       ├── draw.cpp          # the routes end to end, shared with the tests
-│       ├── vertex.cpp
-│       ├── raster.cpp
-│       ├── raster_tiled.cpp
-│       ├── raytrace.cpp
-│       ├── clip.cpp
-│       ├── cull.cpp
-│       └── swap_chain.cpp
-├── kernels/
-│   ├── ppm.hpp
-│   ├── gif.hpp             # an animated GIF, LZW written out rather than linked
-│   ├── orbit.cpp           # a camera going round a cube and a sphere
-│   ├── hello_shader.cpp    # the shortest program with a shader of its own
-│   ├── ray_triangle.cpp
-│   ├── raster_triangle.cpp
-│   └── mesh_render.cpp     # renders an .obj down every route and compares
-├── tests/
-│   ├── CMakeLists.txt
-│   ├── test_isa.cpp
-│   ├── test_memory.cpp
-│   ├── test_thread.cpp
-│   ├── test_scheduler.cpp
-│   ├── test_streams.cpp
-│   ├── test_runtime.cpp
-│   ├── test_ir_builder.cpp
-│   ├── test_math3d.cpp
-│   ├── test_mesh.cpp
-│   ├── test_bvh.cpp
-│   ├── test_cull.cpp
-│   ├── test_gif.cpp
-│   ├── test_gemm.cpp
-│   ├── test_pipeline.cpp
-│   ├── reference.hpp        # host oracles, built into the test target only
-│   └── reference.cpp
-├── benchmarks/
-│   ├── CMakeLists.txt
-│   ├── RESULTS.md
-│   ├── scenes.hpp           # the scenes render_bench and model_bench share
-│   ├── divergence_bench.cpp
-│   ├── render_bench.cpp     # generates the measurement tables in RESULTS.md
-│   ├── reduction_bench.cpp  # summing a warp, two ways
-│   ├── cache_bench.cpp      # a cache against a working set that outgrows it
-│   ├── model_bench.cpp      # the flat model's conclusions under the others
-│   ├── occupancy_bench.cpp  # what several SMs buy, and what caps them
-│   ├── stream_bench.cpp     # a second queue, and a grid the host never learns
-│   ├── async_bench.cpp      # a copy the warp does not wait for
-│   ├── mma_bench.cpp        # one instruction against 4,096 multiply-adds
-│   ├── ser_bench.cpp        # regrouping a block's threads, and when it taxes
-│   ├── cluster_bench.cpp    # a block reading its neighbour's shared memory
-│   ├── gemm_bench.cpp       # the tiled multiply, one feature at a time
-│   ├── bandwidth_bench.cpp  # what happens when the memory system has a ceiling
-│   ├── bvh_bench.cpp        # a tree, and what SIMT takes back from it
-│   ├── instance_bench.cpp   # where a model matrix meets the view-projection
-│   ├── tlas_bench.cpp       # one tree over the copies, or one over all of them
-│   ├── material_bench.cpp   # reordering, on divergence the scene put there
-│   ├── cull_bench.cpp       # the device deciding how much to draw
-│   └── result/              # every run writes here, one directory per run
-│       └── .gitkeep
+│   ├── default.spec  one-sm.spec  four-sm.spec  v100.spec  a100.spec
+├── gpurt/                   # the library: a header and its source side by side
+│   ├── isa.hpp / .cpp           Opcode, Instruction, Program
+│   ├── memory.hpp / .cpp        host and device, separate address spaces
+│   ├── thread.hpp / .cpp        Thread, Warp, ThreadBlock
+│   ├── scheduler.hpp / .cpp     SMs, residency, divergence, the cost model
+│   ├── runtime.hpp / .cpp       malloc / memcpy / launch / stream / sync
+│   ├── ir_builder.hpp / .cpp    typed registers, branch patching
+│   ├── gpu_spec.hpp / .cpp      the machine in one place
+│   ├── app_run.hpp / .cpp       --out and run directories
+│   ├── math3d.hpp / .cpp        Float3, Float4x4, Camera
+│   ├── half.hpp / .cpp          f16 conversion, written out by hand
+│   ├── mesh.hpp / .cpp          load_obj, ACMR scoring, Forsyth reorder
+│   ├── bvh.hpp / .cpp           a tree over triangles, and one over instances
+│   ├── gemm.hpp / .cpp          a tiled matrix multiply
+│   └── pipeline/                the graphics layer, a header a stage
+│       ├── types.hpp            strides, Fragment, Vertex, the callbacks
+│       ├── vertex.*             pass 1
+│       ├── raster.*             pass 2
+│       ├── raster_tiled.*       tile binning and shared-memory staging
+│       ├── raster_emit.hpp      private: what the raster kernels share
+│       ├── raytrace.*           traversal, bounces, deferred shading
+│       ├── clip.*               near-plane clipping
+│       ├── cull.*               frustum culling and the grid it writes
+│       ├── swap_chain.*         two frames
+│       └── draw.*               the routes end to end
+├── apps/                    # the programs with a main()
+│   ├── ppm.hpp  gif.hpp         a still and an animation, both written out
+│   ├── hello_shader.cpp         the shortest program with a shader of its own
+│   ├── orbit.cpp                the short animations, and the mirror scene
+│   ├── ray_triangle.cpp         registers assigned by hand, before IRBuilder
+│   ├── raster_triangle.cpp      the same picture through the pipeline
+│   └── mesh_render.cpp          an .obj down every route, compared
+└── test/
+    ├── unit/                # GoogleTest, a file a layer
+    │   ├── test_isa.cpp  test_memory.cpp  test_thread.cpp
+    │   ├── test_scheduler.cpp  test_streams.cpp  test_runtime.cpp
+    │   ├── test_ir_builder.cpp  test_math3d.cpp  test_mesh.cpp
+    │   ├── test_bvh.cpp  test_cull.cpp  test_gemm.cpp  test_gif.cpp
+    │   ├── test_pipeline.cpp
+    │   └── reference.hpp / .cpp   host oracles, in the test target only
+    └── benchmark/
+        ├── RESULTS.md       # the measurement record
+        ├── src/             # a program a question
+        │   ├── scenes.hpp   the scenes render_bench and model_bench share
+        │   ├── divergence_bench.cpp  render_bench.cpp  reduction_bench.cpp
+        │   ├── cache_bench.cpp  model_bench.cpp  occupancy_bench.cpp
+        │   ├── stream_bench.cpp  async_bench.cpp  mma_bench.cpp
+        │   ├── ser_bench.cpp  cluster_bench.cpp  gemm_bench.cpp
+        │   ├── bandwidth_bench.cpp  bvh_bench.cpp  instance_bench.cpp
+        │   └── tlas_bench.cpp  material_bench.cpp  cull_bench.cpp
+        └── output/          # everything a run writes: images, GIFs, csv, md
 ```

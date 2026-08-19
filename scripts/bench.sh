@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Every renderer and benchmark, into one directory named for when it ran.
 #
-#   scripts/bench.sh          benchmarks/result/<timestamp>/, at 256
+#   scripts/bench.sh          test/benchmark/output/<timestamp>/, at 256
 #   scripts/bench.sh 512      the same, four times the pixels and four times
 #                             the wall clock — the walk route is what costs
 #
@@ -26,7 +26,7 @@ SIZE="${1:-256}"
 # sweep takes 41 seconds there against 7 here, for the same issued work.
 "$ROOT/scripts/build.sh" --release
 
-RUN="benchmarks/result/$(date +%Y-%m-%d_%H%M%S)"
+RUN="test/benchmark/output/$(date +%Y-%m-%d_%H%M%S)"
 mkdir -p "$RUN"
 
 step() {
@@ -35,10 +35,10 @@ step() {
 }
 
 step "ray_triangle"
-./build/kernels/ray_triangle "$SIZE" "$SIZE" --out "$RUN"
+./build/apps/ray_triangle "$SIZE" "$SIZE" --out "$RUN"
 
 step "raster_triangle"
-./build/kernels/raster_triangle "$SIZE" "$SIZE" 1 --out "$RUN"
+./build/apps/raster_triangle "$SIZE" "$SIZE" 1 --out "$RUN"
 
 # The two above render the same triangle by different arithmetic, so their files
 # have to match byte for byte. It is the check neither can make alone.
@@ -50,13 +50,13 @@ else
 fi
 
 step "mesh_render"
-./build/kernels/mesh_render --size "$SIZE" --out "$RUN"
+./build/apps/mesh_render --size "$SIZE" --out "$RUN"
 
 step "render_bench"
-./build/benchmarks/render_bench --out "$RUN"
+./build/test/benchmark/render_bench --out "$RUN"
 
 step "divergence_bench"
-./build/benchmarks/divergence_bench | tee "$RUN/divergence.txt"
+./build/test/benchmark/divergence_bench | tee "$RUN/divergence.txt"
 
 {
     echo "# Run $(date '+%Y-%m-%d %H:%M:%S')"
