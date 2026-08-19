@@ -4,10 +4,15 @@
 #
 # Warnings are errors here but not in an ordinary build, so that work in
 # progress stays comfortable while what gets committed does not accumulate them.
+#
+# That flag is also why this configures a tree of its own rather than reusing
+# the working one: sharing it would flip -Werror on for every ordinary build
+# too. It sits under build/ so there is still only one directory to ignore, and
+# being separate is what makes it the clean tree a commit is checked against.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$ROOT/build-check"
+BUILD_DIR="$ROOT/build/check"
 
 failed=0
 step() {

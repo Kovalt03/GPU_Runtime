@@ -40,32 +40,32 @@ grows only with the perimeter.
                        │  Mesh · Camera · two launches
   ┌────────────────────▼─────────────────────────────┐
   │              Graphics Pipeline                   │
-  │       gpurt/pipeline/ · include/math3d.hpp     │
+  │        gpurt/pipeline/ · gpurt/math3d.hpp        │
   │   vertex stage → tile binning → raster stage     │
   │   host-side Float3 / Float4x4, staged in shared  │
   └────────────────────┬─────────────────────────────┘
                        │  emits a Program
   ┌────────────────────▼─────────────────────────────┐
   │                  IR Builder                      │
-  │              include/ir_builder.hpp              │
+  │               gpurt/ir_builder.hpp               │
   │   typed registers · allocation · branch patching │
   └────────────────────┬─────────────────────────────┘
                        │  myrt_launch(kernel, grid, block, args)
   ┌────────────────────▼─────────────────────────────┐
   │                 Runtime API                      │
-  │              include/runtime.hpp                 │
+  │                gpurt/runtime.hpp                 │
   │   malloc / memcpy / launch / stream / sync       │
   └──────┬───────────────────────────────────────────┘
          │  delegates warp execution
   ┌──────▼───────────────────────────────────────────┐
   │              Warp Scheduler                      │
-  │            include/scheduler.hpp                 │
+  │               gpurt/scheduler.hpp                │
   │   SMs · residency · round-robin · divergence     │
   └──────┬───────────────────────────────────────────┘
          │  executes instructions per warp
   ┌──────▼───────────────────────────────────────────┐
   │          Thread / Warp Structure                 │
-  │             include/thread.hpp                   │
+  │                 gpurt/thread.hpp                 │
   │   Thread[256 regs, pc, active]                   │
   │   Warp[32 threads, activeMask]                   │
   │   ThreadBlock[warps, 4096 floats shared]         │
@@ -73,9 +73,9 @@ grows only with the perimeter.
          │  instruction fetch & decode
   ┌──────▼───────────────────────────────────────────┐
   │               Virtual ISA                        │
-  │              include/isa.hpp                     │
+  │                  gpurt/isa.hpp                   │
   │   Opcode · Instruction · Program                 │
-  │   44 opcodes, 8 bytes each                       │
+  │   45 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
   │   V_LD_GLOBAL_F32 / V_CP_ASYNC_SHARED_GLOBAL_F32 │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
@@ -84,7 +84,7 @@ grows only with the perimeter.
          │  physical memory access
   ┌──────▼───────────────────────────────────────────┐
   │               Memory Model                       │
-  │              include/memory.hpp                  │
+  │                 gpurt/memory.hpp                 │
   │   Host / Device (separate address spaces)        │
   │   free-list allocation                           │
   └──────────────────────────────────────────────────┘
@@ -254,67 +254,67 @@ sips -s format png test/benchmark/output/result.ppm --out result.png   # macOS
 convert test/benchmark/output/result.ppm result.png                    # ImageMagick
 
 # Benchmarks
-./build/benchmarks/divergence_bench
-./build/benchmarks/divergence_bench --csv   # test/benchmark/output/divergence.csv
+./build/test/benchmark/divergence_bench
+./build/test/benchmark/divergence_bench --csv   # test/benchmark/output/divergence.csv
 
 # Four routes to one frame — walk, tiled, shared memory, ray tracer
-./build/benchmarks/render_bench             # test/benchmark/output/render_bench.{md,csv}
+./build/test/benchmark/render_bench             # test/benchmark/output/render_bench.{md,csv}
 
 # An .obj down every route, compared pixel for pixel
 ./build/apps/mesh_render assets/sphere.obj
 
 # Summing a warp: shared memory against the lane exchange
-./build/benchmarks/reduction_bench          # test/benchmark/output/reduction.{md,csv}
+./build/test/benchmark/reduction_bench          # test/benchmark/output/reduction.{md,csv}
 
 # A cache against a growing working set
-./build/benchmarks/cache_bench              # test/benchmark/output/cache.{md,csv}
+./build/test/benchmark/cache_bench              # test/benchmark/output/cache.{md,csv}
 
 # The flat model's conclusions, put to the other cost models
-./build/benchmarks/model_bench              # test/benchmark/output/models.{md,csv}
+./build/test/benchmark/model_bench              # test/benchmark/output/models.{md,csv}
 
 # What several SMs buy, and what stops a kernel from using them
-./build/benchmarks/occupancy_bench          # test/benchmark/output/occupancy.{md,csv}
+./build/test/benchmark/occupancy_bench          # test/benchmark/output/occupancy.{md,csv}
 
 # What a second queue buys, and a grid the host never learns
-./build/benchmarks/stream_bench             # test/benchmark/output/stream.{md,csv}
+./build/test/benchmark/stream_bench             # test/benchmark/output/stream.{md,csv}
 
 # A copy the warp does not wait for, on its own and in a renderer
-./build/benchmarks/async_bench              # test/benchmark/output/async.{md,csv}
+./build/test/benchmark/async_bench              # test/benchmark/output/async.{md,csv}
 
 # One instruction against 4,096 multiply-adds
-./build/benchmarks/mma_bench                # test/benchmark/output/mma.{md,csv}
+./build/test/benchmark/mma_bench                # test/benchmark/output/mma.{md,csv}
 
 # What regrouping a block's threads is worth, and when it is a tax
-./build/benchmarks/ser_bench                # test/benchmark/output/ser.{md,csv}
+./build/test/benchmark/ser_bench                # test/benchmark/output/ser.{md,csv}
 
 # A block reading its neighbour's shared memory
-./build/benchmarks/cluster_bench            # test/benchmark/output/cluster.{md,csv}
+./build/test/benchmark/cluster_bench            # test/benchmark/output/cluster.{md,csv}
 
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
-./build/benchmarks/gemm_bench               # test/benchmark/output/gemm.{md,csv}
+./build/test/benchmark/gemm_bench               # test/benchmark/output/gemm.{md,csv}
 
 # The device deciding how much to draw
-./build/benchmarks/cull_bench                # test/benchmark/output/cull.{md,csv}
-./build/benchmarks/cull_bench --machine machines/four-sm.spec
+./build/test/benchmark/cull_bench                # test/benchmark/output/cull.{md,csv}
+./build/test/benchmark/cull_bench --machine machines/four-sm.spec
 
 # Reordering the threads, on divergence the scene put there
-./build/benchmarks/material_bench            # test/benchmark/output/material.{md,csv}
+./build/test/benchmark/material_bench            # test/benchmark/output/material.{md,csv}
 
 # One tree over the copies, or one over all of them
-./build/benchmarks/tlas_bench                # test/benchmark/output/tlas.{md,csv}
+./build/test/benchmark/tlas_bench                # test/benchmark/output/tlas.{md,csv}
 
 # Where an instance's model matrix meets the view-projection
-./build/benchmarks/instance_bench            # test/benchmark/output/instance.{md,csv}
+./build/test/benchmark/instance_bench            # test/benchmark/output/instance.{md,csv}
 
 # A tree against every triangle for every pixel
-./build/benchmarks/bvh_bench                # test/benchmark/output/bvh.{md,csv}
-./build/benchmarks/bvh_bench --leaf 8       # triangles a leaf may hold
+./build/test/benchmark/bvh_bench                # test/benchmark/output/bvh.{md,csv}
+./build/test/benchmark/bvh_bench --leaf 8       # triangles a leaf may hold
 
 # What happens when the memory system has a ceiling
-./build/benchmarks/bandwidth_bench          # test/benchmark/output/bandwidth.{md,csv}
+./build/test/benchmark/bandwidth_bench          # test/benchmark/output/bandwidth.{md,csv}
 
 # Any of them on another machine — machines/ holds the files
-./build/benchmarks/render_bench --machine machines/a100.spec
+./build/test/benchmark/render_bench --machine machines/a100.spec
 ```
 
 ### Formatting
@@ -360,7 +360,7 @@ on their own line, `int* ptr`.
 
 ### What divergence costs
 
-`benchmarks/divergence_bench` holds the work constant and varies only how a
+`divergence_bench` holds the work constant and varies only how a
 warp splits.
 
 ```
@@ -548,12 +548,12 @@ stall, which on hardware is most of what a barrier is.
 
 Every figure above is reproducible from a committed scene, and each names the
 tool that produced it: the frame-level tables come from
-`./build/benchmarks/render_bench`, which defines its scenes in code and drives
+`./build/test/benchmark/render_bench`, which defines its scenes in code and drives
 the same routes the tests call; the per-pass index-buffer figures come from
 `./build/apps/mesh_render` reading `assets/`, because the draw routes clear
 the counters between passes and a caller otherwise reads pass 2 alone; the ACMR
 numbers come from `simulated_cache_misses`, which scores a mesh rather than
-running one; the reduction comes from `./build/benchmarks/reduction_bench`.
+running one; the reduction comes from `./build/test/benchmark/reduction_bench`.
 
 Both renderers take their camera from one `DrawTarget`, so a comparison between
 them cannot be of two different views. `test/benchmark/RESULTS.md` carries the full
