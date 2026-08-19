@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "bvh.hpp"
 #include "math3d.hpp"
 #include "mesh.hpp"
 #include "pipeline/raster_tiled.hpp"
@@ -177,6 +178,17 @@ struct DeviceGeometry {
     // cross product of edges it has already loaded.
     void* normals = nullptr;
 
+    // A tree over the triangles, when one was asked for. The ray tracer walks it
+    // instead of the whole list; nothing else looks at it.
+    //
+    // The triangles are uploaded in the tree's order, not the caller's, because a
+    // leaf is a range. So a geometry built with an acceleration structure has a
+    // different `world` from one without, and the frames still have to match —
+    // which is the check that says the permutation was applied consistently.
+    void* bvh = nullptr;
+    uint32_t bvh_depth = 0;
+    TraversalOrder bvh_order = TraversalOrder::Unordered;
+
     uint32_t vertex_count = 0;
     uint32_t triangle_count = 0;
 
@@ -193,6 +205,17 @@ struct DeviceGeometry {
 
 DeviceGeometry upload(MyGPURuntime& rt, const std::vector<Float3>& world,
                       VertexStage stage = VertexStage::Projects);
+
+// The same, with a bounding volume hierarchy built over the triangles and
+// uploaded beside them.
+//
+// Separate from the overload above rather than a defaulted argument: building
+// one is host work proportional to the scene, and a benchmark that did it
+// without meaning to would be timing the builder.
+DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                  BvhSplit split = BvhSplit::SAH,
+                                  uint32_t leaf_size = BVH_DEFAULT_LEAF,
+                                  TraversalOrder order = TraversalOrder::Unordered);
 
 // An indexed upload, which is what makes pass 1 transform a shared corner once.
 // The ray tracer cannot draw one — see its overload below.

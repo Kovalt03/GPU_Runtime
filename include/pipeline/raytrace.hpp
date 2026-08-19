@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "bvh.hpp"
 #include "isa.hpp"
 #include "math3d.hpp"
 #include "pipeline/types.hpp"
@@ -55,9 +56,43 @@ RayBasis ray_basis(const Camera& camera, float aspect);
 // face along with it. Against t it keeps a hit behind the origin from counting.
 inline constexpr float INTERSECT_EPSILON = 1e-6f;
 
+// How the kernel finds the triangles a ray might meet.
+//
+// Same launch, same thread meaning, same intersection test — what differs is
+// only which triangles reach it. That is what makes this a flag rather than a
+// second kernel, the way `predicated` and `indexed` are flags.
+enum class Traversal {
+    // Every triangle for every pixel. Cost linear in the scene, and the shape
+    // this route had before there was anything better.
+    Linear,
+
+    // A bounding volume hierarchy, walked with a stack in shared memory.
+    Bvh,
+};
+
+// Which child of an interior node is entered first.
+//
+// Only meaningful under Traversal::Bvh, and a flag because it is a trade rather
+// than an improvement: entering the nearer child first lets the running best cut
+// the far subtree off, and finding out which is nearer costs two slab tests at
+// every interior node whether or not the cut ever happens.
+enum class TraversalOrder {
+    // Left then right, as the build laid them out. The nearest hit is still
+    // correct — every node is tested — and the pruning is whatever the order
+    // happens to give.
+    Unordered,
+
+    // The nearer child first, chosen branchlessly: a comparison yields 1.0 or
+    // 0.0, and adding it to the left index names one child or the other without
+    // splitting the warp to do it.
+    Nearest,
+};
+
 struct RaytraceStageArgs {
     RayBasis basis;
     Shading shading;
+    Traversal traversal = Traversal::Linear;
+    TraversalOrder order = TraversalOrder::Unordered;
 
     // Byte offsets from the base of device memory. Three floats a vertex, in
     // world space and never rewritten — no 1/w, there being no projection on
@@ -85,6 +120,17 @@ struct RaytraceStageArgs {
     // never had to worry about. Two of the three differences in the kernel
     // follow from that rather than from predication itself.
     bool predicated = false;
+
+    // Where the tree is, and how deep a stack it needs. Both come from the build
+    // — Bvh::max_depth is reported rather than guessed because a stack one short
+    // overruns into the next lane's slice of shared memory.
+    //
+    // The stack is in shared memory because an instruction names its registers in
+    // immediate fields: there is no way to index the register file with a running
+    // pointer. Real hardware puts a traversal stack in the same place, for the
+    // same reason.
+    size_t bvh_offset = 0;
+    uint32_t stack_depth = 0;
 };
 
 // Builds the ray tracer. args[0] must point at a RaytraceStageArgs.

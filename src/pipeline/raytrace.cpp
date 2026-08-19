@@ -79,10 +79,12 @@ Program build_raytrace_program(void** args)
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
 
-        // One run of world triangles. count is a host value, so unlike the tiled
-        // rasteriser there is no table to read first — and run_raytrace_stage
-        // refuses a count of zero, so the loop can test at the bottom without a
-        // guard.
+        // What the triangle loop runs over. Linear, these are the whole scene and
+        // never change; traversing a tree, a leaf writes both before entering.
+        //
+        // run_raytrace_stage refuses a count of zero, so the linear loop can test
+        // at the bottom without a guard. A leaf cannot be empty either — the
+        // builder only writes a leaf for triangles it holds.
         const Reg<Scalar> one = k.constant(1.0f);
         const Reg<Scalar> zero = k.constant(0.0f);
         const Reg<Scalar> eps = k.constant(INTERSECT_EPSILON);
@@ -91,13 +93,140 @@ Program build_raytrace_program(void** args)
         const Reg<Scalar> cursor = k.constant(static_cast<float>(a.triangles_offset));
         const Reg<Scalar> i = k.constant(0.0f);
 
-        // Above k.place(top) because a constant below it is issued once per
-        // triangle. Emitted whatever the mode: six moves outside the loop cost
+        // Above the traversal, not merely above k.place(top): a leaf falls
+        // through to the loop, so anything between the two is issued once a leaf
+        // rather than once a launch. Emitted whatever the mode — six moves cost
         // less than the optional it would take to declare them conditionally.
         const Float3& lp = a.shading.light_position;
         const Float3& bc = a.shading.base_colour;
         const Reg<Vec3> light = k.constant(lp.x, lp.y, lp.z);
         const Reg<Vec3> base = k.constant(bc.x, bc.y, bc.z);
+
+        // --- traversal ------------------------------------------------------
+        // Emitted before the triangle loop so that the loop's bottom test can
+        // branch back into it. Nothing here is issued when the mode is Linear.
+        const bool bvh = a.traversal == Traversal::Bvh;
+        const Label traverse = k.label();
+        const Label traverse_next = k.label();
+        const Label leaf_found = k.label();
+        const Label done = k.label();
+
+        // The stack lives in shared memory because it cannot live anywhere else:
+        // an instruction names its registers in immediate fields, so there is no
+        // way to index the register file with a running pointer. Hardware puts a
+        // traversal stack in the same place for the same reason.
+        //
+        // The block is one warp wide, so a lane's slot is its x within the block.
+        // A global thread_x cannot be reduced to it — there is no integer modulo
+        // — which is what block_x is for.
+        Reg<Scalar> stack_slot = zero;
+        Reg<Scalar> sp = zero;
+        Reg<Vec3> inv_dir = k.vec3();
+        if (bvh) {
+            const Reg<Scalar> lane =
+                k.sub(px, k.mul(k.block_x(), k.constant(static_cast<float>(WARP_SIZE))));
+            stack_slot = k.mul(
+                lane, k.constant(static_cast<float>(a.stack_depth * sizeof(float))));
+
+            // Three reciprocals once rather than three divisions a node. A zero
+            // component gives an infinite slab bound, which compares the way the
+            // test wants: the ray never leaves that slab.
+            k.copy_into(inv_dir.component(0), k.rcp(dir.component(0)));
+            k.copy_into(inv_dir.component(1), k.rcp(dir.component(1)));
+            k.copy_into(inv_dir.component(2), k.rcp(dir.component(2)));
+
+            sp = k.constant(0.0f);
+            k.store_shared(stack_slot, zero);  // the root
+            k.fma(sp, one, one);
+
+            k.place(traverse);
+            k.fma(sp, one, k.constant(-1.0f));
+            const Reg<Scalar> node =
+                k.load_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))));
+            const Reg<Scalar> node_addr =
+                k.add(k.constant(static_cast<float>(a.bvh_offset)),
+                      k.mul(node, k.constant(static_cast<float>(BVH_NODE_BYTES))));
+
+            // The slab test. Two wide loads for six floats, and the same
+            // arithmetic nodes_visited runs on the host — a box the two disagree
+            // about would drop geometry from one and not the other.
+            const Reg<Vec3> lo = k.load_vec3(node_addr, 0.0f);
+            const Reg<Vec3> hi = k.load_vec3(node_addr, 12.0f);
+
+            // Clamped below at zero so a box behind the origin cannot be entered,
+            // and above at the running best, which is the early exit an ordered
+            // traversal would get for free: a node further away than a hit
+            // already found has nothing to offer.
+            Reg<Scalar> near = zero;
+            Reg<Scalar> far = best_t;
+            for (uint32_t axis = 0; axis < 3; ++axis) {
+                const Reg<Scalar> t0 =
+                    k.mul(k.sub(lo.component(axis), origin.component(axis)),
+                          inv_dir.component(axis));
+                const Reg<Scalar> t1 =
+                    k.mul(k.sub(hi.component(axis), origin.component(axis)),
+                          inv_dir.component(axis));
+                near = k.max(near, k.min(t0, t1));
+                far = k.min(far, k.max(t0, t1));
+            }
+
+            const Reg<Scalar> node_count = k.load(node_addr, 28.0f);
+            k.branch_to(traverse_next, k.gt(near, far));
+            k.branch_to(leaf_found, k.gt(node_count, zero));
+
+            // Interior: both children, which are adjacent. The second push pops
+            // first, so whichever goes on last is the one entered next.
+            const Reg<Scalar> left = k.load(node_addr, 24.0f);
+            Reg<Scalar> first = left;
+            Reg<Scalar> second = k.add(left, one);
+            if (a.order == TraversalOrder::Nearest) {
+                // Where each child's slab test starts, which is how near it can
+                // possibly be. Four wide loads and two slab tests a node — the
+                // price of the ordering, paid whether or not it prunes anything.
+                const auto entry = [&](Reg<Scalar> index) {
+                    const Reg<Scalar> addr = k.add(
+                        k.constant(static_cast<float>(a.bvh_offset)),
+                        k.mul(index, k.constant(static_cast<float>(BVH_NODE_BYTES))));
+                    const Reg<Vec3> clo = k.load_vec3(addr, 0.0f);
+                    const Reg<Vec3> chi = k.load_vec3(addr, 12.0f);
+                    Reg<Scalar> entered = zero;
+                    for (uint32_t axis = 0; axis < 3; ++axis) {
+                        const Reg<Scalar> c0 =
+                            k.mul(k.sub(clo.component(axis), origin.component(axis)),
+                                  inv_dir.component(axis));
+                        const Reg<Scalar> c1 =
+                            k.mul(k.sub(chi.component(axis), origin.component(axis)),
+                                  inv_dir.component(axis));
+                        entered = k.max(entered, k.min(c0, c1));
+                    }
+                    return entered;
+                };
+                const Reg<Scalar> right = k.add(left, one);
+
+                // 1.0 when the right child is nearer. Adding a flag to an index
+                // picks a child without a branch, which matters here more than
+                // anywhere: a warp diverging over which subtree to enter is the
+                // cost this whole ordering exists to avoid.
+                const Reg<Scalar> swap = k.lt(entry(right), entry(left));
+                first = k.add(left, swap);
+                second = k.sub(right, swap);
+            }
+
+            k.store_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))), second);
+            k.fma(sp, one, one);
+            k.store_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))), first);
+            k.fma(sp, one, one);
+            k.place(traverse_next);
+            k.branch_to(traverse, k.gt(sp, zero));
+            k.branch_to(done);
+
+            // A leaf runs the loop below over its own range instead of the scene.
+            k.place(leaf_found);
+            k.copy_into(count, node_count);
+            k.copy_into(cursor, k.add(k.constant(static_cast<float>(a.triangles_offset)),
+                                      k.mul(k.load(node_addr, 24.0f), stride)));
+            k.copy_into(i, zero);
+        }
 
         // Every miss lands on next, and it is placed before the advance below:
         // a miss means "on to the next triangle", not "out of the loop", so the
@@ -262,6 +391,13 @@ Program build_raytrace_program(void** args)
         k.fma(i, one, one);
         k.branch_to(top, k.lt(i, count));
 
+        // A leaf is one node's worth of triangles, so finishing it means going
+        // back for the next node rather than to the pixel.
+        if (bvh) {
+            k.branch_to(traverse, k.gt(sp, zero));
+            k.place(done);
+        }
+
         // One pixel, once, after the whole scene has been walked.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
@@ -282,6 +418,24 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
     }
     if (args.triangle_count == 0) {
         throw std::runtime_error("run_raytrace_stage: nothing to trace");
+    }
+    if (args.traversal == Traversal::Bvh && args.stack_depth == 0) {
+        throw std::runtime_error(
+            "run_raytrace_stage: a tree to walk and no stack to walk it with — "
+            "set stack_depth from Bvh::max_depth");
+    }
+    if (args.traversal == Traversal::Bvh) {
+        // One slice a lane, and a block is one warp wide. A stack that did not
+        // fit would silently write into the next lane's slice, which shows up as
+        // geometry appearing in the wrong pixel rather than as a failure.
+        const size_t floats = static_cast<size_t>(args.stack_depth) * WARP_SIZE;
+        if (floats > SHARED_MEM_FLOATS) {
+            throw std::runtime_error(
+                "run_raytrace_stage: a stack " + std::to_string(args.stack_depth) +
+                " deep for " + std::to_string(WARP_SIZE) + " lanes is " +
+                std::to_string(floats) + " floats, and a block holds " +
+                std::to_string(SHARED_MEM_FLOATS));
+        }
     }
     if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {
         throw std::runtime_error(

@@ -254,6 +254,26 @@ DeviceGeometry upload(MyGPURuntime& rt, const std::vector<Float3>& world,
     return geometry;
 }
 
+DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                  BvhSplit split, uint32_t leaf_size,
+                                  TraversalOrder order)
+{
+    const Bvh tree = build_bvh(world, split, leaf_size);
+
+    // The tree's order, not the caller's: a leaf is a range, so the triangles
+    // have to sit the way the build left them. VertexStage::None because the ray
+    // tracer projects nothing and would otherwise reserve a screen buffer that
+    // no launch writes.
+    DeviceGeometry geometry = upload_positions(rt, tree.triangles, VertexStage::None);
+
+    geometry.bvh = rt.myrt_malloc(tree.nodes.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.bvh, tree.nodes.data(), tree.nodes.size() * sizeof(float),
+                   Direction::HostToDevice);
+    geometry.bvh_depth = tree.max_depth;
+    geometry.bvh_order = order;
+    return geometry;
+}
+
 DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)
 {
     // mesh.vertices rather than mesh.flattened(): that is what sizes both the
@@ -308,6 +328,7 @@ void release(MyGPURuntime& rt, DeviceGeometry& geometry)
     rt.myrt_free(geometry.screen);
     rt.myrt_free(geometry.index);
     rt.myrt_free(geometry.normals);
+    rt.myrt_free(geometry.bvh);
     geometry = DeviceGeometry{};
 }
 
@@ -550,6 +571,12 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geomet
     args.height = target.height;
     args.triangle_count = geometry.triangle_count;
     args.predicated = predicated;
+    if (geometry.bvh != nullptr) {
+        args.traversal = Traversal::Bvh;
+        args.order = geometry.bvh_order;
+        args.bvh_offset = rt.myrt_device_offset(geometry.bvh);
+        args.stack_depth = geometry.bvh_depth;
+    }
     run_raytrace_stage(rt, args);
     return download(rt, frame);
 }

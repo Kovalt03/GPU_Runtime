@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstdint>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -2691,5 +2692,157 @@ TEST(Pipeline, TheTracerRefusesCustomShadingWithNothingToEmit)
     args.height = HEIGHT;
     args.triangle_count = 1;
     args.shading.mode = ShadingMode::Custom;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}
+
+namespace {
+
+// Small triangles scattered through the view, from a fixed seed. Enough of them
+// that a tree has depth to it, and spread enough that a ray meets few.
+std::vector<Float3> scattered_scene(uint32_t count, uint32_t seed = 7)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> place(-1.2f, 1.2f);
+    std::uniform_real_distribution<float> size(0.05f, 0.25f);
+
+    std::vector<Float3> world;
+    world.reserve(count * 3);
+    for (uint32_t i = 0; i < count; ++i) {
+        const Float3 centre{place(rng), place(rng), place(rng)};
+        const float s = size(rng);
+        world.push_back(centre + Float3{-s, -s, 0.0f});
+        world.push_back(centre + Float3{s, -s, 0.0f});
+        world.push_back(centre + Float3{0.0f, s, s});
+    }
+    return world;
+}
+
+}  // namespace
+
+TEST(Pipeline, TheTreeDrawsTheFrameTheWholeSceneDid)
+{
+    // The claim a BVH makes is that skipping is safe. Nothing else here checks
+    // it: a box too small drops a triangle, a stack too shallow overruns into
+    // the next lane's slice, and both produce a frame that still looks like a
+    // frame. Held against the linear walk, pixel for pixel.
+    //
+    // EQ rather than NEAR: the tree changes which triangles are tested and in
+    // what order, but the winner is chosen by the same comparison on the same
+    // arithmetic, so an identical frame is the right expectation.
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    MyGPURuntime linear_rt(1u << 24);
+    const std::vector<Float3> linear = draw_raytrace(linear_rt, world, target);
+
+    for (BvhSplit split : {BvhSplit::Median, BvhSplit::SAH}) {
+        for (uint32_t leaf : {1u, 4u, 8u}) {
+            for (TraversalOrder order :
+                 {TraversalOrder::Unordered, TraversalOrder::Nearest}) {
+                MyGPURuntime rt(1u << 24);
+                DeviceGeometry geometry =
+                    upload_accelerated(rt, world, split, leaf, order);
+                DeviceFrame frame = allocate_frame(rt, target);
+                const std::vector<Float3> traced =
+                    draw_raytrace(rt, geometry, frame, target);
+
+                ASSERT_EQ(traced.size(), linear.size());
+                uint32_t lit = 0;
+                for (size_t i = 0; i < traced.size(); ++i) {
+                    ASSERT_EQ(traced[i].x, linear[i].x)
+                        << "pixel " << i << ", leaf " << leaf;
+                    ASSERT_EQ(traced[i].y, linear[i].y)
+                        << "pixel " << i << ", leaf " << leaf;
+                    ASSERT_EQ(traced[i].z, linear[i].z)
+                        << "pixel " << i << ", leaf " << leaf;
+                    lit += linear[i].x > 0.01f ? 1u : 0u;
+                }
+                EXPECT_GT(lit, 0u) << "an empty frame matches an empty frame";
+
+                release(rt, frame);
+                release(rt, geometry);
+            }
+        }
+    }
+}
+
+TEST(Pipeline, OrderingTheChildrenPaysOnlyOnceTheTreeIsDeep)
+{
+    // Entering the nearer child first lets the running best cut off the far
+    // subtree, and finding out which is nearer costs two slab tests at every
+    // interior node — paid whether or not the cut happens.
+    //
+    // So it is a trade with a crossing point rather than an improvement, and
+    // this pins the direction on each side of it. The scene sizes here bracket
+    // where the two meet; bvh_bench maps it properly.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const auto issued = [&](const std::vector<Float3>& world, TraversalOrder order) {
+        MyGPURuntime rt(1u << 27);
+        DeviceGeometry geometry =
+            upload_accelerated(rt, world, BvhSplit::SAH, BVH_DEFAULT_LEAF, order);
+        DeviceFrame frame = allocate_frame(rt, target);
+        draw_raytrace(rt, geometry, frame, target);
+        const uint64_t steps = rt.stats().warp_steps;
+        release(rt, frame);
+        release(rt, geometry);
+        return steps;
+    };
+
+    const std::vector<Float3> small = scattered_scene(64);
+    EXPECT_GT(issued(small, TraversalOrder::Nearest),
+              issued(small, TraversalOrder::Unordered))
+        << "the ordering was expected to cost more than it saves here";
+
+    const std::vector<Float3> large = scattered_scene(1024);
+    EXPECT_LT(issued(large, TraversalOrder::Nearest),
+              issued(large, TraversalOrder::Unordered))
+        << "the ordering was expected to have paid for itself by here";
+}
+
+TEST(Pipeline, TheTreeIssuesLessWorkThanWalkingEveryTriangle)
+{
+    // The point of the whole thing. Measured on the scene where it can show:
+    // four triangles cost more to traverse than to test, and the crossing point
+    // is what bvh_bench maps.
+    const std::vector<WorldTriangle> scene = shared_scene();
+    std::vector<Float3> world;
+    for (uint32_t copy = 0; copy < 24; ++copy) {
+        const float shift = static_cast<float>(copy) * 0.11f - 1.3f;
+        for (const WorldTriangle& t : scene) {
+            for (const Float3& v : {t.v0, t.v1, t.v2}) {
+                world.push_back(v + Float3{shift, shift * 0.5f, shift * 0.25f});
+            }
+        }
+    }
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    MyGPURuntime linear_rt(1u << 26);
+    draw_raytrace(linear_rt, world, target);
+    const uint64_t linear = linear_rt.stats().warp_steps;
+
+    MyGPURuntime bvh_rt(1u << 26);
+    DeviceGeometry geometry = upload_accelerated(bvh_rt, world, BvhSplit::SAH);
+    DeviceFrame frame = allocate_frame(bvh_rt, target);
+    draw_raytrace(bvh_rt, geometry, frame, target);
+    const uint64_t accelerated = bvh_rt.stats().warp_steps;
+
+    EXPECT_LT(accelerated, linear) << "linear " << linear << ", bvh " << accelerated;
+    release(bvh_rt, frame);
+    release(bvh_rt, geometry);
+}
+
+TEST(Pipeline, ATreeWithNoStackToWalkItIsRefused)
+{
+    MyGPURuntime rt(1u << 20);
+    RaytraceStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 1;
+    args.traversal = Traversal::Bvh;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+
+    // And one too deep for the scratchpad, which would otherwise write over the
+    // lane beside it.
+    args.stack_depth = SHARED_MEM_FLOATS;
     EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
 }
