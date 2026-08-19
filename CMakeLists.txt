@@ -39,6 +39,7 @@ add_library(gpurt STATIC
     src/gemm.cpp
     src/half.cpp
     src/mesh.cpp
+    src/bvh.cpp
     src/app_run.cpp
     src/pipeline/vertex.cpp
     src/pipeline/clip.cpp
