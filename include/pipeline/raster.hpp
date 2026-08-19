@@ -59,6 +59,16 @@ struct RasterStageArgs {
     // the trade measured out at.
     bool predicated = false;
 
+    // How many floats a vertex carries past its screen position, and what to do
+    // with a covered pixel.
+    //
+    // Zero varyings and a built-in mode is what every figure before shaders used:
+    // the screen vertex is four floats and the instruction stream is unchanged.
+    // A launch that declares varyings pays three loads and three multiply-adds a
+    // pixel a triangle for each of them — there is no dead-code elimination here
+    // to drop one a shader never reads.
+    uint32_t varying_count = 0;
+
     // What a covered pixel is coloured with, and the two buffers Diffuse needs
     // beyond the screen vertices.
     //

@@ -1,7 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <functional>
 
+#include "ir_builder.hpp"
 #include "math3d.hpp"
 
 // The graphics layer. Everything below is a thin wrapper over myrt_launch: the
@@ -44,6 +47,35 @@ inline constexpr uint32_t WORLD_VERTEX_BYTES = WORLD_VERTEX_FLOATS * sizeof(floa
 inline constexpr uint32_t SCREEN_VERTEX_FLOATS = 4;
 inline constexpr uint32_t SCREEN_VERTEX_BYTES = SCREEN_VERTEX_FLOATS * sizeof(float);
 
+// --- varyings ---------------------------------------------------------------
+// Values a vertex carries to the pixels its triangles cover, interpolated on the
+// way. GLSL declares them `out` in one stage and `in` in the next; here a launch
+// says how many floats a vertex adds and they ride in the slots after the four
+// above.
+//
+// Zero is the default and is what every figure taken before they existed used:
+// a screen vertex is then exactly the four floats it always was, and no stride
+// anywhere moves. A kernel pays for the varyings it declares and no others —
+// there is no dead-code elimination here to drop an unread one.
+//
+// The cap is a register budget rather than a format: interpolating one costs
+// three loads and three multiply-adds a pixel a triangle, and a raster kernel
+// already spends around sixty registers before it starts.
+inline constexpr uint32_t MAX_VARYINGS = 8;
+
+// How wide a screen vertex is when a launch carries varyings. The stride reaches
+// the kernels through their args rather than as a constant, which is what lets
+// the zero case emit exactly the instructions it emitted before.
+inline constexpr uint32_t screen_vertex_floats(uint32_t varyings)
+{
+    return SCREEN_VERTEX_FLOATS + varyings;
+}
+
+inline constexpr uint32_t screen_vertex_bytes(uint32_t varyings)
+{
+    return screen_vertex_floats(varyings) * sizeof(float);
+}
+
 // A triangle as pass 1 leaves it: x and y in pixels, z the NDC depth.
 struct ScreenTriangle {
     Float3 v0;
@@ -75,7 +107,24 @@ inline constexpr uint32_t PIXEL_BYTES = PIXEL_FLOATS * sizeof(float);
 enum class ShadingMode {
     Barycentric,
     Diffuse,
+
+    // What the caller supplies. Shading::shade holds a function that emits the
+    // instructions, and it is handed the fragment below.
+    Custom,
 };
+
+struct Fragment;
+
+// Emits the instructions that colour a fragment. Called once when the kernel is
+// built, not once a pixel — like everything else here, what it writes is a
+// program rather than a value.
+//
+// It runs for fragments that go on to lose. Under `predicated` no lane is
+// masked, so the colour is computed and then blended away; the ray tracer shades
+// inside its triangle loop, so a pixel that meets three triangles shades three
+// times. Writing `out` is therefore safe and any other effect is not — a store
+// or an atomic in here fires for candidates the frame never shows.
+using ShadeFn = std::function<void(IRBuilder&, const Fragment&)>;
 
 struct Shading {
     ShadingMode mode = ShadingMode::Barycentric;
@@ -83,6 +132,47 @@ struct Shading {
     // World space. Only read in Diffuse.
     Float3 light_position{2.0f, 3.0f, 1.0f};
     Float3 base_colour{1.0f, 1.0f, 1.0f};
+
+    // Emits the colour, when mode is Custom. It rides inside Shading rather than
+    // beside it because every route that can shade already takes a Shading: the
+    // walk and the ray tracer both pick up a caller's shader without a signature
+    // of their own, and a mode that named a function living somewhere else could
+    // reach a route that never looked for it.
+    ShadeFn shade;
+};
+
+// --- what a fragment shader is handed ---------------------------------------
+// The pixel a raster kernel has decided is covered, and everything about it the
+// kernel already worked out. A caller's shading function writes `out` and may
+// read anything else here, or any buffer it knows the offset of.
+//
+// This is the fragment stage's interface, and it is deliberately the same set
+// GLSL gives one: interpolated values, the pixel's position, and whatever the
+// launch put in memory. What it adds is that the instruction set is not fenced
+// off — a shading function may store to global memory or take an atomic, which
+// GLSL allows only through an image or a storage buffer.
+struct Fragment {
+    // Write the colour here. Three registers, and what the pixel becomes if this
+    // fragment wins the depth test.
+    Reg<Vec3> out;
+
+    // The varyings this launch declared, already interpolated with perspective
+    // correction. varyings[i] is the i-th float a vertex carried.
+    std::array<Reg<Scalar>, MAX_VARYINGS> varyings{};
+    uint32_t varying_count = 0;
+
+    // Where the pixel is and how deep the fragment is, in the same NDC the depth
+    // buffer holds.
+    Reg<Scalar> x;
+    Reg<Scalar> y;
+    Reg<Scalar> depth;
+
+    // The perspective-corrected barycentric weights, for a shader that wants to
+    // interpolate something the varyings do not carry — a vertex attribute it
+    // reads out of its own buffer, say.
+    Reg<Scalar> w0;
+    Reg<Scalar> w1;
+    Reg<Scalar> w2;
 };
 
 // One unit normal a triangle, which is what the raster routes read rather than

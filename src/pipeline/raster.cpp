@@ -32,6 +32,12 @@ struct Triangle {
     Reg<Scalar> x0, y0, z0, iw0;
     Reg<Scalar> x1, y1, z1, iw1;
     Reg<Scalar> x2, y2, z2, iw2;
+
+    // Where each vertex sits, so that a shading function can read the slots past
+    // the four above. Both forms know this address already — the indexed one
+    // computed it from an index and the flattened one walked to it — and keeping
+    // it costs nothing where recovering it later would cost the multiply again.
+    Reg<Scalar> v0, v1, v2;
 };
 
 }  // namespace
@@ -40,6 +46,10 @@ Program build_raster_program(void** args)
 {
     const RasterStageArgs& a = *static_cast<const RasterStageArgs*>(args[0]);
     IRBuilder k;
+
+    // Named once: it decides how wide a screen vertex is, and three places
+    // address one.
+    const uint32_t varyings = a.varying_count;
 
     // Both coordinates need checking, not just one: the launch rounds up along
     // x and y both. min() of two flags is their AND, each being 1.0 or 0.0 —
@@ -131,8 +141,8 @@ Program build_raster_program(void** args)
         // stride and what fetch below has to do to reach a vertex.
         const Reg<Scalar> cursor =
             k.constant(static_cast<float>(a.indexed ? a.index_offset : a.screen_offset));
-        const Reg<Scalar> stride = k.constant(
-            static_cast<float>(a.indexed ? 3 * sizeof(float) : 3 * SCREEN_VERTEX_BYTES));
+        const Reg<Scalar> stride = k.constant(static_cast<float>(
+            a.indexed ? 3 * sizeof(float) : 3 * screen_vertex_bytes(varyings)));
         const Reg<Scalar> i = k.constant(0.0f);
         const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
 
@@ -169,7 +179,7 @@ Program build_raster_program(void** args)
             const Reg<Scalar> screen_base =
                 k.constant(static_cast<float>(a.screen_offset));
             const Reg<Scalar> vertex_bytes =
-                k.constant(static_cast<float>(SCREEN_VERTEX_BYTES));
+                k.constant(static_cast<float>(screen_vertex_bytes(varyings)));
 
             fetch = [&k, cursor, screen_base, vertex_bytes] {
                 // The dependent load the flattened form does not pay: a
@@ -191,6 +201,9 @@ Program build_raster_program(void** args)
                 // form reads twelve off one. Fifteen global loads a triangle
                 // against twelve is the whole cost of indexing on this pass.
                 Triangle t;
+                t.v0 = v0;
+                t.v1 = v1;
+                t.v2 = v2;
                 t.x0 = k.load(v0, 0.0f);
                 t.y0 = k.load(v0, 4.0f);
                 t.z0 = k.load(v0, 8.0f);
@@ -206,22 +219,28 @@ Program build_raster_program(void** args)
                 return t;
             };
         } else {
-            fetch = [&k, cursor] {
+            // A vertex is wider when the launch carries varyings, so the three
+            // are a stride apart rather than sixteen bytes apart.
+            const float stride = static_cast<float>(screen_vertex_bytes(varyings));
+            fetch = [&k, cursor, stride] {
                 // Position then 1/w, three times — the layout pass 1 writes and
                 // bin_triangles copies.
                 Triangle t;
-                t.x0 = k.load(cursor, 0.0f);
-                t.y0 = k.load(cursor, 4.0f);
-                t.z0 = k.load(cursor, 8.0f);
-                t.iw0 = k.load(cursor, 12.0f);
-                t.x1 = k.load(cursor, 16.0f);
-                t.y1 = k.load(cursor, 20.0f);
-                t.z1 = k.load(cursor, 24.0f);
-                t.iw1 = k.load(cursor, 28.0f);
-                t.x2 = k.load(cursor, 32.0f);
-                t.y2 = k.load(cursor, 36.0f);
-                t.z2 = k.load(cursor, 40.0f);
-                t.iw2 = k.load(cursor, 44.0f);
+                t.v0 = cursor;
+                t.v1 = k.add(cursor, k.constant(stride));
+                t.v2 = k.add(cursor, k.constant(2.0f * stride));
+                t.x0 = k.load(t.v0, 0.0f);
+                t.y0 = k.load(t.v0, 4.0f);
+                t.z0 = k.load(t.v0, 8.0f);
+                t.iw0 = k.load(t.v0, 12.0f);
+                t.x1 = k.load(t.v1, 0.0f);
+                t.y1 = k.load(t.v1, 4.0f);
+                t.z1 = k.load(t.v1, 8.0f);
+                t.iw1 = k.load(t.v1, 12.0f);
+                t.x2 = k.load(t.v2, 0.0f);
+                t.y2 = k.load(t.v2, 4.0f);
+                t.z2 = k.load(t.v2, 8.0f);
+                t.iw2 = k.load(t.v2, 12.0f);
                 return t;
             };
         }
@@ -282,12 +301,42 @@ Program build_raster_program(void** args)
         // triangle's normal, both of which are still on the device because the
         // geometry is.
         const auto shade = [&](Reg<Vec3> dst) {
-            if (!diffuse) {
-                emit_shade(k, dst, w0, w1, w2, t.iw0, t.iw1, t.iw2);
+            if (a.shading.mode == ShadingMode::Custom) {
+                // The perspective-corrected weights, which is what any attribute
+                // has to be interpolated with — the debug colouring works them
+                // out for a colour and a point light for a position, and a
+                // caller's shader gets them handed over rather than derived
+                // again.
+                const Corrected c = emit_correct(k, w0, w1, w2, t.iw0, t.iw1, t.iw2);
+
+                Fragment fragment;
+                fragment.varying_count = varyings;
+
+                // Every declared varying, interpolated. Three loads and three
+                // multiply-adds each: a vertex's slots sit past its four screen
+                // floats, so the address is the vertex's own plus an offset.
+                for (uint32_t i = 0; i < varyings; ++i) {
+                    const float at =
+                        static_cast<float>(SCREEN_VERTEX_BYTES + i * sizeof(float));
+                    const Reg<Scalar> value = k.mul(k.load(t.v0, at), c.w0);
+                    k.fma(value, k.load(t.v1, at), c.w1);
+                    k.fma(value, k.load(t.v2, at), c.w2);
+                    fragment.varyings[i] = value;
+                }
+
+                emit_covered_pixel(k, a.shading, dst, fragment, c, cx, cy, depth);
                 return;
             }
 
-            // The same perspective correction emit_shade applies to a colour.
+            if (!diffuse) {
+                Fragment unused;
+                emit_covered_pixel(k, a.shading, dst, unused,
+                                   emit_correct(k, w0, w1, w2, t.iw0, t.iw1, t.iw2), cx,
+                                   cy, depth);
+                return;
+            }
+
+            // The same perspective correction the debug colouring applies.
             // A world position is an attribute like any other: affine weights
             // interpolate it wrongly across a projected triangle.
             const Reg<Scalar> a0 = k.mul(w0, t.iw0);
@@ -382,6 +431,16 @@ void run_raster_stage(MyGPURuntime& rt, const RasterStageArgs& args)
     // would still walk one triangle's worth of whatever the buffer holds.
     if (args.triangle_count == 0) {
         throw std::runtime_error("run_raster_stage: nothing to draw");
+    }
+    if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {
+        throw std::runtime_error(
+            "run_raster_stage: Custom shading with nothing to emit — set "
+            "RasterStageArgs::shade");
+    }
+    if (args.varying_count > MAX_VARYINGS) {
+        throw std::runtime_error(
+            "run_raster_stage: " + std::to_string(args.varying_count) +
+            " varyings, and a register file that holds " + std::to_string(MAX_VARYINGS));
     }
 
     // 32 along x so that one warp lands on 32 horizontally adjacent pixels of a

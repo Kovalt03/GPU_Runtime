@@ -505,18 +505,13 @@ std::vector<Float3> draw_tiled(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                const DeviceFrame& frame, const DrawTarget& target,
                                bool predicated, const Shading& shading)
 {
-    if (shading.mode != ShadingMode::Barycentric) {
-        throw std::runtime_error(
-            "draw_tiled: a tile list carries screen positions only, so this route "
-            "cannot light what it draws — the walk can");
-    }
-
     // The kernel is the same program whichever form the geometry arrived in:
     // bin_triangles copies each triangle into every tile it reaches, so what
     // reaches the device is already de-indexed.
     run_pass_one(rt, geometry, target);
     TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
     args.predicated = predicated;
+    args.shading = shading;
     run_tiled_raster_stage(rt, args);
     return download(rt, frame);
 }
@@ -526,15 +521,10 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry
                                 bool predicated, const Shading& shading,
                                 bool async_staging)
 {
-    if (shading.mode != ShadingMode::Barycentric) {
-        throw std::runtime_error(
-            "draw_shared: a tile list carries screen positions only, so this route "
-            "cannot light what it draws — the walk can");
-    }
-
     run_pass_one(rt, geometry, target);
     TiledRasterStageArgs args = bin_and_upload(rt, geometry, frame, target);
     args.predicated = predicated;
+    args.shading = shading;
     args.staging =
         async_staging ? TileStaging::AsyncDoubleBuffered : TileStaging::Synchronous;
     run_shared_raster_stage(rt, args);

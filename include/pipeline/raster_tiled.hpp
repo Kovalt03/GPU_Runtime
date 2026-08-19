@@ -121,6 +121,13 @@ struct TiledRasterStageArgs {
     // How the shared-memory route gets its tile there. Ignored by the other two,
     // which stage nothing.
     TileStaging staging = TileStaging::Synchronous;
+
+    // Barycentric or a caller's shader. Diffuse is refused and so is a varying:
+    // a tile holds three vertices of four floats each, fixed inside the kernel,
+    // so there is no attribute and no world position here. What a shader does
+    // get is the corrected weights, the pixel and the depth — enough for
+    // anything that asks the geometry no questions.
+    Shading shading;
 };
 
 // Builds the tiled pass 2. Same picture as build_raster_program, reached by

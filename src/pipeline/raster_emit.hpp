@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ir_builder.hpp"
+#include "pipeline/types.hpp"
 
 // Shared by the three raster kernels, which is the whole reason this is a
 // header and not an anonymous namespace: build_raster_program, the tiled one
@@ -16,21 +17,56 @@ inline Reg<Scalar> emit_edge(IRBuilder& k, Reg<Scalar> ax, Reg<Scalar> ay, Reg<S
                  k.mul(k.sub(py, ay), k.sub(bx, ax)));
 }
 
-// Writes the corrected weights into dst as (w1, w2, w0), the order the
-// framebuffer takes. The device counterpart of perspective_correct, minus its
-// guard against a zero denominator: inside a covered pixel the affine weights
-// sum to one and every 1/w is positive, so the sum cannot reach zero.
-inline void emit_shade(IRBuilder& k, Reg<Vec3> dst, Reg<Scalar> w0, Reg<Scalar> w1,
-                       Reg<Scalar> w2, Reg<Scalar> iw0, Reg<Scalar> iw1, Reg<Scalar> iw2)
+// The affine weights, corrected for perspective. The device counterpart of
+// perspective_correct, minus its guard against a zero denominator: inside a
+// covered pixel the affine weights sum to one and every 1/w is positive, so the
+// sum cannot reach zero.
+//
+// Named rather than inlined into the shade below because a caller's shader wants
+// these as numbers where the built-in mode wants them as a colour. One
+// arithmetic, so a varying and the debug colouring cannot disagree about what a
+// weight is.
+struct Corrected {
+    Reg<Scalar> w0, w1, w2;
+};
+
+inline Corrected emit_correct(IRBuilder& k, Reg<Scalar> w0, Reg<Scalar> w1,
+                              Reg<Scalar> w2, Reg<Scalar> iw0, Reg<Scalar> iw1,
+                              Reg<Scalar> iw2)
 {
     const Reg<Scalar> a0 = k.mul(w0, iw0);
     const Reg<Scalar> a1 = k.mul(w1, iw1);
     const Reg<Scalar> a2 = k.mul(w2, iw2);
     const Reg<Scalar> inv_total = k.rcp(k.add(k.add(a0, a1), a2));
+    return {k.mul(a0, inv_total), k.mul(a1, inv_total), k.mul(a2, inv_total)};
+}
 
-    k.copy_into(dst.component(0), k.mul(a1, inv_total));
-    k.copy_into(dst.component(1), k.mul(a2, inv_total));
-    k.copy_into(dst.component(2), k.mul(a0, inv_total));
+// The two modes every raster route can serve: the debug colouring, and a
+// caller's shader. Diffuse is not here because it needs buffers only the walk
+// has — a world position and a face normal — so the walk tests for it first.
+//
+// The fragment comes in by reference already holding whatever varyings the route
+// could interpolate, which is the one thing the routes differ on: the walk fills
+// three, a tile has nowhere to keep one. Everything below it is the same on all
+// three, and this is the single place that decides it.
+inline void emit_covered_pixel(IRBuilder& k, const Shading& shading, Reg<Vec3> dst,
+                               Fragment& fragment, const Corrected& c, Reg<Scalar> cx,
+                               Reg<Scalar> cy, Reg<Scalar> depth)
+{
+    if (shading.mode != ShadingMode::Custom) {
+        k.copy_into(dst.component(0), c.w1);
+        k.copy_into(dst.component(1), c.w2);
+        k.copy_into(dst.component(2), c.w0);
+        return;
+    }
+    fragment.out = dst;
+    fragment.x = cx;
+    fragment.y = cy;
+    fragment.depth = depth;
+    fragment.w0 = c.w0;
+    fragment.w1 = c.w1;
+    fragment.w2 = c.w2;
+    shading.shade(k, fragment);
 }
 
 // Keeping a triangle that covered the pixel and beat the running best — the one

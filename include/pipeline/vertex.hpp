@@ -23,6 +23,16 @@ struct VertexStageArgs {
     uint32_t width = 0;
     uint32_t height = 0;
 
+    // Per-vertex attributes that ride through to the fragment stage, and how
+    // many floats of them a vertex has.
+    //
+    // Zero is what every launch before them declared, and the screen vertex is
+    // then exactly the four floats it always was. Pass 1 copies them rather than
+    // computing them: a stage that computed its own would be a vertex shader,
+    // which is a callback this does not have yet.
+    size_t attribute_offset = 0;
+    uint32_t varying_count = 0;
+
     // Where the view-projection is, if it is not baked into the program.
     //
     // Zero means bake it: sixteen moves, and a program that serves one matrix.

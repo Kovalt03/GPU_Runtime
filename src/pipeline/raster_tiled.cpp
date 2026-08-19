@@ -176,9 +176,13 @@ Program build_tiled_raster_program(void** args)
             k.fma(depth, w2, z2);
 
             const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
-            emit_keep(
-                k, a.predicated, take, best_z, best, depth, one,
-                [&](Reg<Vec3> dst) { emit_shade(k, dst, w0, w1, w2, iw0, iw1, iw2); });
+            emit_keep(k, a.predicated, take, best_z, best, depth, one,
+                      [&](Reg<Vec3> dst) {
+                          Fragment fragment;
+                          emit_covered_pixel(k, a.shading, dst, fragment,
+                                             emit_correct(k, w0, w1, w2, iw0, iw1, iw2),
+                                             cx, cy, depth);
+                      });
 
             k.fma(tri_addr, stride, one);
             k.fma(i, one, one);
@@ -204,6 +208,16 @@ void run_tiled_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
 {
     if (args.width == 0 || args.height == 0) {
         throw std::runtime_error("run_tiled_raster_stage: an image with no pixels");
+    }
+    if (args.shading.mode == ShadingMode::Diffuse) {
+        throw std::runtime_error(
+            "run_tiled_raster_stage: a tile carries screen positions only, so this "
+            "route has no world position to light — the walk and the tracer do");
+    }
+    if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {
+        throw std::runtime_error(
+            "run_tiled_raster_stage: Custom shading with nothing to emit — set "
+            "Shading::shade");
     }
 
     // One block per tile, which is what makes blockIdx the tile index. A block
@@ -282,8 +296,11 @@ void emit_shared_walk(IRBuilder& k, const TiledRasterStageArgs& a,
         k.fma(depth, w2, z2);
 
         const Reg<Scalar> take = k.min(inside, k.lt(depth, best_z));
-        emit_keep(k, a.predicated, take, best_z, best, depth, one,
-                  [&](Reg<Vec3> dst) { emit_shade(k, dst, w0, w1, w2, iw0, iw1, iw2); });
+        emit_keep(k, a.predicated, take, best_z, best, depth, one, [&](Reg<Vec3> dst) {
+            Fragment fragment;
+            emit_covered_pixel(k, a.shading, dst, fragment,
+                               emit_correct(k, w0, w1, w2, iw0, iw1, iw2), cx, cy, depth);
+        });
 
         k.fma(shared_addr, shared_stride, one);
         k.fma(i, one, one);
@@ -494,6 +511,16 @@ void run_shared_raster_stage(MyGPURuntime& rt, const TiledRasterStageArgs& args)
 {
     if (args.width == 0 || args.height == 0) {
         throw std::runtime_error("run_shared_raster_stage: an image with no pixels");
+    }
+    if (args.shading.mode == ShadingMode::Diffuse) {
+        throw std::runtime_error(
+            "run_shared_raster_stage: a tile carries screen positions only, so this "
+            "route has no world position to light — the walk and the tracer do");
+    }
+    if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {
+        throw std::runtime_error(
+            "run_shared_raster_stage: Custom shading with nothing to emit — set "
+            "Shading::shade");
     }
 
     // Real hardware splits an overfull tile across passes, and so does the

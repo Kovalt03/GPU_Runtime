@@ -181,6 +181,36 @@ Program build_raytrace_program(void** args)
         // and shade the other. dir is not normalised and does not need to be —
         // t is measured in units of it, so the two cancel.
         const auto shade = [&](Reg<Vec3> dst) {
+            if (a.shading.mode == ShadingMode::Custom) {
+                // The same Fragment the raster routes hand over, with two of its
+                // fields meaning what this route can mean by them.
+                //
+                // No varyings: there is no vertex stage here to carry an
+                // attribute, the triangles being read in world space. A shader
+                // that wants per-vertex data reads it from a buffer with the
+                // weights below, which is what they are for.
+                //
+                // depth is the ray parameter rather than an NDC depth. Both are
+                // "how far", both order hits the same way, and neither route has
+                // the other's number to give — a shader that only compares
+                // depths is portable, one that expects [0, 1] is not.
+                Fragment fragment;
+                fragment.out = dst;
+                fragment.x = px;
+                fragment.y = py;
+                fragment.depth = t;
+
+                // Möller-Trumbore's u and v are already the weights of v1 and v2,
+                // and they are exact rather than corrected: a ray meets the
+                // triangle in world space, so there is no projection to undo.
+                // Naming them w1 and w2 rather than w0 and w1 is what makes one
+                // shader draw the same picture down this route and the walk.
+                fragment.w0 = k.sub(k.sub(one, u), v);
+                fragment.w1 = u;
+                fragment.w2 = v;
+                a.shading.shade(k, fragment);
+                return;
+            }
             if (a.shading.mode == ShadingMode::Diffuse) {
                 const Reg<Vec3> normal = k.normalize(k.cross(e1, e2));
                 const Reg<Vec3> point = k.add(origin, k.scale(dir, t));
@@ -252,6 +282,11 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
     }
     if (args.triangle_count == 0) {
         throw std::runtime_error("run_raytrace_stage: nothing to trace");
+    }
+    if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {
+        throw std::runtime_error(
+            "run_raytrace_stage: Custom shading with nothing to emit — set "
+            "Shading::shade");
     }
 
     const dim3 block{WARP_SIZE, 1, 1};

@@ -92,8 +92,8 @@ Program build_vertex_program(void** args)
 
         // A second address register, the two buffers no longer sharing a
         // stride: the screen vertex carries 1/w and the world one does not.
-        const Reg<Scalar> out_addr =
-            k.mul(id, k.constant(static_cast<float>(SCREEN_VERTEX_BYTES)));
+        const Reg<Scalar> out_addr = k.mul(
+            id, k.constant(static_cast<float>(screen_vertex_bytes(a.varying_count))));
 
         const float screen_base = static_cast<float>(a.screen_offset);
         k.store(out_addr, sx, screen_base + 0.0f);
@@ -103,6 +103,21 @@ Program build_vertex_program(void** args)
         // inv_w falls out of the divide above at no extra cost, and pass 2
         // cannot recover it once w is gone.
         k.store(out_addr, inv_w, screen_base + 12.0f);
+
+        // The varyings, copied through. A vertex's attributes sit in a buffer of
+        // their own and land in the slots after the four above, so that pass 2
+        // reads a vertex once and has everything about it.
+        if (a.varying_count > 0) {
+            const Reg<Scalar> from = k.add(
+                k.constant(static_cast<float>(a.attribute_offset)),
+                k.mul(id,
+                      k.constant(static_cast<float>(a.varying_count) * sizeof(float))));
+            for (uint32_t i = 0; i < a.varying_count; ++i) {
+                const float at = static_cast<float>(i * sizeof(float));
+                k.store(out_addr, k.load(from, at),
+                        screen_base + static_cast<float>(SCREEN_VERTEX_BYTES) + at);
+            }
+        }
     });
 
     return k.build();

@@ -2398,3 +2398,298 @@ TEST(Pipeline, TheTwoFramesAreDifferentBuffers)
     EXPECT_NE(first, second) << "presenting did not change which frame is drawn into";
     EXPECT_EQ(first, third) << "two buffers should come back round";
 }
+
+// ---------------------------------------------------------------------------
+// Shaders — a caller's own fragment stage, and the varyings that feed it
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Runs both passes over one triangle list, with a caller's shading function and
+// however many varyings it asked for. The attributes are per vertex, tightly
+// packed, `varyings` floats each.
+std::vector<Float3> shade_with(const std::vector<Float3>& world,
+                               const std::vector<float>& attributes, uint32_t varyings,
+                               const ShadeFn& shade, const DrawTarget& target)
+{
+    MyGPURuntime rt(1u << 24);
+    void* geometry = rt.myrt_malloc(world.size() * sizeof(Float3));
+    void* screen = rt.myrt_malloc(world.size() * screen_vertex_bytes(varyings));
+    rt.myrt_memcpy(geometry, world.data(), world.size() * sizeof(Float3),
+                   Direction::HostToDevice);
+
+    void* attribute_buffer = nullptr;
+    if (!attributes.empty()) {
+        attribute_buffer = rt.myrt_malloc(attributes.size() * sizeof(float));
+        rt.myrt_memcpy(attribute_buffer, attributes.data(),
+                       attributes.size() * sizeof(float), Direction::HostToDevice);
+    }
+
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    VertexStageArgs vertex;
+    vertex.view_projection = target.camera.view_projection(target.aspect());
+    vertex.world_offset = rt.myrt_device_offset(geometry);
+    vertex.screen_offset = rt.myrt_device_offset(screen);
+    vertex.vertex_count = static_cast<uint32_t>(world.size());
+    vertex.width = target.width;
+    vertex.height = target.height;
+    vertex.varying_count = varyings;
+    vertex.attribute_offset =
+        attribute_buffer != nullptr ? rt.myrt_device_offset(attribute_buffer) : 0;
+    run_vertex_stage(rt, vertex);
+    rt.myrt_sync(false);
+
+    RasterStageArgs raster;
+    raster.screen_offset = rt.myrt_device_offset(screen);
+    raster.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    raster.width = target.width;
+    raster.height = target.height;
+    raster.triangle_count = static_cast<uint32_t>(world.size() / 3);
+    raster.varying_count = varyings;
+    raster.shading.mode = ShadingMode::Custom;
+    raster.shading.shade = shade;
+    run_raster_stage(rt, raster);
+
+    std::vector<Float3> pixels = read_back(rt, frame);
+    release(rt, frame);
+    return pixels;
+}
+
+// A triangle near enough to the camera to cover a useful part of the frame.
+std::vector<Float3> shader_triangle()
+{
+    return {Float3{-0.6f, -0.4f, 0.5f}, Float3{0.6f, -0.4f, 0.5f},
+            Float3{0.0f, 0.6f, 0.5f}};
+}
+
+}  // namespace
+
+TEST(Pipeline, AVaryingInterpolatesTheWayTheBuiltInShadingDoes)
+{
+    // The built-in Barycentric mode writes the perspective-corrected weights as
+    // a colour, and it has been checked against a host reference since it
+    // existed. Hand a vertex the unit colours and a varying carries exactly
+    // those weights — so a caller's shader that writes them has to produce the
+    // same frame, pixel for pixel.
+    const std::vector<Float3> world = shader_triangle();
+    const DrawTarget target = default_target();
+
+    // emit_shade rotates the weights on their way to the channels — red takes
+    // w1, green w2, blue w0 — so the attributes are rotated to match. Getting
+    // this wrong is what the test is for: the two frames then differ by a
+    // permutation rather than by a number, which is the mistake a tolerance
+    // would hide.
+    const std::vector<float> unit_colours{0, 0, 1, 1, 0, 0, 0, 1, 0};
+    const std::vector<Float3> shaded = shade_with(
+        world, unit_colours, 3,
+        [](IRBuilder& k, const Fragment& f) {
+            for (uint32_t i = 0; i < 3; ++i) {
+                k.copy_into(f.out.component(i), f.varyings[i]);
+            }
+        },
+        target);
+
+    MyGPURuntime rt(1u << 24);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> built_in = draw_walk(rt, geometry, frame, target);
+
+    ASSERT_EQ(shaded.size(), built_in.size());
+    uint32_t covered = 0;
+    for (size_t i = 0; i < built_in.size(); ++i) {
+        EXPECT_FLOAT_EQ(shaded[i].x, built_in[i].x) << "pixel " << i;
+        EXPECT_FLOAT_EQ(shaded[i].y, built_in[i].y) << "pixel " << i;
+        EXPECT_FLOAT_EQ(shaded[i].z, built_in[i].z) << "pixel " << i;
+        if (built_in[i].x + built_in[i].y + built_in[i].z > 0.0f) {
+            ++covered;
+        }
+    }
+    EXPECT_GT(covered, 8u) << "two blank frames agree about nothing";
+
+    release(rt, frame);
+    release(rt, geometry);
+}
+
+TEST(Pipeline, AShaderMaySpendTheWholeInstructionSet)
+{
+    // Not a colour expression — a program. This one reads the pixel it is
+    // shading and branches on it, which is what makes the callback more than a
+    // table of modes.
+    const DrawTarget target = default_target();
+    const std::vector<Float3> pixels = shade_with(
+        shader_triangle(), std::vector<float>{}, 0,
+        [](IRBuilder& k, const Fragment& f) {
+            // Two halves, split down the middle of the frame — computed from the
+            // pixel rather than sampled from anything.
+            const Reg<Scalar> stripe =
+                k.ge(f.x, k.constant(static_cast<float>(WIDTH) / 2.0f));
+            k.copy_into(f.out.component(0), stripe);
+            k.copy_into(f.out.component(1), k.sub(k.constant(1.0f), stripe));
+            k.set(f.out.component(2), 0.25f);
+        },
+        target);
+
+    uint32_t red = 0;
+    uint32_t green = 0;
+    for (const Float3& pixel : pixels) {
+        if (pixel.z != 0.25f) {
+            continue;  // not covered
+        }
+        if (pixel.x > 0.5f) {
+            ++red;
+        }
+        if (pixel.y > 0.5f) {
+            ++green;
+        }
+    }
+    EXPECT_GT(red, 0u) << "the branch went one way everywhere";
+    EXPECT_GT(green, 0u) << "the branch went the other way everywhere";
+}
+
+TEST(Pipeline, CustomShadingWithNothingToEmitIsRefused)
+{
+    MyGPURuntime rt(1u << 20);
+    RasterStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 1;
+    args.shading.mode = ShadingMode::Custom;
+    EXPECT_THROW(run_raster_stage(rt, args), std::runtime_error);
+
+    args.shading.shade = [](IRBuilder&, const Fragment&) {};
+    args.varying_count = MAX_VARYINGS + 1;
+    EXPECT_THROW(run_raster_stage(rt, args), std::runtime_error);
+}
+
+TEST(Pipeline, TheTiledRoutesHonourAShaderAndStillMatchTheWalk)
+{
+    // A tile carries screen positions only, which is why it refuses a light and
+    // a varying. It does not follow that it refuses a shader: the weights, the
+    // pixel and the depth are all in the kernel already, and a shader that asks
+    // the geometry no questions wants nothing else. Refusing it would have been
+    // the wider claim, not the safer one.
+    //
+    // Identical rather than merely close, unlike the tracer below: these read
+    // the same screen vertices the walk does and run the same arithmetic on
+    // them, so a difference here is a bug rather than a method.
+    const ShadeFn shade = [](IRBuilder& k, const Fragment& f) {
+        k.copy_into(f.out.component(0), k.mul(f.w2, k.constant(0.8f)));
+        k.copy_into(f.out.component(1), k.mul(f.depth, k.constant(0.5f)));
+        k.copy_into(f.out.component(2), k.mul(f.w0, k.constant(0.3f)));
+    };
+
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    Shading custom;
+    custom.mode = ShadingMode::Custom;
+    custom.shade = shade;
+
+    MyGPURuntime rt(1u << 24);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    const std::vector<Float3> walked =
+        draw_walk(rt, geometry, frame, target, false, custom);
+    const std::vector<Float3> tiled =
+        draw_tiled(rt, geometry, frame, target, false, custom);
+    const std::vector<Float3> shared =
+        draw_shared(rt, geometry, frame, target, false, custom);
+
+    uint32_t coloured = 0;
+    ASSERT_EQ(tiled.size(), walked.size());
+    ASSERT_EQ(shared.size(), walked.size());
+    for (size_t i = 0; i < walked.size(); ++i) {
+        ASSERT_NEAR(tiled[i].x, walked[i].x, PIXEL_EPS) << "tiled pixel " << i;
+        ASSERT_NEAR(tiled[i].z, walked[i].z, PIXEL_EPS) << "tiled pixel " << i;
+        ASSERT_NEAR(shared[i].x, walked[i].x, PIXEL_EPS) << "shared pixel " << i;
+        ASSERT_NEAR(shared[i].z, walked[i].z, PIXEL_EPS) << "shared pixel " << i;
+        if (walked[i].x > 0.01f) {
+            ++coloured;
+        }
+    }
+    EXPECT_GT(coloured, 0u) << "the shader coloured nothing, so nothing was compared";
+
+    // A varying is a different matter: the tile format is three vertices of four
+    // floats, fixed inside the kernel, so there is nowhere to put one.
+    Shading lit;
+    lit.mode = ShadingMode::Diffuse;
+    EXPECT_THROW(draw_tiled(rt, geometry, frame, target, false, lit), std::runtime_error);
+
+    Shading empty;
+    empty.mode = ShadingMode::Custom;
+    EXPECT_THROW(draw_shared(rt, geometry, frame, target, false, empty),
+                 std::runtime_error);
+
+    release(rt, frame);
+    release(rt, geometry);
+}
+
+TEST(Pipeline, OneShaderDrawsTheSamePictureDownTheWalkAndTheTracer)
+{
+    // The two routes reach the barycentric weights by different arithmetic: the
+    // walk interpolates across a projected triangle and corrects for
+    // perspective, the tracer gets Möller-Trumbore's u and v straight out of a
+    // world-space solve. Naming them the same way is a claim, and this is what
+    // checks it — one shader, two routes, one picture.
+    //
+    // Written to spend all three weights unevenly, so a shader that had them in
+    // the wrong order would not survive: an even blend would hide a rotation.
+    const ShadeFn shade = [](IRBuilder& k, const Fragment& f) {
+        k.copy_into(f.out.component(0), k.mul(f.w0, k.constant(0.9f)));
+        k.copy_into(f.out.component(1), k.mul(f.w1, k.constant(0.5f)));
+        k.copy_into(f.out.component(2), k.mul(f.w2, k.constant(0.2f)));
+    };
+
+    const std::vector<WorldTriangle> scene = shared_scene();
+    const std::vector<Float3> world = as_vertex_list(scene);
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    Shading custom;
+    custom.mode = ShadingMode::Custom;
+    custom.shade = shade;
+
+    MyGPURuntime ray_rt(1u << 24);
+    const std::vector<Float3> traced = draw_raytrace(ray_rt, world, target, custom);
+
+    MyGPURuntime raster_rt(1u << 24);
+    DeviceGeometry geometry = upload(raster_rt, world);
+    DeviceFrame frame = allocate_frame(raster_rt, target);
+    const std::vector<Float3> walked =
+        draw_walk(raster_rt, geometry, frame, target, false, custom);
+
+    ASSERT_EQ(traced.size(), walked.size());
+    uint32_t differing = 0;
+    uint32_t coloured = 0;
+    for (size_t i = 0; i < traced.size(); ++i) {
+        const bool same = std::abs(traced[i].x - walked[i].x) < PIXEL_EPS &&
+                          std::abs(traced[i].y - walked[i].y) < PIXEL_EPS &&
+                          std::abs(traced[i].z - walked[i].z) < PIXEL_EPS;
+        differing += same ? 0u : 1u;
+        if (walked[i].x > 0.01f) {
+            ++coloured;
+        }
+    }
+    EXPECT_GT(coloured, 0u) << "the shader coloured nothing, so nothing was compared";
+    EXPECT_LT(differing, traced.size() / 100)
+        << differing << " of " << traced.size() << " pixels disagree";
+
+    release(raster_rt, frame);
+    release(raster_rt, geometry);
+}
+
+TEST(Pipeline, TheTracerRefusesCustomShadingWithNothingToEmit)
+{
+    // The mode reaches this route through the same Shading the walk takes, so
+    // the route that cannot honour it has to say so. Before the shader moved
+    // inside Shading, Custom fell through to the barycentric arm here and drew
+    // a plausible frame that was not the one asked for.
+    MyGPURuntime rt(1u << 20);
+    RaytraceStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 1;
+    args.shading.mode = ShadingMode::Custom;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}
