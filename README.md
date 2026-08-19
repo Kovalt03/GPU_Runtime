@@ -289,6 +289,10 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
 ./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
 
+# The device deciding how much to draw
+./build/benchmarks/cull_bench                # benchmarks/result/cull.{md,csv}
+./build/benchmarks/cull_bench --machine machines/four-sm.spec
+
 # Reordering the threads, on divergence the scene put there
 ./build/benchmarks/material_bench            # benchmarks/result/material.{md,csv}
 
@@ -574,9 +578,9 @@ this project exists to measure.
 | Input Assembler | fixed | **partly** — an index buffer is fetched and expanded, but by the raster kernel itself rather than a block ahead of it |
 | Post-transform vertex cache | fixed | **absent** — pass 1 transforms each unique vertex once, which is the saving the cache exists to make, but nothing reuses a result *within* a launch. `simulated_cache_misses` scores meshes against the cache the hardware would have |
 | Vertex shader | programmable | `build_vertex_program`, one thread per vertex |
-| Primitive assembly, clip, cull | fixed | back-face culling only, inside the kernel; **no clipping** |
+| Primitive assembly, clip, cull | fixed | back-face culling inside the kernel, near-plane clipping as a pass of its own, and frustum culling per instance — the last of those decides the next launch's grid, so the host never learns how much survived |
 | Rasteriser (edge functions, quad generation) | fixed | `build_raster_program`, one thread per pixel |
-| Hi-Z / early-Z | fixed | **absent** — every pixel shades every triangle and keeps the nearest |
+| Hi-Z / early-Z | fixed | **partly** — `DepthUse::EarlyZ` and a depth prepass are built and measured; the hierarchical form is not |
 | Fragment shader | programmable | folded into the raster kernel |
 | ROP (blend, depth write) | fixed | **absent** — the running nearest lives in a register |
 | Texture units, samplers | fixed | **absent** |
@@ -677,6 +681,7 @@ gpu-runtime-sim/
 ├── machines/                # a machine a benchmark can be pointed at
 │   ├── default.spec
 │   ├── one-sm.spec
+│   ├── four-sm.spec
 │   ├── v100.spec
 │   └── a100.spec
 ├── include/
@@ -700,6 +705,7 @@ gpu-runtime-sim/
 │       ├── raster_tiled.hpp
 │       ├── raytrace.hpp
 │       ├── clip.hpp         # near-plane clipping, compacted with an atomic
+│       ├── cull.hpp         # frustum culling, and the grid the draw after it reads
 │       ├── swap_chain.hpp   # two frames, and a clear that overlaps the draw
 │       └── draw.hpp          # the routes, each taking a mesh or a vertex list
 ├── src/
@@ -725,6 +731,7 @@ gpu-runtime-sim/
 │       ├── raster_tiled.cpp
 │       ├── raytrace.cpp
 │       ├── clip.cpp
+│       ├── cull.cpp
 │       └── swap_chain.cpp
 ├── kernels/
 │   ├── ppm.hpp
@@ -744,6 +751,7 @@ gpu-runtime-sim/
 │   ├── test_math3d.cpp
 │   ├── test_mesh.cpp
 │   ├── test_bvh.cpp
+│   ├── test_cull.cpp
 │   ├── test_gemm.cpp
 │   ├── test_pipeline.cpp
 │   ├── reference.hpp        # host oracles, built into the test target only
@@ -769,6 +777,7 @@ gpu-runtime-sim/
 │   ├── instance_bench.cpp   # where a model matrix meets the view-projection
 │   ├── tlas_bench.cpp       # one tree over the copies, or one over all of them
 │   ├── material_bench.cpp   # reordering, on divergence the scene put there
+│   ├── cull_bench.cpp       # the device deciding how much to draw
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```

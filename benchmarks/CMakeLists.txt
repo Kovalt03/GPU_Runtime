@@ -71,3 +71,7 @@ target_link_libraries(tlas_bench PRIVATE gpurt project_warnings)
 # Reordering the threads, on divergence nobody put there to be reordered.
 add_executable(material_bench material_bench.cpp)
 target_link_libraries(material_bench PRIVATE gpurt project_warnings)
+
+# The device deciding how much to draw.
+add_executable(cull_bench cull_bench.cpp)
+target_link_libraries(cull_bench PRIVATE gpurt project_warnings)

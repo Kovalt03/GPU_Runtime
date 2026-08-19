@@ -17,6 +17,7 @@ cmake --build build -j8
 ./build/benchmarks/instance_bench   #         plus benchmarks/result/instance.{md,csv}
 ./build/benchmarks/tlas_bench       #         plus benchmarks/result/tlas.{md,csv}
 ./build/benchmarks/material_bench   #         plus benchmarks/result/material.{md,csv}
+./build/benchmarks/cull_bench       #         plus benchmarks/result/cull.{md,csv}
 ```
 
 **Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
@@ -1010,6 +1011,67 @@ Nothing stopped a kernel keeping its uniforms in global memory, and under
 `Coalesced` a warp reading one address was already one transaction. What the
 space adds is that it **cannot be anything else**: an address that varies by lane
 cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
+## The device deciding how much to draw
+
+`myrt_launch_indirect` reads a grid from device memory when a launch reaches the
+machine, and `V_ATOM_ADD_GLOBAL_F32` gives a surviving lane a slot nobody else
+got. Both were built with nothing to point at — *Two queues, and a grid the host
+never learns* measured the first with a culling pass that walked its candidates
+one thread at a time, 810 cycles of 900, because a flag buffer stood in for a
+scene. Instancing supplied the thing it stood in for.
+
+### What culling removes
+
+| Visible | Drawn | No cull | Culled | Change |
+|---:|---:|---:|---:|---:|
+| 100% | 64 of 64 | 11,064 | 11,304 | **+2.2%** |
+| 100% | 64 of 64 | 11,064 | 11,304 | **+2.2%** |
+| 89% | 57 of 64 | 11,064 | 10,212 | **-7.7%** |
+| 45% | 29 of 64 | 11,064 | 5,844 | **-47.2%** |
+
+64 candidates of 96 vertices each. The cull is one thread an instance, six plane
+tests against the box's furthest corner, and an atomic to compact what survives —
+240 instructions for 64 candidates against the loop's 810 cycles for the same
+count.
+
+**It costs 2.2% when the camera sees everything**, which is the honest half: a
+cull that rejects nothing is a pass that ran for nothing. What it buys scales
+with what it rejects, and by 45% visible it has halved the frame.
+
+### What deciding on the device removes
+
+Reading the count back means draining every queue, so the synchronisation costs
+whatever the other one still had to do.
+
+| Other work | Host reads the count | Device decides | Change |
+|---:|---:|---:|---:|
+| 1 block | 2,371 | 2,358 | **-0.5%** |
+| 4 blocks | 2,506 | 2,491 | **-0.6%** |
+| 16 blocks | 2,896 | 2,844 | **-1.8%** |
+| 64 blocks | 4,516 | 4,464 | **-1.2%** |
+| 256 blocks | 10,996 | 10,981 | **-0.1%** |
+
+`machines/four-sm.spec`, because the default machine is one SM holding one block
+and nothing there ever overlaps — the indirect launch measures exactly 0.0% on
+it, which is right rather than disappointing.
+
+**It is small, and it peaks in the middle.** With one block of unrelated work
+there is nothing for a drain to throw away; with 256 the draw is a rounding error
+beside it. In between, the overlap the synchronisation would have cost is worth
+about 1.8%.
+
+**So the indirect launch is not where the saving is** — culling is, and an
+indirect launch is what lets culling happen without a round trip. The two are
+reported apart because a single table would credit the wrong one.
+
+**What this does not settle.** Pass 2 still takes its triangle count as a host
+value baked into the kernel, so what the device decides is how much geometry is
+transformed and not how much is rasterised. And the boxes are host data uploaded
+once; a scene whose instances move would have to compute them on the device, and
+that is where a mid-frame readback would really hurt.
 
 ---
 
