@@ -450,6 +450,87 @@ std::vector<Float3> draw_depth_tested(MyGPURuntime& rt, const DeviceGeometry& ge
     return download(rt, frame);
 }
 
+size_t instanced_screen_bytes(uint32_t vertex_count, uint32_t instances,
+                              uint32_t varying_count)
+{
+    return static_cast<size_t>(vertex_count) * instances *
+           screen_vertex_bytes(varying_count);
+}
+
+std::vector<Float3> draw_instanced(MyGPURuntime& rt, const DeviceGeometry& geometry,
+                                   const DeviceFrame& frame, const DrawTarget& target,
+                                   const std::vector<Instance>& instances,
+                                   InstanceTransform transform)
+{
+    if (instances.empty()) {
+        throw std::runtime_error("draw_instanced: nothing to draw");
+    }
+    if (geometry.indexed()) {
+        throw std::runtime_error(
+            "draw_instanced: an indexed upload, and pass 2 reads a flat vertex "
+            "run per instance — upload it flattened");
+    }
+
+    const uint32_t count = static_cast<uint32_t>(instances.size());
+
+    // The matrices go up as one buffer and the constant window starts at it, so
+    // a block's address is its blockIdx.y scaled by a matrix. Composed results
+    // sit in a second buffer of the same shape rather than overwriting the
+    // models, which a second frame would need again.
+    std::vector<float> matrices;
+    matrices.reserve(static_cast<size_t>(count) * MAT4_REGISTERS);
+    for (const Instance& instance : instances) {
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                matrices.push_back(instance.model.at(row, col));
+            }
+        }
+    }
+
+    void* models = rt.myrt_malloc(matrices.size() * sizeof(float));
+    rt.myrt_memcpy(models, matrices.data(), matrices.size() * sizeof(float),
+                   Direction::HostToDevice);
+    void* composed = transform == InstanceTransform::ComposePass
+                         ? rt.myrt_malloc(matrices.size() * sizeof(float))
+                         : nullptr;
+
+    VertexStageArgs pass1;
+    pass1.view_projection = target.camera.view_projection(target.aspect());
+    pass1.world_offset = rt.myrt_device_offset(geometry.world);
+    pass1.screen_offset = rt.myrt_device_offset(geometry.screen);
+    pass1.vertex_count = geometry.vertex_count;
+    pass1.width = target.width;
+    pass1.height = target.height;
+    pass1.instance_count = count;
+    pass1.instance_offset = rt.myrt_device_offset(models);
+    pass1.transform = transform;
+
+    // The window starts at the matrices, so const_base plus blockIdx.y x 64 is
+    // the block's own. The view-projection is baked in the per-vertex arm, the
+    // window being spent on what varies.
+    pass1.uniform_offset = pass1.instance_offset;
+
+    if (composed != nullptr) {
+        pass1.composed_offset = rt.myrt_device_offset(composed);
+        run_compose_stage(rt, pass1);
+        rt.myrt_sync(false);
+    }
+    run_vertex_stage(rt, pass1);
+    rt.myrt_sync(false);
+
+    RasterStageArgs args;
+    args.screen_offset = pass1.screen_offset;
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.width = target.width;
+    args.height = target.height;
+    args.triangle_count = geometry.triangle_count * count;
+    run_raster_stage(rt, args);
+
+    rt.myrt_free(models);
+    rt.myrt_free(composed);
+    return download(rt, frame);
+}
+
 std::vector<Float3> draw_walk(MyGPURuntime& rt, const DeviceGeometry& geometry,
                               const DeviceFrame& frame, const DrawTarget& target,
                               bool predicated, const Shading& shading)
@@ -766,4 +847,63 @@ SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
     run_vertex_stage(rt, args);
 
     return rt.stats();
+}
+
+SchedulerStats instanced_vertex_cost(const std::vector<Float3>& vertices,
+                                     const DrawTarget& target,
+                                     const std::vector<Instance>& instances,
+                                     InstanceTransform transform)
+{
+    const uint32_t count = static_cast<uint32_t>(instances.size());
+    BufferPlan plan;
+    plan.world_vertices = static_cast<uint32_t>(vertices.size());
+    plan.screen_vertices = plan.world_vertices * count;
+
+    MyGPURuntime rt(plan.device_bytes() + (1u << 16) +
+                    2 * count * MAT4_REGISTERS * sizeof(float));
+    DeviceGeometry geometry = upload(rt, vertices, VertexStage::None);
+    const Owned<DeviceGeometry> own_geometry{rt, geometry};
+    void* screen = rt.myrt_malloc(instanced_screen_bytes(geometry.vertex_count, count));
+
+    std::vector<float> matrices;
+    matrices.reserve(static_cast<size_t>(count) * MAT4_REGISTERS);
+    for (const Instance& instance : instances) {
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                matrices.push_back(instance.model.at(row, col));
+            }
+        }
+    }
+    void* models = rt.myrt_malloc(matrices.size() * sizeof(float));
+    rt.myrt_memcpy(models, matrices.data(), matrices.size() * sizeof(float),
+                   Direction::HostToDevice);
+
+    VertexStageArgs args;
+    args.view_projection = target.camera.view_projection(target.aspect());
+    args.world_offset = rt.myrt_device_offset(geometry.world);
+    args.screen_offset = rt.myrt_device_offset(screen);
+    args.vertex_count = geometry.vertex_count;
+    args.width = target.width;
+    args.height = target.height;
+    args.instance_count = count;
+    args.instance_offset = rt.myrt_device_offset(models);
+    args.uniform_offset = args.instance_offset;
+    args.transform = transform;
+
+    void* composed = nullptr;
+    if (transform == InstanceTransform::ComposePass) {
+        composed = rt.myrt_malloc(matrices.size() * sizeof(float));
+        args.composed_offset = rt.myrt_device_offset(composed);
+
+        // No sync between them, and none needed for the counters: the reading is
+        // the sum of both launches, which is the number the trade turns on.
+        run_compose_stage(rt, args);
+    }
+    run_vertex_stage(rt, args);
+
+    const SchedulerStats stats = rt.stats();
+    rt.myrt_free(composed);
+    rt.myrt_free(models);
+    rt.myrt_free(screen);
+    return stats;
 }

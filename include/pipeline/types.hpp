@@ -94,6 +94,24 @@ struct ScreenTriangle {
 inline constexpr uint32_t PIXEL_FLOATS = 3;
 inline constexpr uint32_t PIXEL_BYTES = PIXEL_FLOATS * sizeof(float);
 
+// --- instancing --------------------------------------------------------------
+// Where an instance's model matrix meets the view-projection.
+//
+// A flag because it is a crossing rather than a winner, and the cost model says
+// where: MATMUL is four MATVECs, so folding once an instance beats an extra
+// MATVEC at every vertex exactly when an instance has more than four vertices.
+// Both arms deliver one matrix through the constant window, so that cost cancels
+// and what is left is the arithmetic.
+enum class InstanceTransform {
+    // Two transforms at every vertex: by the model matrix, then by the
+    // view-projection. No composition anywhere, and nothing to schedule.
+    PerVertex,
+
+    // A pass ahead of pass 1 folds the two, one thread an instance. Pass 1 then
+    // does the single MATVEC it always did, reading a different matrix.
+    ComposePass,
+};
+
 // --- shading -----------------------------------------------------------------
 // How a hit is coloured, shared by both renderers so that a frame from one can
 // be held against a frame from the other.

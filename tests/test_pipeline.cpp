@@ -2846,3 +2846,178 @@ TEST(Pipeline, ATreeWithNoStackToWalkItIsRefused)
     args.stack_depth = SHARED_MEM_FLOATS;
     EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
 }
+
+namespace {
+
+// Four copies of a shape, spread across the frame. Distinct translations, so an
+// instance drawn with the wrong matrix lands somewhere visible.
+std::vector<Instance> spread_instances(uint32_t count)
+{
+    std::vector<Instance> instances;
+    for (uint32_t i = 0; i < count; ++i) {
+        Float4x4 model = Float4x4::identity();
+        model.at(0, 3) = -0.75f + static_cast<float>(i) * 0.5f;
+        model.at(1, 3) = static_cast<float>(i % 2) * 0.3f - 0.15f;
+        instances.push_back(Instance{model});
+    }
+    return instances;
+}
+
+// An upload whose screen buffer is sized for instances rather than for one draw.
+DeviceGeometry upload_for_instances(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                    uint32_t instances)
+{
+    DeviceGeometry geometry = upload(rt, world, VertexStage::None);
+    geometry.screen =
+        rt.myrt_malloc(instanced_screen_bytes(geometry.vertex_count, instances));
+    return geometry;
+}
+
+}  // namespace
+
+TEST(Pipeline, BothPlacesToFoldTheModelMatrixDrawTheSameFrame)
+{
+    // The crossing between them is only about cost, so the frames have to agree.
+    //
+    // Agree rather than match bit for bit, unlike the BVH against the linear
+    // walk: floating-point matrix products do not associate, so (VP x M) x v and
+    // VP x (M x v) land a few ulps apart. That is not free of consequence — a
+    // vertex a hair either side of a pixel centre changes which lane the edge
+    // function keeps — so the count of pixels that differ is checked too, and it
+    // has to be none at this tolerance rather than merely few.
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Instance> instances = spread_instances(4);
+
+    std::vector<std::vector<Float3>> frames;
+    for (InstanceTransform transform :
+         {InstanceTransform::PerVertex, InstanceTransform::ComposePass}) {
+        MyGPURuntime rt(1u << 25);
+        DeviceGeometry geometry =
+            upload_for_instances(rt, world, static_cast<uint32_t>(instances.size()));
+        DeviceFrame frame = allocate_frame(rt, target);
+        frames.push_back(
+            draw_instanced(rt, geometry, frame, target, instances, transform));
+        release(rt, frame);
+        release(rt, geometry);
+    }
+
+    uint32_t lit = 0;
+    uint32_t covered_differently = 0;
+    ASSERT_EQ(frames[0].size(), frames[1].size());
+    for (size_t i = 0; i < frames[0].size(); ++i) {
+        ASSERT_NEAR(frames[0][i].x, frames[1][i].x, PIXEL_EPS) << "pixel " << i;
+        ASSERT_NEAR(frames[0][i].y, frames[1][i].y, PIXEL_EPS) << "pixel " << i;
+        ASSERT_NEAR(frames[0][i].z, frames[1][i].z, PIXEL_EPS) << "pixel " << i;
+
+        const bool a = frames[0][i].x + frames[0][i].y + frames[0][i].z > 0.01f;
+        const bool b = frames[1][i].x + frames[1][i].y + frames[1][i].z > 0.01f;
+        covered_differently += a != b ? 1u : 0u;
+        lit += a ? 1u : 0u;
+    }
+    EXPECT_GT(lit, 0u) << "an empty frame matches an empty frame";
+    EXPECT_EQ(covered_differently, 0u) << "the rounding moved an edge across a pixel";
+}
+
+TEST(Pipeline, AnInstanceDrawsWhereItsMatrixPutsIt)
+{
+    // Instancing is not a way of drawing the same thing several times in the same
+    // place. One instance at the origin against four spread out: the second has
+    // to light pixels the first does not, and the frames cannot match.
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+
+    const auto draw = [&](const std::vector<Instance>& instances) {
+        MyGPURuntime rt(1u << 25);
+        DeviceGeometry geometry =
+            upload_for_instances(rt, world, static_cast<uint32_t>(instances.size()));
+        DeviceFrame frame = allocate_frame(rt, target);
+        std::vector<Float3> pixels =
+            draw_instanced(rt, geometry, frame, target, instances);
+        release(rt, frame);
+        release(rt, geometry);
+        return pixels;
+    };
+
+    const std::vector<Float3> one = draw({Instance{Float4x4::identity()}});
+    const std::vector<Float3> four = draw(spread_instances(4));
+
+    uint32_t only_in_four = 0;
+    for (size_t i = 0; i < one.size(); ++i) {
+        const bool a = one[i].x + one[i].y + one[i].z > 0.01f;
+        const bool b = four[i].x + four[i].y + four[i].z > 0.01f;
+        only_in_four += (b && !a) ? 1u : 0u;
+    }
+    EXPECT_GT(only_in_four, 0u) << "the extra instances landed on top of the first";
+
+    // And a single instance with the identity is the uninstanced draw, which is
+    // what says the instanced kernel did not change the picture on its own.
+    MyGPURuntime plain_rt(1u << 25);
+    DeviceGeometry geometry = upload(plain_rt, world);
+    DeviceFrame frame = allocate_frame(plain_rt, target);
+    const std::vector<Float3> plain = draw_walk(plain_rt, geometry, frame, target);
+    for (size_t i = 0; i < one.size(); ++i) {
+        ASSERT_EQ(one[i].x, plain[i].x) << "pixel " << i;
+    }
+    release(plain_rt, frame);
+    release(plain_rt, geometry);
+}
+
+TEST(Pipeline, ComposingPaysForItselfOnlyWhenAnInstanceIsLarge)
+{
+    // The plan predicted a crossing at four vertices an instance, from the
+    // arithmetic alone: a MATMUL is four MATVECs, so folding once should beat an
+    // extra MATVEC at every vertex past four of them.
+    //
+    // It is nowhere near there, because the pass is not its multiply. Reading
+    // sixteen floats and writing sixteen costs 3,200 against the MATMUL's 64,
+    // and pass 1 pays none of that — the constant window hands a block its
+    // matrix once for the whole warp. What the trade really is: an extra MATVEC
+    // a vertex against a matrix materialised through memory.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Instance> instances = spread_instances(16);
+
+    const auto cost = [&](uint32_t vertices, InstanceTransform transform) {
+        std::vector<Float3> world;
+        for (uint32_t i = 0; i < vertices; ++i) {
+            world.push_back(Float3{static_cast<float>(i) * 0.01f - 0.3f,
+                                   static_cast<float>(i % 7) * 0.05f, 0.0f});
+        }
+        return instanced_vertex_cost(world, target, instances, transform)
+            .weighted_lane_ops;
+    };
+
+    EXPECT_LT(cost(8, InstanceTransform::PerVertex),
+              cost(8, InstanceTransform::ComposePass))
+        << "a small instance was expected to favour applying twice";
+    EXPECT_GT(cost(256, InstanceTransform::PerVertex),
+              cost(256, InstanceTransform::ComposePass))
+        << "a large instance was expected to favour folding once";
+}
+
+TEST(Pipeline, AnInstancedDrawWithNothingToPlaceIsRefused)
+{
+    MyGPURuntime rt(1u << 22);
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+    DeviceGeometry geometry = upload_for_instances(rt, world, 1);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    EXPECT_THROW(draw_instanced(rt, geometry, frame, target, {}), std::runtime_error);
+
+    // A composed transform with no buffer composed into is the same mistake one
+    // level down, and it reaches the stage rather than the route.
+    VertexStageArgs args;
+    args.vertex_count = 3;
+    args.instance_count = 2;
+    args.instance_offset = 64;
+    args.transform = InstanceTransform::ComposePass;
+    EXPECT_THROW(run_vertex_stage(rt, args), std::runtime_error);
+
+    args.instance_offset = 0;
+    args.transform = InstanceTransform::PerVertex;
+    EXPECT_THROW(run_vertex_stage(rt, args), std::runtime_error);
+
+    release(rt, frame);
+    release(rt, geometry);
+}

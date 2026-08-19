@@ -36,8 +36,19 @@ Program build_vertex_program(void** args)
     //
     // The two forms compute the same frame, and the baked one is what every
     // figure taken before the window existed used.
-    const Reg<Mat4> mvp = [&] {
-        if (a.uniform_offset != 0) {
+    // Which instance this block is drawing. Driven by whether matrices were
+    // supplied rather than by how many: a draw of one instance still has a
+    // transform to apply, and a launch with no instance buffer is the
+    // uninstanced kernel that every figure before this was taken from.
+    const bool instanced = a.instance_offset != 0;
+    const Reg<Scalar> instance = k.block_y();
+
+    const auto view_projection = [&] {
+        // Instanced, the window is spent on the matrices that vary and the
+        // view-projection is baked. Reading it from the window here would read
+        // the first instance's model matrix instead, since that is what the
+        // window points at.
+        if (a.uniform_offset != 0 && !instanced) {
             return k.load_const_mat4(k.const_base());
         }
         const Reg<Mat4> baked = k.mat4();
@@ -48,7 +59,25 @@ Program build_vertex_program(void** args)
             }
         }
         return baked;
-    }();
+    };
+
+    // Where a block's matrix sits: blockIdx.y scaled by a matrix, which is
+    // uniform across the warp — see instance_offset in the header for why that
+    // is the whole reason a per-instance matrix can go in the window at all.
+    const auto instance_matrix = [&](size_t base) {
+        return k.load_const_mat4(
+            k.add(k.const_base(), k.mul(instance, k.constant(static_cast<float>(
+                                                      MAT4_REGISTERS * sizeof(float))))),
+            static_cast<float>(base) - static_cast<float>(a.uniform_offset));
+    };
+
+    // Composed, one matrix carries both and the kernel is the uninstanced one
+    // with a different address. Per-vertex, the model matrix is applied first
+    // and the view-projection after, which is two MATVECs a vertex.
+    const bool composed = instanced && a.transform == InstanceTransform::ComposePass;
+    const Reg<Mat4> mvp = composed    ? instance_matrix(a.composed_offset)
+                          : instanced ? instance_matrix(a.instance_offset)
+                                      : view_projection();
 
     // A launch rounds up to whole warps, so unless vertex_count is a multiple
     // of 32 the last warp runs lanes with no vertex to read. Everything below
@@ -73,7 +102,13 @@ Program build_vertex_program(void** args)
         k.load_into(position.component(2), addr, world_base + 8.0f);
         k.set(position.component(3), 1.0f);
 
-        const Reg<Vec4> clip = k.transform(mvp, position);
+        // Instanced and not composed, mvp holds the model matrix alone and the
+        // view-projection follows it. This is the extra MATVEC a vertex that a
+        // composition pass exists to remove.
+        const Reg<Vec4> model_space = k.transform(mvp, position);
+        const Reg<Vec4> clip = (instanced && !composed)
+                                   ? k.transform(view_projection(), model_space)
+                                   : model_space;
 
         // The perspective divide, and why Reg carries both views: w on its own
         // and xyz as a vector, over one register range.
@@ -92,8 +127,16 @@ Program build_vertex_program(void** args)
 
         // A second address register, the two buffers no longer sharing a
         // stride: the screen vertex carries 1/w and the world one does not.
+        //
+        // Instance-major: instance i's vertices are one run of vertex_count, so
+        // pass 2 sees a single longer list at the stride it already used and
+        // needs no change at all.
+        const Reg<Scalar> slot =
+            instanced ? k.add(id, k.mul(instance,
+                                        k.constant(static_cast<float>(a.vertex_count))))
+                      : id;
         const Reg<Scalar> out_addr = k.mul(
-            id, k.constant(static_cast<float>(screen_vertex_bytes(a.varying_count))));
+            slot, k.constant(static_cast<float>(screen_vertex_bytes(a.varying_count))));
 
         const float screen_base = static_cast<float>(a.screen_offset);
         k.store(out_addr, sx, screen_base + 0.0f);
@@ -123,6 +166,68 @@ Program build_vertex_program(void** args)
     return k.build();
 }
 
+Program build_compose_program(void** args)
+{
+    const VertexStageArgs& a = *static_cast<const VertexStageArgs*>(args[0]);
+    IRBuilder k;
+
+    // One thread an instance, and the view-projection baked: this pass runs once
+    // a frame over a handful of threads, so sixteen moves here are cheaper than
+    // a window read and they leave the window free for the model matrices.
+    const Reg<Mat4> vp = k.mat4();
+    for (uint32_t row = 0; row < MATRIX_DIMENSION; ++row) {
+        for (uint32_t col = 0; col < MATRIX_DIMENSION; ++col) {
+            k.set(vp.component(row * MATRIX_DIMENSION + col),
+                  a.view_projection.at(row, col));
+        }
+    }
+
+    const Reg<Scalar> id = k.thread_x();
+    const Reg<Scalar> live = k.lt(id, k.constant(static_cast<float>(a.instance_count)));
+
+    k.if_(live, [&] {
+        // Read and written through ordinary global memory, not the window: a
+        // lane here wants its own matrix, so the address varies by lane and the
+        // window's pricing would be a lie. The window is for pass 1, where a
+        // block is one instance.
+        const Reg<Scalar> addr =
+            k.mul(id, k.constant(static_cast<float>(MAT4_REGISTERS * sizeof(float))));
+
+        const Reg<Mat4> model = k.mat4();
+        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+            k.load_into(model.component(i), addr,
+                        static_cast<float>(a.instance_offset + i * sizeof(float)));
+        }
+
+        // view_projection * model, in that order: the model matrix acts first.
+        const Reg<Mat4> folded = k.compose(vp, model);
+        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+            k.store(addr, folded.component(i),
+                    static_cast<float>(a.composed_offset + i * sizeof(float)));
+        }
+    });
+
+    return k.build();
+}
+
+void run_compose_stage(MyGPURuntime& rt, const VertexStageArgs& args)
+{
+    if (args.instance_count == 0) {
+        throw std::runtime_error("run_compose_stage: no instances to compose for");
+    }
+    if (args.composed_offset == 0) {
+        throw std::runtime_error(
+            "run_compose_stage: nowhere to put the folded matrices — set "
+            "composed_offset");
+    }
+
+    const dim3 block{WARP_SIZE, 1, 1};
+    const dim3 grid{(args.instance_count + WARP_SIZE - 1) / WARP_SIZE, 1, 1};
+    void* raw = const_cast<VertexStageArgs*>(&args);
+    void* kernel_args[] = {raw};
+    rt.myrt_launch(build_compose_program, grid, block, kernel_args);
+}
+
 void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
 {
     // Caught here rather than left to myrt_launch, which would reject the empty
@@ -130,12 +235,27 @@ void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
     if (args.vertex_count == 0) {
         throw std::runtime_error("run_vertex_stage: a mesh with no vertices");
     }
+    if (args.instance_count == 0) {
+        throw std::runtime_error("run_vertex_stage: a draw of no instances");
+    }
+    if (args.instance_count > 1 && args.instance_offset == 0) {
+        throw std::runtime_error(
+            "run_vertex_stage: " + std::to_string(args.instance_count) +
+            " instances and no matrices for them — set instance_offset");
+    }
+    if (args.instance_offset != 0 && args.transform == InstanceTransform::ComposePass &&
+        args.composed_offset == 0) {
+        throw std::runtime_error(
+            "run_vertex_stage: a composed transform and nowhere it was composed "
+            "into — run_compose_stage writes composed_offset");
+    }
 
     // 1D, one warp wide: a vertex has no second coordinate to spend, unlike a
     // pixel. The last block is partly out of range whenever vertex_count is not
     // a multiple of the warp, which is what the guard in the kernel is for.
     const dim3 block{WARP_SIZE, 1, 1};
-    const dim3 grid{(args.vertex_count + WARP_SIZE - 1) / WARP_SIZE, 1, 1};
+    const dim3 grid{(args.vertex_count + WARP_SIZE - 1) / WARP_SIZE, args.instance_count,
+                    1};
 
     // myrt_launch takes void** after CUDA's convention, so the const has to
     // come off. The kernel only reads it, and args outlives the call.

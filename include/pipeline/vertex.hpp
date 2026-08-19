@@ -41,7 +41,41 @@ struct VertexStageArgs {
     // any matrix. That is the difference between a demo and a runtime: without
     // it, an object with its own transform needs its own build.
     size_t uniform_offset = 0;
+
+    // --- instancing ---------------------------------------------------------
+    // One model matrix an instance, sixteen floats each, in the constant window
+    // beside the view-projection.
+    //
+    // The launch grows a second grid dimension rather than a longer first one:
+    // blockIdx.y is the instance, so **a block is one instance**, and the matrix
+    // a lane wants is the same across its warp. That is what lets it ride the
+    // constant window at all — the window is charged once for a warp, and the
+    // justification is warp-uniformity rather than the address being a launch
+    // constant. A block coordinate preserves it; a lane coordinate would not.
+    //
+    // One instance is what every launch before this declared, and the kernel it
+    // builds is the one that existed then.
+    uint32_t instance_count = 1;
+    size_t instance_offset = 0;
+
+    // Where the model matrix is folded into the view-projection.
+    InstanceTransform transform = InstanceTransform::PerVertex;
+
+    // Where the composition pass put its results, when there was one. Read
+    // instead of instance_offset, and the kernel then does one MATVEC where the
+    // per-vertex form does two.
+    size_t composed_offset = 0;
 };
+
+// Composes view_projection with every model matrix — one thread an instance,
+// one V_MATMUL_MAT4_F32 each.
+//
+// A launch of its own rather than work folded into pass 1, and that is the whole
+// point: composing costs four MATVECs, so doing it once an instance beats doing
+// an extra MATVEC at every vertex only when an instance has more than four of
+// them. A pass makes the "once" real.
+Program build_compose_program(void** args);
+void run_compose_stage(MyGPURuntime& rt, const VertexStageArgs& args);
 
 // Builds pass 1. Matches KernelFunc, so it is handed to myrt_launch directly;
 // args[0] must point at a VertexStageArgs that outlives the launch.

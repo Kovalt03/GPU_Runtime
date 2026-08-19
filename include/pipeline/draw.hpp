@@ -221,6 +221,16 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
 // The ray tracer cannot draw one — see its overload below.
 DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh);
 
+// One object drawn from shared geometry: where it is, and nothing else yet.
+//
+// A material would belong here too and is not here, because nothing reads one.
+// It arrives with the ray tracer's second level, where the instance a ray hits
+// is what decides the shader — which is the divergence SER exists for, and the
+// first in this repository that will not have been built to be measured.
+struct Instance {
+    Float4x4 model;
+};
+
 // Where a draw puts its pixels, kept apart from the geometry because it belongs
 // to the target rather than to the model.
 struct DeviceFrame {
@@ -314,6 +324,24 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geomet
                                   const Shading& shading = Shading{},
                                   bool predicated = false);
 
+// The same geometry drawn several times, each with its own transform.
+//
+// One pass 1 over vertex_count x instances, laid out instance-major, so pass 2
+// sees a single longer vertex list at the stride it already used. Every raster
+// route below therefore draws instances without knowing they exist.
+//
+// `transform` picks where the model matrix meets the view-projection, which is a
+// crossing rather than a winner — see InstanceTransform.
+std::vector<Float3> draw_instanced(
+    MyGPURuntime& rt, const DeviceGeometry& geometry, const DeviceFrame& frame,
+    const DrawTarget& target, const std::vector<Instance>& instances,
+    InstanceTransform transform = InstanceTransform::PerVertex);
+
+// How much room the buffers of an instanced draw need. Pass 1 writes a screen
+// vertex an instance, so the screen buffer is the one that grows.
+size_t instanced_screen_bytes(uint32_t vertex_count, uint32_t instances,
+                              uint32_t varying_count = 0);
+
 // The walk again, with a depth prepass in front of it.
 //
 // Two launches over the same geometry: the first keeps the nearest depth a pixel
@@ -346,3 +374,15 @@ enum class Uniforms {
 SchedulerStats vertex_stage_cost(const std::vector<Float3>& vertices,
                                  const DrawTarget& target,
                                  Uniforms uniforms = Uniforms::Baked);
+
+// Pass 1 again, over instances, and the composition pass ahead of it when there
+// is one. The sum of both launches, since the whole question is whether the one
+// pays for itself in the other.
+//
+// Separate from a draw route for the reason above, and more sharply here: pass 2
+// grows with the instances too and swamps the difference completely — the two
+// arms come out identical to the last lane operation through draw_instanced.
+SchedulerStats instanced_vertex_cost(const std::vector<Float3>& vertices,
+                                     const DrawTarget& target,
+                                     const std::vector<Instance>& instances,
+                                     InstanceTransform transform);
