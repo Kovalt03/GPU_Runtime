@@ -223,6 +223,18 @@ public:
     // than a kernel run — and for a benchmark making fifteen of them.
     void myrt_sync(bool report = true);
 
+    // How many cycles a launch may take before the scheduler gives up on it.
+    //
+    // The guard is against a kernel that does not terminate, and its default is
+    // a flat number — which a large enough grid reaches for an honest reason.
+    // A 1024x1024 walk of six bounces with shadow rays does: twelve traversals
+    // a pixel over a million pixels is more cycles than a launch was ever
+    // expected to want, and refusing it says nothing about whether it ends.
+    //
+    // Raising it costs a caller the guard, so it is not something a stage does
+    // on a caller's behalf. An app rendering something deliberately large asks.
+    void myrt_cycle_budget(uint64_t cycles);
+
     // --- statistics ---------------------------------------------------------
     // Accumulated across every launch since construction or the last
     // myrt_sync(). The Scheduler only ever knows about the launch it is

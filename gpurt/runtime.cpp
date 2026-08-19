@@ -296,6 +296,11 @@ void MyGPURuntime::drain()
     queue_.clear();
 }
 
+void MyGPURuntime::myrt_cycle_budget(uint64_t cycles)
+{
+    scheduler_->set_cycle_budget(cycles);
+}
+
 void MyGPURuntime::myrt_sync(bool report)
 {
     // Everything queued runs here, which is the only thing a sync waits for.
