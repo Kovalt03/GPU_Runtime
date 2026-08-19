@@ -1158,13 +1158,15 @@ lower tree's address baked into the kernel, a hundred cubes were expressible and
 a cube beside a sphere was not. They cost two loads where sixteen were already
 being spent, and about 3 KB of the 36.8 above.
 
-**The same missing instruction, named a second time.** An instance visited costs
-sixteen scalar loads to fetch its inverse, and a global access is charged 100 —
-1,600 before any traversal happens. `V_LD_GLOBAL_MAT4_F32`, the slot beside
-`V_LD_CONST_MAT4_F32`, would make it two. That absence set the crossing point in
-*Where a model matrix meets the view-projection* as well, and two independent
-measurements pointing at one unbuilt opcode is a stronger argument for building
-it than either alone.
+**One instruction where sixteen were, and it changes nothing here.** An instance
+visited fetches its inverse, which was sixteen scalar loads and is now one
+`V_LD_GLOBAL_MAT4_F32`. Under the flat charge these figures are taken with, that
+is the same 1,600 — a wide load is its parts, as VEC3 established. It is worth
+-87.9% under `Coalesced`, which is where lines rather than lanes are counted.
+
+So the work column above is not waiting on an instruction. It is what two levels
+of traversal cost when every access is priced per lane, and the honest lever for
+it is the cost model rather than the ISA.
 
 The constant window is no help here, and the reason is the pricing rather than
 the plumbing: two lanes at the same TLAS leaf may still be at different
@@ -1229,11 +1231,22 @@ four.
 through a draw route the two arms come out identical to the last lane operation.
 `instanced_vertex_cost` runs pass 1 and the composition pass and nothing else.
 
-**What would move this.** A wide global matrix load — the slot beside
-`V_LD_CONST_MAT4_F32` that the naming scheme reserves — would take the pass from
-32 accesses to 2 and put the crossing back near where the arithmetic puts it.
-That it is absent is why the number reads as it does, and it is the obvious lever
-rather than a defence of the result.
+**What was expected to move this, and did not.** A wide global matrix load was
+named here as the obvious lever — the slot beside `V_LD_CONST_MAT4_F32` that the
+naming scheme reserves — and said to put the crossing back near where the
+arithmetic puts it. `V_LD_GLOBAL_MAT4_F32` has since been built, and the table
+above is unchanged to the last lane operation.
+
+It could not have been otherwise, and the rule was already written down for
+VEC3: **a flat charge is per lane per float, so a wide load is exactly its
+parts.** What one buys is lines asked for, and only `MemoryModel::Coalesced`
+counts those. Every figure in this section is a flat one.
+
+Under `Coalesced` it is worth what it was supposed to be: sixteen lanes each
+reading their own matrix cost 27,296 as sixteen scalar loads and 3,296 as one
+wide one, **-87.9%**, and the composition pass drops from 79,616 to 30,016. The
+crossing this table reports is a property of a flat charge, not of the
+instruction set.
 
 ---
 

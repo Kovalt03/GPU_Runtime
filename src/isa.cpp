@@ -51,6 +51,7 @@ std::string_view opcode_name(Opcode op)
     // MEM
     case Opcode::V_LD_GLOBAL_F32:  return "V_LD_GLOBAL_F32";
     case Opcode::V_LD_GLOBAL_VEC3_F32: return "V_LD_GLOBAL_VEC3_F32";
+    case Opcode::V_LD_GLOBAL_MAT4_F32: return "V_LD_GLOBAL_MAT4_F32";
     case Opcode::V_ST_GLOBAL_F32:  return "V_ST_GLOBAL_F32";
     case Opcode::V_LD_SHARED_F32:  return "V_LD_SHARED_F32";
     case Opcode::V_ST_SHARED_F32:  return "V_ST_SHARED_F32";
@@ -207,6 +208,11 @@ Instruction make_v_ld_global_f32(uint8_t dst, uint8_t addr_reg, float offset)
 Instruction make_v_ld_global_vec3_f32(uint8_t dst, uint8_t addr_reg, float offset)
 {
     return {Opcode::V_LD_GLOBAL_VEC3_F32, dst, addr_reg, 0, offset};
+}
+
+Instruction make_v_ld_global_mat4_f32(uint8_t dst, uint8_t addr_reg, float offset)
+{
+    return {Opcode::V_LD_GLOBAL_MAT4_F32, dst, addr_reg, 0, offset};
 }
 
 // Store instructions leave dst unused. Address goes in src0, value in src1.
@@ -473,6 +479,11 @@ uint32_t instruction_cost(Opcode op)
     // global_transaction_cost is where the two part company.
     case Opcode::V_LD_GLOBAL_VEC3_F32: return 300;
 
+    // Sixteen floats, so sixteen times a float — the same rule VEC3 follows and
+    // for the same reason. A charge per lane cannot see a wide load's saving,
+    // which is transactions; MemoryModel::Coalesced is where the two part.
+    case Opcode::V_LD_GLOBAL_MAT4_F32: return 1600;
+
     // Control flow retires in the scheduler rather than an execution unit.
     case Opcode::BRA:
     case Opcode::BRA_DIV:
@@ -548,7 +559,8 @@ uint32_t instruction_latency(Opcode op)
     // line was found, which is a question for the memory model — the scheduler
     // takes it from global_access_cost instead.
     case Opcode::V_LD_GLOBAL_F32:
-    case Opcode::V_LD_GLOBAL_VEC3_F32: return 0;
+    case Opcode::V_LD_GLOBAL_VEC3_F32:
+    case Opcode::V_LD_GLOBAL_MAT4_F32: return 0;
 
     // A store is fire-and-forget: the warp hands it to memory and carries on, so
     // nothing downstream waits on it. Modelling a full write buffer would be a

@@ -2680,3 +2680,76 @@ TEST(Scheduler, ComposingRefusesOperandsItCannotRead)
     EXPECT_THROW(f.run(Program{make_v_matmul_mat4_f32(36, 1, 16), make_ret()}),
                  std::runtime_error);
 }
+
+TEST(Scheduler, AWideMatrixLoadBuysTransactionsAndNotIssue)
+{
+    // The claim a wide load makes, and the one it does not. RESULTS said a wide
+    // matrix load would move a crossing point measured under MemoryModel::Flat,
+    // and that was written before it was measured: a flat charge is per lane per
+    // float, so the load is exactly its sixteen parts and nothing moves at all.
+    //
+    // What it buys is lines asked for, which only Coalesced counts. Sixteen
+    // lanes each reading their own matrix touch the same lines either way; the
+    // scalar form looks them up sixteen times and the wide form once.
+    // A matrix a lane, packed end to end — what a bone palette or an instance
+    // list looks like. Sixteen of them shared by the warp's thirty-two lanes,
+    // that being what the scratch buffer holds; the pairing changes nothing
+    // about which lines are touched.
+    constexpr uint32_t MATRICES = 16;
+    const auto issued = [](bool wide, MemoryModel model) {
+        Fixture f;
+        f.sched.set_memory_model(model);
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            f.lane(lane).regs[1] =
+                static_cast<float>((lane % MATRICES) * MAT4_REGISTERS * sizeof(float));
+        }
+
+        Program program;
+        if (wide) {
+            program.push_back(make_v_ld_global_mat4_f32(16, 1));
+        } else {
+            for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+                program.push_back(
+                    make_v_ld_global_f32(static_cast<uint8_t>(16 + i), 1,
+                                         static_cast<float>(i * sizeof(float))));
+            }
+        }
+        program.push_back(make_ret());
+        f.run(program);
+        return f.sched.stats().weighted_lane_ops;
+    };
+
+    EXPECT_EQ(issued(true, MemoryModel::Flat), issued(false, MemoryModel::Flat))
+        << "a flat charge cannot see a wide load";
+    EXPECT_LT(issued(true, MemoryModel::Coalesced),
+              issued(false, MemoryModel::Coalesced) / 4)
+        << "the wide load asked for as many lines as the scalar ones did";
+}
+
+TEST(Scheduler, AWideMatrixLoadReadsSixteenConsecutiveFloats)
+{
+    Fixture f;
+    for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+        f.poke(128 + i * sizeof(float), static_cast<float>(i) + 0.5f);
+    }
+    f.lane(0).regs[1] = 128.0f;
+    f.run(Program{make_v_ld_global_mat4_f32(16, 1), make_ret()});
+
+    for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+        EXPECT_FLOAT_EQ(f.lane(0).regs[16 + i], static_cast<float>(i) + 0.5f)
+            << "element " << i;
+    }
+
+    // Sixteen registers, 4-aligned, like every other MAT4 operand. A fresh
+    // fixture each time: a run ends with every thread retired, and a program
+    // handed to retired threads never executes at all.
+    Fixture past_the_end;
+    past_the_end.lane(0).regs[1] = 128.0f;
+    EXPECT_THROW(past_the_end.run(Program{make_v_ld_global_mat4_f32(245, 1), make_ret()}),
+                 std::runtime_error);
+
+    Fixture misaligned;
+    misaligned.lane(0).regs[1] = 128.0f;
+    EXPECT_THROW(misaligned.run(Program{make_v_ld_global_mat4_f32(17, 1), make_ret()}),
+                 std::runtime_error);
+}

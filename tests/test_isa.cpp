@@ -83,10 +83,10 @@ TEST(Isa, InstructionSize)
 
 TEST(Isa, OpcodeCount)
 {
-    // 44 opcodes, 0-indexed → RET == 43
-    EXPECT_EQ(static_cast<int>(Opcode::RET), 43);
-    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 40);
-    EXPECT_EQ(OPCODE_COUNT, 44);
+    // 45 opcodes, 0-indexed → RET == 44
+    EXPECT_EQ(static_cast<int>(Opcode::RET), 44);
+    EXPECT_EQ(static_cast<int>(Opcode::BARRIER), 41);
+    EXPECT_EQ(OPCODE_COUNT, 45);
 
     // Enum values are never serialized, so a change here is not itself a problem.
     // Pinning the category boundaries is a tripwire: it makes it visible when an
@@ -98,7 +98,7 @@ TEST(Isa, OpcodeCount)
     EXPECT_EQ(static_cast<int>(Opcode::V_CMP_F32), 17);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_F32), 18);
     EXPECT_EQ(static_cast<int>(Opcode::V_LD_GLOBAL_VEC3_F32), 19);
-    EXPECT_EQ(static_cast<int>(Opcode::BRA), 30);
+    EXPECT_EQ(static_cast<int>(Opcode::BRA), 31);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +381,26 @@ TEST(Isa, ProgramIsContiguous)
     EXPECT_EQ(&prog[2] - base, 2);
     EXPECT_EQ(
         reinterpret_cast<const char*>(&prog[1]) - reinterpret_cast<const char*>(base), 8);
+}
+
+TEST(Isa, AWideLoadCostsWhatItsNarrowOnesDo)
+{
+    // The rule VEC3 set and this follows: a flat charge is per lane per float,
+    // so a wide load is exactly its parts and nothing is saved. What it buys is
+    // transactions, which only MemoryModel::Coalesced can see.
+    //
+    // Worth pinning, because the opposite was written into RESULTS before it was
+    // measured — a wide matrix load was said to move a crossing point that a
+    // flat charge cannot notice at all.
+    EXPECT_EQ(instruction_cost(Opcode::V_LD_GLOBAL_VEC3_F32),
+              3 * instruction_cost(Opcode::V_LD_GLOBAL_F32));
+    EXPECT_EQ(instruction_cost(Opcode::V_LD_GLOBAL_MAT4_F32),
+              16 * instruction_cost(Opcode::V_LD_GLOBAL_F32));
+
+    // The constant window is the one that is cheaper, and by a factor of the
+    // warp: it is answered once and broadcast.
+    EXPECT_LT(instruction_cost(Opcode::V_LD_CONST_MAT4_F32),
+              instruction_cost(Opcode::V_LD_GLOBAL_MAT4_F32));
 }
 
 TEST(Isa, ComposingCostsFourTransforms)

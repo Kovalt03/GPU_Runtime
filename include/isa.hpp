@@ -66,6 +66,7 @@ enum class Opcode : uint8_t {
     // asking for twelve bytes at one address touches the lines they fall in
     // once, where three instructions pay for their lines three times.
     V_LD_GLOBAL_VEC3_F32,  // reg[dst..+2] = global[reg[src0] + imm ..+8]
+    V_LD_GLOBAL_MAT4_F32,  // reg[dst..+15] = global[reg[src0] + imm ..+60]
 
     V_ST_GLOBAL_F32,  // global[reg[src0] + imm] = reg[src1]      (dst unused)
     V_LD_SHARED_F32,  // reg[dst] = shared[reg[src0] + imm]       (src1 unused)
@@ -296,6 +297,7 @@ Instruction make_v_cmp_f32(uint8_t dst, uint8_t src0, uint8_t src1, CmpOp op);
 // MEM
 Instruction make_v_ld_global_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_ld_global_vec3_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
+Instruction make_v_ld_global_mat4_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_global_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);
 Instruction make_v_ld_shared_f32(uint8_t dst, uint8_t addr_reg, float offset = 0.0f);
 Instruction make_v_st_shared_f32(uint8_t addr_reg, uint8_t src, float offset = 0.0f);

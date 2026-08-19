@@ -373,6 +373,13 @@ Reg<Mat4> IRBuilder::load_const_mat4(Reg<Scalar> address, float offset)
     return out;
 }
 
+Reg<Mat4> IRBuilder::load_mat4(Reg<Scalar> address, float offset)
+{
+    const Reg<Mat4> dst = alloc<Mat4>();
+    emit(make_v_ld_global_mat4_f32(dst.first(), address.first(), offset));
+    return dst;
+}
+
 Reg<HalfFrag> IRBuilder::load_shared_half_fragment(Reg<Scalar> address, float offset)
 {
     const Reg<HalfFrag> out = alloc<HalfFrag>();

@@ -300,6 +300,13 @@ public:
     Reg<Scalar> load_const(Reg<Scalar> address, float offset = 0.0f);
     Reg<Mat4> load_const_mat4(Reg<Scalar> address, float offset = 0.0f);
 
+    // A matrix from global memory, at an address that may differ by lane. What
+    // the constant window cannot do: its charge rests on every lane wanting the
+    // same one, and a bone palette or an instance list indexed per thread does
+    // not. Sixteen loads' worth under a flat charge, one transaction's worth
+    // under a coalesced one.
+    Reg<Mat4> load_mat4(Reg<Scalar> address, float offset = 0.0f);
+
     // The same in half precision: four registers of packed halves, which nothing
     // but the F16 instructions may read.
     Reg<HalfFrag> load_shared_half_fragment(Reg<Scalar> address, float offset = 0.0f);

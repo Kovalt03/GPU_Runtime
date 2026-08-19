@@ -403,6 +403,22 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
+    // A matrix in one, checked like the other wide shapes. The same sixteen
+    // registers V_LD_CONST_MAT4_F32 fills, from an address that may differ by
+    // lane — which is the difference between the two and why both exist.
+    case Opcode::V_LD_GLOBAL_MAT4_F32: {
+        require_register_range(instr.dst, MAT4_REGISTERS, "V_LD_GLOBAL_MAT4_F32 dst");
+        require_register_alignment(instr.dst, 4, "V_LD_GLOBAL_MAT4_F32 dst");
+        const size_t addr =
+            decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_GLOBAL_MAT4_F32");
+        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+            thread.regs[instr.dst + i] =
+                load_f32(global.base, global.size, addr + i * sizeof(float),
+                         "V_LD_GLOBAL_MAT4_F32");
+        }
+        break;
+    }
+
     // Store leaves dst unused: the address is src0 and the value is src1.
     case Opcode::V_ST_GLOBAL_F32: {
         const size_t addr =
@@ -779,15 +795,22 @@ namespace {
 // stays a change in one place.
 uint32_t transaction_cost(Opcode op)
 {
-    return op == Opcode::V_LD_GLOBAL_VEC3_F32 ? instruction_cost(Opcode::V_LD_GLOBAL_F32)
-                                              : instruction_cost(op);
+    const bool wide =
+        op == Opcode::V_LD_GLOBAL_VEC3_F32 || op == Opcode::V_LD_GLOBAL_MAT4_F32;
+    return wide ? instruction_cost(Opcode::V_LD_GLOBAL_F32) : instruction_cost(op);
 }
 
 // How many floats one lane asks for, which decides how many addresses a warp
 // puts to the cache.
 uint32_t access_components(Opcode op)
 {
-    return op == Opcode::V_LD_GLOBAL_VEC3_F32 ? VEC3_COMPONENTS : 1u;
+    if (op == Opcode::V_LD_GLOBAL_VEC3_F32) {
+        return VEC3_COMPONENTS;
+    }
+    if (op == Opcode::V_LD_GLOBAL_MAT4_F32) {
+        return MAT4_REGISTERS;
+    }
+    return 1u;
 }
 
 }  // namespace
@@ -893,7 +916,7 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
         bandwidth_ == BandwidthModel::Modelled && latency_ == LatencyModel::Modelled;
 
     const uint32_t components = access_components(instr.op);
-    std::array<size_t, WARP_SIZE * VEC3_COMPONENTS> lines{};
+    std::array<size_t, WARP_SIZE * MAT4_REGISTERS> lines{};
     uint32_t n = 0;
     for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
         if (!is_active(warp, lane)) {
@@ -1466,6 +1489,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     const Instruction& issued = program[warp.pc];
     const bool addresses_memory = issued.op == Opcode::V_LD_GLOBAL_F32 ||
                                   issued.op == Opcode::V_LD_GLOBAL_VEC3_F32 ||
+                                  issued.op == Opcode::V_LD_GLOBAL_MAT4_F32 ||
                                   issued.op == Opcode::V_ST_GLOBAL_F32 ||
                                   issued.op == Opcode::V_CP_ASYNC_SHARED_GLOBAL_F32;
     const bool is_atomic = issued.op == Opcode::V_ATOM_ADD_GLOBAL_F32;

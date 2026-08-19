@@ -224,11 +224,12 @@ Program build_compose_program(void** args)
         const Reg<Scalar> addr =
             k.mul(id, k.constant(static_cast<float>(MAT4_REGISTERS * sizeof(float))));
 
-        const Reg<Mat4> model = k.mat4();
-        for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
-            k.load_into(model.component(i), addr,
-                        static_cast<float>(a.instance_offset + i * sizeof(float)));
-        }
+        // One instruction where sixteen stood. Under a flat charge that is the
+        // same cost — a wide load is exactly its parts, as VEC3 already showed —
+        // so what moves is the instruction count and, under Coalesced, the
+        // transactions. The window cannot serve this: a lane wants its own
+        // matrix, and the window's price rests on every lane wanting one matrix.
+        const Reg<Mat4> model = k.load_mat4(addr, static_cast<float>(a.instance_offset));
 
         // view_projection * model, in that order: the model matrix acts first.
         const Reg<Mat4> folded = k.compose(vp, model);
