@@ -15,6 +15,7 @@ cmake --build build -j8
 ./build/benchmarks/occupancy_bench  #         plus benchmarks/result/occupancy.{md,csv}
 ./build/benchmarks/bvh_bench        #         plus benchmarks/result/bvh.{md,csv}
 ./build/benchmarks/instance_bench   #         plus benchmarks/result/instance.{md,csv}
+./build/benchmarks/tlas_bench       #         plus benchmarks/result/tlas.{md,csv}
 ```
 
 **Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
@@ -1008,6 +1009,50 @@ Nothing stopped a kernel keeping its uniforms in global memory, and under
 `Coalesced` a warp reading one address was already one transaction. What the
 space adds is that it **cannot be anything else**: an address that varies by lane
 cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
+## One tree over the copies, or one over all of them
+
+A scene of the same object many times can be given to a ray tracer two ways.
+Flatten it — transform every vertex of every copy on the host and build one tree
+over the lot — or keep one tree over one copy and a second tree over the
+placements, moving the ray into an instance's space at each leaf of the upper
+one. The second is what DXR and Vulkan RT call a TLAS over BLASes.
+
+| Copies | Flat triangles | Flat work | Flat KB | Two-level triangles | Work | KB | Memory | Work |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 128 | 3,097,101 | 7.2 | 32 | 3,483,023 | 2.2 | **3.2x** | 0.89x |
+| 16 | 512 | 5,175,635 | 28.5 | 32 | 6,681,623 | 3.8 | **7.6x** | 0.77x |
+| 64 | 2,048 | 11,032,700 | 114.7 | 32 | 16,933,096 | 9.8 | **11.8x** | 0.65x |
+| 256 | 8,192 | 35,332,837 | 457.6 | 32 | 59,188,484 | 33.8 | **13.6x** | 0.60x |
+
+64x32, 32 triangles a copy.
+
+**It is a memory answer, not a speed one.** The device holds 32 triangles instead
+of 8,192, and 33.8 KB instead of 457.6 — the ratio growing with the copies,
+because one tree serves however many there are. Work goes the other way, from
+0.89x to 0.60x, and by a widening margin.
+
+**The same missing instruction, named a second time.** An instance visited costs
+sixteen scalar loads to fetch its inverse, and a global access is charged 100 —
+1,600 before any traversal happens. `V_LD_GLOBAL_MAT4_F32`, the slot beside
+`V_LD_CONST_MAT4_F32`, would make it two. That absence set the crossing point in
+*Where a model matrix meets the view-projection* as well, and two independent
+measurements pointing at one unbuilt opcode is a stronger argument for building
+it than either alone.
+
+The constant window is no help here, and the reason is the pricing rather than
+the plumbing: two lanes at the same TLAS leaf may still be at different
+instances, so the address is not warp-uniform and the window's charge would be a
+lie. Where instancing put a block on one instance and could use it, a ray tracer
+cannot.
+
+**What this does not settle.** The upper level has no traversal unit in front of
+it, so the two levels are the same instructions in the same kernel and the
+divergence of both lands in the same figure. Hardware separates them. Nor is the
+instance box tight: it is the AABB of the transformed root of the lower tree,
+which is loose under rotation.
 
 ---
 

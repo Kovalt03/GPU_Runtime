@@ -63,3 +63,7 @@ target_link_libraries(bvh_bench PRIVATE gpurt project_warnings)
 # Where an instance's model matrix meets the view-projection.
 add_executable(instance_bench instance_bench.cpp)
 target_link_libraries(instance_bench PRIVATE gpurt project_warnings)
+
+# One tree over the copies, or one over all of them.
+add_executable(tlas_bench tlas_bench.cpp)
+target_link_libraries(tlas_bench PRIVATE gpurt project_warnings)
