@@ -59,3 +59,7 @@ target_link_libraries(bandwidth_bench PRIVATE gpurt project_warnings)
 # The last algorithm here that was still linear in the scene.
 add_executable(bvh_bench bvh_bench.cpp)
 target_link_libraries(bvh_bench PRIVATE gpurt project_warnings)
+
+# Where an instance's model matrix meets the view-projection.
+add_executable(instance_bench instance_bench.cpp)
+target_link_libraries(instance_bench PRIVATE gpurt project_warnings)

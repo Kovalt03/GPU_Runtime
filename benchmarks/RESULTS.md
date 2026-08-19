@@ -14,6 +14,7 @@ cmake --build build -j8
 ./build/benchmarks/model_bench      #         plus benchmarks/result/models.{md,csv}
 ./build/benchmarks/occupancy_bench  #         plus benchmarks/result/occupancy.{md,csv}
 ./build/benchmarks/bvh_bench        #         plus benchmarks/result/bvh.{md,csv}
+./build/benchmarks/instance_bench   #         plus benchmarks/result/instance.{md,csv}
 ```
 
 **Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
@@ -1007,6 +1008,56 @@ Nothing stopped a kernel keeping its uniforms in global memory, and under
 `Coalesced` a warp reading one address was already one transaction. What the
 space adds is that it **cannot be anything else**: an address that varies by lane
 cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
+## Where a model matrix meets the view-projection
+
+An object drawn many times needs its own transform, and that transform has to
+reach the camera's somewhere. Fold the two once an instance and pass 1 does the
+single MATVEC it always did; leave them apart and every vertex does two.
+
+The arithmetic says where that pays. `V_MATMUL_MAT4_F32` is 4x4x4 multiply-adds
+against MATVEC's 4x4, so it costs four of them — and folding once an instance
+should beat an extra MATVEC at every vertex past four of them.
+
+| Vertices an instance | Per-vertex | Composed | Composing |
+|---:|---:|---:|---:|
+| 8 | 105,216 | 154,080 | **+46.4%** |
+| 32 | 400,896 | 437,472 | **+9.1%** |
+| 64 | 801,792 | 821,984 | **+2.5%** |
+| 96 | 1,202,688 | 1,206,496 | **+0.3%** |
+| 128 | 1,603,584 | 1,591,008 | **-0.8%** |
+| 256 | 3,207,168 | 3,129,056 | **-2.4%** |
+| 512 | 6,414,336 | 6,205,152 | **-3.3%** |
+
+16 instances, pass 1 only. Positive is worse.
+
+**The crossing is between 96 and 128, not at 4.** The prediction was written into
+the plan before anything was measured, and it was two orders out.
+
+**It missed because the pass is not its multiply.** A composition thread reads
+sixteen floats and writes sixteen, and a global access is charged 100 — so 3,200
+of memory around a MATMUL of 64. The arithmetic the prediction counted is 2% of
+what the pass spends.
+
+**And pass 1 pays nothing for its matrix.** A block is one instance, so the
+matrix a lane wants is the same across its warp and rides the constant window,
+charged once for the warp. The per-vertex arm therefore gets its model matrix
+free and spends only the extra MATVEC; the composed arm has to materialise a
+second matrix through memory first. What the trade really is: **an extra MATVEC a
+vertex against a matrix pushed through global memory** — not one multiply against
+four.
+
+**Pass 2 is excluded, and has to be.** It grows with the instances too, and
+through a draw route the two arms come out identical to the last lane operation.
+`instanced_vertex_cost` runs pass 1 and the composition pass and nothing else.
+
+**What would move this.** A wide global matrix load — the slot beside
+`V_LD_CONST_MAT4_F32` that the naming scheme reserves — would take the pass from
+32 accesses to 2 and put the crossing back near where the arithmetic puts it.
+That it is absent is why the number reads as it does, and it is the obvious lever
+rather than a defence of the result.
 
 ---
 

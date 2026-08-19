@@ -75,7 +75,7 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   43 opcodes, 8 bytes each                       │
+  │   44 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
   │   V_LD_GLOBAL_F32 / V_CP_ASYNC_SHARED_GLOBAL_F32 │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
@@ -113,9 +113,10 @@ Control    <OP>                             BRA, BRA_DIV, BARRIER, RET
   `V_SHUFFLE_F32` and not `S_SHUFFLE` — the rule decides it rather than
   intuition about which instructions feel collective.
 - **`<SHAPE>`** is omitted for scalars. `VEC3` and `MAT4` are built —
-  `V_MATVEC_MAT4_F32` arrived for the vertex stage and `V_LD_GLOBAL_VEC3_F32`
-  once there was a memory model to show what a wide load saves, each filling a
-  slot the scheme had reserved without renaming anything. `MAT3` is still open,
+  `V_MATVEC_MAT4_F32` arrived for the vertex stage, `V_MATMUL_MAT4_F32` for
+  instancing and `V_LD_GLOBAL_VEC3_F32` once there was a memory model to show
+  what a wide load saves — each filling a slot the scheme had reserved without
+  renaming anything. `MAT3` is still open,
   and `VEC4` is what the raster routes would want: their screen vertex is four
   floats, so a VEC3 load leaves 1/w behind.
 - **`<TYPE>`** always comes last, leaving room for `F64` / `F16`.
@@ -287,6 +288,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
 ./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
+
+# Where an instance's model matrix meets the view-projection
+./build/benchmarks/instance_bench            # benchmarks/result/instance.{md,csv}
 
 # A tree against every triangle for every pixel
 ./build/benchmarks/bvh_bench                # benchmarks/result/bvh.{md,csv}
@@ -753,6 +757,7 @@ gpu-runtime-sim/
 │   ├── gemm_bench.cpp       # the tiled multiply, one feature at a time
 │   ├── bandwidth_bench.cpp  # what happens when the memory system has a ceiling
 │   ├── bvh_bench.cpp        # a tree, and what SIMT takes back from it
+│   ├── instance_bench.cpp   # where a model matrix meets the view-projection
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```
