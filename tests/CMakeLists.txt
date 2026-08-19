@@ -27,6 +27,7 @@ function(add_layer_test name)
     # runs the binaries from the build tree, where a relative one would miss.
     target_compile_definitions(${name} PRIVATE
         GPURT_ASSETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../assets"
+        GPURT_BUILD_DIR="${CMAKE_CURRENT_BINARY_DIR}"
         GPURT_MACHINES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../machines")
     gtest_discover_tests(${name})
 endfunction()
@@ -44,5 +45,6 @@ add_layer_test(test_bvh)
 add_layer_test(test_cull)
 add_layer_test(test_skeleton)
 add_layer_test(test_skin)
+add_layer_test(test_gif)
 add_layer_test(test_gemm)
 add_layer_test(test_pipeline reference.cpp)
