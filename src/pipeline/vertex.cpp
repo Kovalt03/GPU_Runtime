@@ -228,6 +228,30 @@ void run_compose_stage(MyGPURuntime& rt, const VertexStageArgs& args)
     rt.myrt_launch(build_compose_program, grid, block, kernel_args);
 }
 
+void run_vertex_stage_indirect(MyGPURuntime& rt, const VertexStageArgs& args,
+                               size_t grid_offset, StreamId stream)
+{
+    if (args.vertex_count == 0) {
+        throw std::runtime_error("run_vertex_stage_indirect: a mesh with no vertices");
+    }
+    if (grid_offset == 0) {
+        throw std::runtime_error(
+            "run_vertex_stage_indirect: no grid to read — a culling pass writes one");
+    }
+    if (args.instance_offset == 0) {
+        throw std::runtime_error(
+            "run_vertex_stage_indirect: an indirect grid decides how many instances "
+            "to draw, and there are no matrices to draw them from");
+    }
+
+    void* raw[] = {const_cast<VertexStageArgs*>(&args)};
+    IndirectLaunchConfig config;
+    config.grid_offset = grid_offset;
+    config.block = dim3{WARP_SIZE, 1, 1};
+    config.const_offset = args.uniform_offset;
+    rt.myrt_launch_indirect(build_vertex_program, config, raw, stream);
+}
+
 void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args)
 {
     // Caught here rather than left to myrt_launch, which would reject the empty

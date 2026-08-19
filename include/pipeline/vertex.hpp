@@ -92,3 +92,17 @@ Program build_vertex_program(void** args);
 // Threads past vertex_count exit without writing, since a grid only divides
 // evenly into warps by accident.
 void run_vertex_stage(MyGPURuntime& rt, const VertexStageArgs& args);
+
+// The same, with the instance count read from device memory when the launch
+// reaches the machine rather than when it is queued.
+//
+// `grid_offset` names three floats a culling pass has already raised, so the
+// host never learns how many instances survived. It is enqueued rather than run,
+// since waiting for it would put the number back in the host's hands — the whole
+// arrangement is that nobody outside the device knows it.
+//
+// instance_count is still read: it sizes the constant window and is the upper
+// bound the buffers were allocated for. What comes from the device is how many
+// of them are drawn.
+void run_vertex_stage_indirect(MyGPURuntime& rt, const VertexStageArgs& args,
+                               size_t grid_offset, StreamId stream = DEFAULT_STREAM);
