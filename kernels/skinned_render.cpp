@@ -13,11 +13,19 @@
 //   ./build/kernels/skinned_render                       result/images/skinned.gif
 //   ./build/kernels/skinned_render assets/arm.bvh assets/sphere.obj
 //   ./build/kernels/skinned_render --width 128 --height 96
+//   ./build/kernels/skinned_render --route raytrace
 //
 // A rig that already says which bone a vertex follows can be pointed at instead,
 // one OBJ a bone sharing a vertex pool:
 //
 //   ./build/kernels/skinned_render --rig <dir> --motion <dir>/walk.bvh
+//
+// A rig of any size wants --route raytrace. The walk is one thread a pixel
+// against every triangle, so it grows with both and a character mesh is tens of
+// thousands of triangles: 124 seconds a frame against the tree's 3, measured on
+// 25,342. The tree costs something the walk does not, though — the ray tracer
+// has no vertex stage, so a skinned mesh has to be posed before it arrives, and
+// the skinning then happens on the host rather than on the device.
 //
 // Nothing from such a directory is committed here. The rigs this was developed
 // against are licensed for use and not for redistribution, which is the ordinary
@@ -49,14 +57,16 @@ struct Rigged {
 };
 
 // One OBJ a bone, all sharing a vertex pool and partitioning the triangles —
-// what a rig exported per bone looks like. A vertex takes the bone of the first
-// triangle that names it.
+// what a rig exported per bone looks like. The partition is over triangles, not
+// vertices, so the list is flattened: a vertex on a seam is duplicated and each
+// copy takes the bone of the triangle it belongs to, which is what the rig
+// actually says.
 Rigged load_rig(const std::string& dir, const Skeleton& skeleton)
 {
     Rigged rigged;
     rigged.how = "per-bone meshes";
 
-    std::vector<int> bone_of;
+    std::vector<Float3> pool;
     for (uint32_t j = 0; j < skeleton.joint_count(); ++j) {
         const Joint& joint = skeleton.joints[j];
         if (joint.end_site) {
@@ -74,27 +84,22 @@ Rigged load_rig(const std::string& dir, const Skeleton& skeleton)
         } catch (const std::runtime_error&) {
             continue;
         }
-
-        if (rigged.vertices.empty()) {
-            rigged.vertices = part.vertices;
-            bone_of.assign(part.vertices.size(), -1);
+        if (pool.empty()) {
+            pool = part.vertices;
         }
+
         for (const uint32_t index : part.indices) {
-            if (index < bone_of.size() && bone_of[index] < 0) {
-                bone_of[index] = static_cast<int>(j);
+            if (index >= pool.size()) {
+                throw std::runtime_error("skinned_render: " + plain +
+                                         ".obj indexes past the shared vertex pool");
             }
+            rigged.vertices.push_back(pool[index]);
+            rigged.bone.push_back(j);
         }
     }
 
     if (rigged.vertices.empty()) {
         throw std::runtime_error("skinned_render: no bone meshes found in " + dir);
-    }
-
-    // A vertex no triangle named follows the root, which is where an unbound
-    // vertex would sit anyway.
-    rigged.bone.reserve(bone_of.size());
-    for (const int b : bone_of) {
-        rigged.bone.push_back(b < 0 ? 0u : static_cast<uint32_t>(b));
     }
     return rigged;
 }
@@ -121,6 +126,7 @@ int main(int argc, char** argv)
     const uint32_t width = args.flag("width", 96);
     const uint32_t height = args.flag("height", 96);
     const std::string rig = args.text_flag("rig", "");
+    const bool trace = args.text_flag("route", "walk") == "raytrace";
 
     const std::string assets = std::string(GPURT_ASSETS_DIR);
     const std::string motion_path =
@@ -178,7 +184,31 @@ int main(int argc, char** argv)
             bones.push_back(static_cast<float>(b));
         }
 
-        MyGPURuntime rt(1u << 27);
+        MyGPURuntime rt(1u << 28);
+
+        if (trace) {
+            // Posed on the host, because this route has no vertex stage to pose
+            // it with. What it buys is that a pixel meets the triangles a tree
+            // says it might rather than all of them.
+            std::vector<Float3> posed;
+            posed.reserve(rigged.vertices.size());
+            for (size_t v = 0; v < rigged.vertices.size(); ++v) {
+                const Float4x4& m =
+                    *reinterpret_cast<const Float4x4*>(&palette[skin.bone[v] * 16]);
+                const Float4 at = transform(m, rigged.vertices[v], 1.0f);
+                posed.push_back(Float3{at.x, at.y, at.z});
+            }
+
+            DeviceGeometry traced = upload_accelerated(rt, posed);
+            DeviceFrame frame_buffer = allocate_frame(rt, target);
+            animation.push_back(draw_raytrace(rt, traced, frame_buffer, target));
+            std::printf("  frame %2u  divergence %5.2f%%\n", frame,
+                        rt.divergence_rate() * 100.0);
+            release(rt, frame_buffer);
+            release(rt, traced);
+            continue;
+        }
+
         DeviceGeometry geometry = upload(rt, rigged.vertices);
         DeviceFrame buffer = allocate_frame(rt, target);
         void* device_bones = rt.myrt_malloc(bones.size() * sizeof(float));
