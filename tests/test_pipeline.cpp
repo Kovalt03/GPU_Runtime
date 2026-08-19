@@ -2717,6 +2717,26 @@ std::vector<Float3> scattered_scene(uint32_t count, uint32_t seed = 7)
     return world;
 }
 
+// The same, packed into a small volume, so copies of it placed a little apart
+// do not reach one another.
+std::vector<Float3> compact_scene(uint32_t count, uint32_t seed = 7)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> place(-0.08f, 0.08f);
+    std::uniform_real_distribution<float> size(0.06f, 0.12f);
+
+    std::vector<Float3> world;
+    world.reserve(count * 3);
+    for (uint32_t i = 0; i < count; ++i) {
+        const Float3 centre{place(rng), place(rng), place(rng)};
+        const float s = size(rng);
+        world.push_back(centre + Float3{-s, -s, 0.0f});
+        world.push_back(centre + Float3{s, -s, 0.0f});
+        world.push_back(centre + Float3{0.0f, s, s});
+    }
+    return world;
+}
+
 }  // namespace
 
 TEST(Pipeline, TheTreeDrawsTheFrameTheWholeSceneDid)
@@ -3020,4 +3040,182 @@ TEST(Pipeline, AnInstancedDrawWithNothingToPlaceIsRefused)
 
     release(rt, frame);
     release(rt, geometry);
+}
+
+TEST(Pipeline, TwoLevelsDrawWhatOneLevelOverFlattenedCopiesDoes)
+{
+    // The claim a second level makes: moving the ray into an instance's space
+    // finds the same hits as building that instance's geometry in world space
+    // would. Held against exactly that — the same copies flattened on the host
+    // and given one tree.
+    //
+    // Instances kept apart here, so no ray meets two and every hit has one
+    // candidate. The overlapping case is the test below, where the two stop
+    // agreeing to the last bit and the reason is worth stating separately.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = compact_scene(12);
+
+    for (uint32_t count : {1u, 2u, 4u, 8u, 13u}) {
+        std::vector<Instance> instances;
+        for (uint32_t i = 0; i < count; ++i) {
+            Float4x4 model = Float4x4::identity();
+            // Far enough apart that no ray meets two: the geometry reaches 0.2
+            // from its own origin and the copies sit 0.5 from each other.
+            model.at(0, 3) = -1.5f + static_cast<float>(i % 5) * 0.5f;
+            model.at(1, 3) = static_cast<float>(i / 5) * 0.5f - 0.5f;
+            instances.push_back(Instance{model});
+        }
+
+        std::vector<Float3> flattened;
+        for (const Instance& instance : instances) {
+            for (const Float3& v : geometry) {
+                const Float4 w = transform(instance.model, v, 1.0f);
+                flattened.push_back(Float3{w.x, w.y, w.z});
+            }
+        }
+
+        MyGPURuntime flat_rt(1u << 26);
+        DeviceGeometry flat = upload_accelerated(flat_rt, flattened);
+        DeviceFrame flat_frame = allocate_frame(flat_rt, target);
+        const std::vector<Float3> one_level =
+            draw_raytrace(flat_rt, flat, flat_frame, target);
+
+        MyGPURuntime rt(1u << 26);
+        DeviceGeometry placed = upload_instanced_accelerated(rt, geometry, instances);
+        DeviceFrame frame = allocate_frame(rt, target);
+        const std::vector<Float3> two_level = draw_raytrace(rt, placed, frame, target);
+
+        // One tree over the geometry however many copies there are, which is the
+        // whole of what the second level buys.
+        EXPECT_EQ(placed.triangle_count, geometry.size() / 3);
+
+        uint32_t lit = 0;
+        for (size_t i = 0; i < one_level.size(); ++i) {
+            ASSERT_NEAR(two_level[i].x, one_level[i].x, PIXEL_EPS)
+                << count << " instances, pixel " << i;
+            ASSERT_NEAR(two_level[i].y, one_level[i].y, PIXEL_EPS)
+                << count << " instances, pixel " << i;
+            ASSERT_NEAR(two_level[i].z, one_level[i].z, PIXEL_EPS)
+                << count << " instances, pixel " << i;
+            lit += one_level[i].x + one_level[i].y + one_level[i].z > 0.01f ? 1u : 0u;
+        }
+        EXPECT_GT(lit, 0u) << count << " instances lit nothing";
+
+        release(rt, frame);
+        release(rt, placed);
+        release(flat_rt, flat_frame);
+        release(flat_rt, flat);
+    }
+}
+
+TEST(Pipeline, OverlappingInstancesAgreeOnCoverageAndNotAlwaysOnDepth)
+{
+    // Where instances overlap, a ray meets surfaces from more than one and the
+    // nearest wins by a strict comparison. The two routes reach t differently —
+    // one transforms vertices by the model matrix, the other transforms the ray
+    // by an inverse computed in float — so two surfaces within a rounding of
+    // each other can swap places.
+    //
+    // What may not move is which pixels are covered at all. A hit found by one
+    // route and not the other would be a missing instance, and that is what a
+    // stack sized for one level while holding two produced: the same frame with
+    // whole copies gone. Coverage is asserted exactly and the depth ties are
+    // bounded.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = scattered_scene(12);
+
+    std::vector<Instance> instances;
+    for (uint32_t i = 0; i < 16; ++i) {
+        Float4x4 model = Float4x4::identity();
+        model.at(0, 3) = -0.7f + static_cast<float>(i % 8) * 0.2f;
+        model.at(1, 3) = static_cast<float>(i % 3) * 0.25f - 0.25f;
+        instances.push_back(Instance{model});
+    }
+
+    std::vector<Float3> flattened;
+    for (const Instance& instance : instances) {
+        for (const Float3& v : geometry) {
+            const Float4 w = transform(instance.model, v, 1.0f);
+            flattened.push_back(Float3{w.x, w.y, w.z});
+        }
+    }
+
+    MyGPURuntime flat_rt(1u << 27);
+    DeviceGeometry flat = upload_accelerated(flat_rt, flattened);
+    DeviceFrame flat_frame = allocate_frame(flat_rt, target);
+    const std::vector<Float3> one_level =
+        draw_raytrace(flat_rt, flat, flat_frame, target);
+
+    MyGPURuntime rt(1u << 27);
+    DeviceGeometry placed = upload_instanced_accelerated(rt, geometry, instances);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> two_level = draw_raytrace(rt, placed, frame, target);
+
+    uint32_t lit = 0;
+    uint32_t different_winner = 0;
+    for (size_t i = 0; i < one_level.size(); ++i) {
+        const bool a = one_level[i].x + one_level[i].y + one_level[i].z > 0.01f;
+        const bool b = two_level[i].x + two_level[i].y + two_level[i].z > 0.01f;
+        ASSERT_EQ(a, b) << "pixel " << i << " is covered by one route and not the other";
+        lit += a ? 1u : 0u;
+        different_winner +=
+            std::abs(one_level[i].x - two_level[i].x) > PIXEL_EPS ? 1u : 0u;
+    }
+    EXPECT_GT(lit, 0u) << "nothing was drawn, so nothing was compared";
+    EXPECT_LT(different_winner * 10, lit)
+        << different_winner << " of " << lit
+        << " lit pixels chose a different surface, which is more than a tie-break";
+
+    release(rt, frame);
+    release(rt, placed);
+    release(flat_rt, flat_frame);
+    release(flat_rt, flat);
+}
+
+TEST(Pipeline, ASecondLevelHoldsTheStacksOfBoth)
+{
+    // The bug this exists to keep out: a lane's slice of shared memory was sized
+    // by the lower level alone while the upper level's stack sat inside it, so
+    // lane 0's traversal wrote over lane 1's. It lost whole instances and left a
+    // frame that still looked like a frame — the test above is what caught it,
+    // and this pins the arithmetic that fixed it.
+    MyGPURuntime rt(1u << 20);
+    RaytraceStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 1;
+    args.traversal = Traversal::Tlas;
+    args.tlas_offset = 128;
+    args.instances_offset = 256;
+
+    // Neither level's depth on its own overruns the scratchpad; together they do.
+    args.stack_depth = SHARED_MEM_FLOATS / WARP_SIZE;
+    args.tlas_stack_depth = 1;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+
+    // And a second level with nothing to walk.
+    args.stack_depth = 4;
+    args.tlas_stack_depth = 0;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}
+
+TEST(Pipeline, TheSecondLevelRefusesAPointLight)
+{
+    // A diffuse term needs a normal in world space, and an instance's edges are
+    // in its own. Carrying one across takes the inverse-transpose, which is not
+    // built — so the route says so rather than lighting a rotated instance
+    // wrongly and looking almost right.
+    MyGPURuntime rt(1u << 22);
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = scattered_scene(4);
+    DeviceGeometry placed =
+        upload_instanced_accelerated(rt, geometry, {Instance{Float4x4::identity()}});
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    Shading lit;
+    lit.mode = ShadingMode::Diffuse;
+    EXPECT_THROW(draw_raytrace(rt, placed, frame, target, lit), std::runtime_error);
+
+    release(rt, frame);
+    release(rt, placed);
 }

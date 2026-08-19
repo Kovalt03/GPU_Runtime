@@ -274,6 +274,47 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
     return geometry;
 }
 
+DeviceGeometry upload_instanced_accelerated(MyGPURuntime& rt,
+                                            const std::vector<Float3>& world,
+                                            const std::vector<Instance>& instances,
+                                            BvhSplit split, uint32_t leaf_size,
+                                            TraversalOrder order)
+{
+    if (instances.empty()) {
+        throw std::runtime_error("upload_instanced_accelerated: nowhere to place it");
+    }
+
+    const Bvh blas = build_bvh(world, split, leaf_size);
+
+    std::vector<Float4x4> models;
+    models.reserve(instances.size());
+    for (const Instance& instance : instances) {
+        models.push_back(instance.model);
+    }
+
+    // One instance a leaf. A leaf of several would put two matrices behind one
+    // box, and the loop over them is a lane's serial work rather than a warp's —
+    // where a BLAS leaf of four triangles is four tests every lane was going to
+    // run anyway.
+    const Tlas tlas = build_tlas(blas, models, split, 1);
+
+    DeviceGeometry geometry = upload_positions(rt, blas.triangles, VertexStage::None);
+    geometry.bvh = rt.myrt_malloc(blas.nodes.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.bvh, blas.nodes.data(), blas.nodes.size() * sizeof(float),
+                   Direction::HostToDevice);
+    geometry.bvh_depth = blas.max_depth;
+    geometry.bvh_order = order;
+
+    geometry.tlas = rt.myrt_malloc(tlas.tree.nodes.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.tlas, tlas.tree.nodes.data(),
+                   tlas.tree.nodes.size() * sizeof(float), Direction::HostToDevice);
+    geometry.tlas_instances = rt.myrt_malloc(tlas.instances.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.tlas_instances, tlas.instances.data(),
+                   tlas.instances.size() * sizeof(float), Direction::HostToDevice);
+    geometry.tlas_depth = tlas.tree.max_depth;
+    return geometry;
+}
+
 DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)
 {
     // mesh.vertices rather than mesh.flattened(): that is what sizes both the
@@ -329,6 +370,8 @@ void release(MyGPURuntime& rt, DeviceGeometry& geometry)
     rt.myrt_free(geometry.index);
     rt.myrt_free(geometry.normals);
     rt.myrt_free(geometry.bvh);
+    rt.myrt_free(geometry.tlas);
+    rt.myrt_free(geometry.tlas_instances);
     geometry = DeviceGeometry{};
 }
 
@@ -657,6 +700,12 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geomet
         args.order = geometry.bvh_order;
         args.bvh_offset = rt.myrt_device_offset(geometry.bvh);
         args.stack_depth = geometry.bvh_depth;
+    }
+    if (geometry.tlas != nullptr) {
+        args.traversal = Traversal::Tlas;
+        args.tlas_offset = rt.myrt_device_offset(geometry.tlas);
+        args.instances_offset = rt.myrt_device_offset(geometry.tlas_instances);
+        args.tlas_stack_depth = geometry.tlas_depth;
     }
     run_raytrace_stage(rt, args);
     return download(rt, frame);

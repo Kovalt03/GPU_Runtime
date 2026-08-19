@@ -145,6 +145,39 @@ public:
         return next_free_;
     }
 
+    // Hands back everything allocated inside it.
+    //
+    // The allocator is a bump pointer with no liveness analysis, so every
+    // expression a kernel writes costs a register for the whole program. That is
+    // fine until a kernel is long: two levels of tree traversal ran out at 250,
+    // and most of what it had allocated was slab-test arithmetic that had been
+    // dead for a hundred instructions.
+    //
+    // **A value made inside a scope must not be read after it.** The next
+    // allocation gets those registers, and nothing checks. So this is for a
+    // computation that ends by writing into a register declared outside it —
+    // which is the shape of a slab test, and why the two here are wrapped and
+    // nothing else is.
+    class Scratch {
+    public:
+        explicit Scratch(IRBuilder& builder)
+            : builder_(builder), mark_(builder.next_free_)
+        {
+        }
+
+        ~Scratch()
+        {
+            builder_.next_free_ = mark_;
+        }
+
+        Scratch(const Scratch&) = delete;
+        Scratch& operator=(const Scratch&) = delete;
+
+    private:
+        IRBuilder& builder_;
+        uint32_t mark_;
+    };
+
     // --- constants ----------------------------------------------------------
     // The only door a host value gets through, which is what makes passing one
     // into an operand slot impossible rather than merely discouraged.

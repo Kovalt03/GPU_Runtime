@@ -68,6 +68,17 @@ enum class Traversal {
 
     // A bounding volume hierarchy, walked with a stack in shared memory.
     Bvh,
+
+    // Two levels: a tree over instances in world space, and at each of its
+    // leaves the ray moves into that instance's space and walks the tree over
+    // the geometry there.
+    //
+    // The ray is transformed rather than the geometry, which is what makes one
+    // tree serve every copy. The parameter t survives the move — a hit at t in
+    // object space is the hit at t in world space, the direction being carried
+    // as a vector and left unnormalised — so the running best still compares
+    // across instances without being brought back.
+    Tlas,
 };
 
 // Which child of an interior node is entered first.
@@ -131,6 +142,13 @@ struct RaytraceStageArgs {
     // same reason.
     size_t bvh_offset = 0;
     uint32_t stack_depth = 0;
+
+    // The upper level: its nodes, its instances, and how deep it goes. The stack
+    // holds both levels at once — the upper one is still on it while the lower is
+    // walked — so a lane's slice is tlas_stack_depth + stack_depth entries.
+    size_t tlas_offset = 0;
+    size_t instances_offset = 0;
+    uint32_t tlas_stack_depth = 0;
 };
 
 // Builds the ray tracer. args[0] must point at a RaytraceStageArgs.

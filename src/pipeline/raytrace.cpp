@@ -43,7 +43,7 @@ Program build_raytrace_program(void** args)
     // matrix and for the tile table. The redundancy a scalar unit exists to
     // avoid, and the third place it turns up.
     const RayBasis& b = a.basis;
-    const Reg<Vec3> origin = k.constant(b.origin.x, b.origin.y, b.origin.z);
+    const Reg<Vec3> world_origin = k.constant(b.origin.x, b.origin.y, b.origin.z);
     const Reg<Vec3> right = k.constant(b.right.x, b.right.y, b.right.z);
     const Reg<Vec3> up = k.constant(b.up.x, b.up.y, b.up.z);
     const Reg<Vec3> forward = k.constant(b.forward.x, b.forward.y, b.forward.z);
@@ -63,7 +63,21 @@ Program build_raytrace_program(void** args)
         const Reg<Scalar> sy =
             k.add(k.mul(py, k.constant(-2.0f / static_cast<float>(a.height))),
                   k.constant(1.0f - 1.0f / static_cast<float>(a.height)));
-        const Reg<Vec3> dir = k.add(k.scale(right, sx), k.add(k.scale(up, sy), forward));
+        const Reg<Vec3> world_dir =
+            k.add(k.scale(right, sx), k.add(k.scale(up, sy), forward));
+
+        // What the lower level and the intersection test read. The same
+        // registers as the world ray until there is an upper level to move out
+        // of, and then the instance's own — written once at each of its leaves.
+        const bool two_level = a.traversal == Traversal::Tlas;
+        const Reg<Vec3> origin = two_level ? k.vec3() : world_origin;
+        const Reg<Vec3> dir = two_level ? k.vec3() : world_dir;
+        if (two_level) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                k.copy_into(origin.component(c), world_origin.component(c));
+                k.copy_into(dir.component(c), world_dir.component(c));
+            }
+        }
         // The running best, as in the rasteriser. Infinity rather than the
         // rasteriser's 2.0f: that worked because NDC depth is bounded, and t is
         // a ray parameter with no ceiling.
@@ -105,11 +119,21 @@ Program build_raytrace_program(void** args)
         // --- traversal ------------------------------------------------------
         // Emitted before the triangle loop so that the loop's bottom test can
         // branch back into it. Nothing here is issued when the mode is Linear.
-        const bool bvh = a.traversal == Traversal::Bvh;
+        const bool bvh = a.traversal != Traversal::Linear;
         const Label traverse = k.label();
         const Label traverse_next = k.label();
         const Label leaf_found = k.label();
         const Label done = k.label();
+
+        // The upper level's own loop and its own place to come back to. Where
+        // the lower level goes when its stack empties is the only thing two
+        // levels change about it: the next instance rather than the pixel.
+        const Label tlas_traverse = k.label();
+        const Label tlas_next = k.label();
+        const Label tlas_leaf = k.label();
+        const Label instance_top = k.label();
+        const Label instance_next = k.label();
+        const Label& blas_exit = two_level ? instance_next : done;
 
         // The stack lives in shared memory because it cannot live anywhere else:
         // an instruction names its registers in immediate fields, so there is no
@@ -122,27 +146,156 @@ Program build_raytrace_program(void** args)
         Reg<Scalar> stack_slot = zero;
         Reg<Scalar> sp = zero;
         Reg<Vec3> inv_dir = k.vec3();
+        Reg<Vec3> world_inv = two_level ? k.vec3() : inv_dir;
+
+        // Where the upper level's leaf left off. Declared out here because the
+        // lower level's exit has to advance them, and that sits past the block
+        // that fills them in.
+        Reg<Scalar> inst_i = zero;
+        Reg<Scalar> inst_count = zero;
         if (bvh) {
             const Reg<Scalar> lane =
                 k.sub(px, k.mul(k.block_x(), k.constant(static_cast<float>(WARP_SIZE))));
-            stack_slot = k.mul(
-                lane, k.constant(static_cast<float>(a.stack_depth * sizeof(float))));
+            // Both levels: the upper one is still on the stack while the lower
+            // is walked, so a lane's slice has to hold the sum. Sizing it by the
+            // lower level alone put lane 0's BLAS stack on top of lane 1's TLAS
+            // stack, which loses whole instances and leaves a frame that still
+            // looks like one.
+            const uint32_t slice = a.stack_depth + a.tlas_stack_depth;
+            stack_slot =
+                k.mul(lane, k.constant(static_cast<float>(slice * sizeof(float))));
 
             // Three reciprocals once rather than three divisions a node. A zero
             // component gives an infinite slab bound, which compares the way the
             // test wants: the ray never leaves that slab.
-            k.copy_into(inv_dir.component(0), k.rcp(dir.component(0)));
-            k.copy_into(inv_dir.component(1), k.rcp(dir.component(1)));
-            k.copy_into(inv_dir.component(2), k.rcp(dir.component(2)));
+            for (uint32_t c = 0; c < 3; ++c) {
+                k.copy_into(world_inv.component(c), k.rcp(world_dir.component(c)));
+                k.copy_into(inv_dir.component(c), world_inv.component(c));
+            }
 
             sp = k.constant(0.0f);
-            k.store_shared(stack_slot, zero);  // the root
-            k.fma(sp, one, one);
+
+            // The lower level's slice starts past the upper one's, which is
+            // still occupied while this runs — the instance being walked has a
+            // node of its own waiting on the stack above.
+            const Reg<Scalar> blas_slot =
+                two_level ? k.add(stack_slot, k.constant(static_cast<float>(
+                                                  a.tlas_stack_depth * sizeof(float))))
+                          : stack_slot;
+
+            if (two_level) {
+                // --- the upper level ----------------------------------------
+                const Reg<Scalar> tlas_sp = k.constant(0.0f);
+                k.store_shared(stack_slot, zero);
+                k.fma(tlas_sp, one, one);
+
+                k.place(tlas_traverse);
+                k.fma(tlas_sp, one, k.constant(-1.0f));
+                const Reg<Scalar> tnode =
+                    k.load_shared(k.add(stack_slot, k.mul(tlas_sp, k.constant(4.0f))));
+                const Reg<Scalar> tnode_addr =
+                    k.add(k.constant(static_cast<float>(a.tlas_offset)),
+                          k.mul(tnode, k.constant(static_cast<float>(BVH_NODE_BYTES))));
+
+                // Tested against the world ray, this level being where the
+                // instances sit rather than where their geometry does.
+                const Reg<Scalar> tnear = k.constant(0.0f);
+                const Reg<Scalar> tfar = k.constant(0.0f);
+                const Reg<Scalar> tcount = k.constant(0.0f);
+                {
+                    // Everything here dies at the brace, which is what lets a
+                    // second traversal fit at all.
+                    IRBuilder::Scratch scope(k);
+                    const Reg<Vec3> tlo = k.load_vec3(tnode_addr, 0.0f);
+                    const Reg<Vec3> thi = k.load_vec3(tnode_addr, 12.0f);
+                    Reg<Scalar> near_so_far = zero;
+                    Reg<Scalar> far_so_far = best_t;
+                    for (uint32_t axis = 0; axis < 3; ++axis) {
+                        const Reg<Scalar> t0 = k.mul(
+                            k.sub(tlo.component(axis), world_origin.component(axis)),
+                            world_inv.component(axis));
+                        const Reg<Scalar> t1 = k.mul(
+                            k.sub(thi.component(axis), world_origin.component(axis)),
+                            world_inv.component(axis));
+                        near_so_far = k.max(near_so_far, k.min(t0, t1));
+                        far_so_far = k.min(far_so_far, k.max(t0, t1));
+                    }
+                    k.copy_into(tnear, near_so_far);
+                    k.copy_into(tfar, far_so_far);
+                    k.copy_into(tcount, k.load(tnode_addr, 28.0f));
+                }
+                k.branch_to(tlas_next, k.gt(tnear, tfar));
+                k.branch_to(tlas_leaf, k.gt(tcount, zero));
+
+                const Reg<Scalar> tleft = k.load(tnode_addr, 24.0f);
+                k.store_shared(k.add(stack_slot, k.mul(tlas_sp, k.constant(4.0f))),
+                               k.add(tleft, one));
+                k.fma(tlas_sp, one, one);
+                k.store_shared(k.add(stack_slot, k.mul(tlas_sp, k.constant(4.0f))),
+                               tleft);
+                k.fma(tlas_sp, one, one);
+                k.place(tlas_next);
+                k.branch_to(tlas_traverse, k.gt(tlas_sp, zero));
+                k.branch_to(done);
+
+                // --- a leaf: one instance at a time --------------------------
+                k.place(tlas_leaf);
+                inst_i = k.constant(0.0f);
+                inst_count = k.constant(0.0f);
+                const Reg<Scalar> inst_first = k.constant(0.0f);
+                k.copy_into(inst_count, tcount);
+                k.copy_into(inst_first, k.load(tnode_addr, 24.0f));
+
+                k.place(instance_top);
+                const Reg<Scalar> inst_addr =
+                    k.add(k.constant(static_cast<float>(a.instances_offset)),
+                          k.mul(k.add(inst_first, inst_i),
+                                k.constant(static_cast<float>(TLAS_INSTANCE_BYTES))));
+
+                // Sixteen scalar loads, a lane at a time. The constant window is
+                // no help here and the pricing says why: two lanes at the same
+                // TLAS leaf may still be at different instances, so the address
+                // is not warp-uniform. A wide global matrix load is the slot the
+                // naming scheme reserves and does not have.
+                IRBuilder::Scratch instance_scope(k);
+                const Reg<Mat4> to_object = k.mat4();
+                for (uint32_t i = 0; i < MAT4_REGISTERS; ++i) {
+                    k.load_into(to_object.component(i), inst_addr,
+                                static_cast<float>(i * sizeof(float)));
+                }
+
+                // The point moves with w = 1 and the direction with w = 0, which
+                // is what leaves t meaning the same thing on both sides.
+                const Reg<Vec4> op = k.vec4();
+                const Reg<Vec4> od = k.vec4();
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(op.component(c), world_origin.component(c));
+                    k.copy_into(od.component(c), world_dir.component(c));
+                }
+                k.set(op.component(3), 1.0f);
+                k.set(od.component(3), 0.0f);
+
+                const Reg<Vec4> moved_origin = k.transform(to_object, op);
+                const Reg<Vec4> moved_dir = k.transform(to_object, od);
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(origin.component(c), moved_origin.component(c));
+                    k.copy_into(dir.component(c), moved_dir.component(c));
+                    k.copy_into(inv_dir.component(c), k.rcp(moved_dir.component(c)));
+                }
+
+                // And into the lower level, which is the loop below unchanged.
+                k.copy_into(sp, zero);
+                k.store_shared(blas_slot, zero);
+                k.fma(sp, one, one);
+            } else {
+                k.store_shared(stack_slot, zero);  // the root
+                k.fma(sp, one, one);
+            }
 
             k.place(traverse);
             k.fma(sp, one, k.constant(-1.0f));
             const Reg<Scalar> node =
-                k.load_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))));
+                k.load_shared(k.add(blas_slot, k.mul(sp, k.constant(4.0f))));
             const Reg<Scalar> node_addr =
                 k.add(k.constant(static_cast<float>(a.bvh_offset)),
                       k.mul(node, k.constant(static_cast<float>(BVH_NODE_BYTES))));
@@ -150,28 +303,31 @@ Program build_raytrace_program(void** args)
             // The slab test. Two wide loads for six floats, and the same
             // arithmetic nodes_visited runs on the host — a box the two disagree
             // about would drop geometry from one and not the other.
-            const Reg<Vec3> lo = k.load_vec3(node_addr, 0.0f);
-            const Reg<Vec3> hi = k.load_vec3(node_addr, 12.0f);
+            const Reg<Scalar> node_count = k.constant(0.0f);
+            {
+                IRBuilder::Scratch scope(k);
+                const Reg<Vec3> lo = k.load_vec3(node_addr, 0.0f);
+                const Reg<Vec3> hi = k.load_vec3(node_addr, 12.0f);
 
-            // Clamped below at zero so a box behind the origin cannot be entered,
-            // and above at the running best, which is the early exit an ordered
-            // traversal would get for free: a node further away than a hit
-            // already found has nothing to offer.
-            Reg<Scalar> near = zero;
-            Reg<Scalar> far = best_t;
-            for (uint32_t axis = 0; axis < 3; ++axis) {
-                const Reg<Scalar> t0 =
-                    k.mul(k.sub(lo.component(axis), origin.component(axis)),
-                          inv_dir.component(axis));
-                const Reg<Scalar> t1 =
-                    k.mul(k.sub(hi.component(axis), origin.component(axis)),
-                          inv_dir.component(axis));
-                near = k.max(near, k.min(t0, t1));
-                far = k.min(far, k.max(t0, t1));
+                // Clamped below at zero so a box behind the origin cannot be entered,
+                // and above at the running best, which is the early exit an ordered
+                // traversal would get for free: a node further away than a hit
+                // already found has nothing to offer.
+                Reg<Scalar> near = zero;
+                Reg<Scalar> far = best_t;
+                for (uint32_t axis = 0; axis < 3; ++axis) {
+                    const Reg<Scalar> t0 =
+                        k.mul(k.sub(lo.component(axis), origin.component(axis)),
+                              inv_dir.component(axis));
+                    const Reg<Scalar> t1 =
+                        k.mul(k.sub(hi.component(axis), origin.component(axis)),
+                              inv_dir.component(axis));
+                    near = k.max(near, k.min(t0, t1));
+                    far = k.min(far, k.max(t0, t1));
+                }
+                k.copy_into(node_count, k.load(node_addr, 28.0f));
+                k.branch_to(traverse_next, k.gt(near, far));
             }
-
-            const Reg<Scalar> node_count = k.load(node_addr, 28.0f);
-            k.branch_to(traverse_next, k.gt(near, far));
             k.branch_to(leaf_found, k.gt(node_count, zero));
 
             // Interior: both children, which are adjacent. The second push pops
@@ -212,13 +368,13 @@ Program build_raytrace_program(void** args)
                 second = k.sub(right, swap);
             }
 
-            k.store_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))), second);
+            k.store_shared(k.add(blas_slot, k.mul(sp, k.constant(4.0f))), second);
             k.fma(sp, one, one);
-            k.store_shared(k.add(stack_slot, k.mul(sp, k.constant(4.0f))), first);
+            k.store_shared(k.add(blas_slot, k.mul(sp, k.constant(4.0f))), first);
             k.fma(sp, one, one);
             k.place(traverse_next);
             k.branch_to(traverse, k.gt(sp, zero));
-            k.branch_to(done);
+            k.branch_to(blas_exit);
 
             // A leaf runs the loop below over its own range instead of the scene.
             k.place(leaf_found);
@@ -342,7 +498,7 @@ Program build_raytrace_program(void** args)
             }
             if (a.shading.mode == ShadingMode::Diffuse) {
                 const Reg<Vec3> normal = k.normalize(k.cross(e1, e2));
-                const Reg<Vec3> point = k.add(origin, k.scale(dir, t));
+                const Reg<Vec3> point = k.add(world_origin, k.scale(world_dir, t));
                 const Reg<Vec3> to_light = k.normalize(k.sub(light, point));
                 const Reg<Scalar> diffuse = k.max(zero, k.dot(normal, to_light));
                 const Reg<Vec3> lit = k.scale(base, diffuse);
@@ -395,6 +551,16 @@ Program build_raytrace_program(void** args)
         // back for the next node rather than to the pixel.
         if (bvh) {
             k.branch_to(traverse, k.gt(sp, zero));
+
+            // The lower level is finished. Two levels, that means the next
+            // instance in this leaf and then the next node above it; one level,
+            // it means the pixel.
+            if (two_level) {
+                k.place(instance_next);
+                k.fma(inst_i, one, one);
+                k.branch_to(instance_top, k.lt(inst_i, inst_count));
+                k.branch_to(tlas_next);
+            }
             k.place(done);
         }
 
@@ -419,22 +585,40 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
     if (args.triangle_count == 0) {
         throw std::runtime_error("run_raytrace_stage: nothing to trace");
     }
-    if (args.traversal == Traversal::Bvh && args.stack_depth == 0) {
+    if (args.traversal == Traversal::Tlas) {
+        if (args.tlas_stack_depth == 0 || args.tlas_offset == 0 ||
+            args.instances_offset == 0) {
+            throw std::runtime_error(
+                "run_raytrace_stage: a second level with no tree, instances or "
+                "stack to walk it with");
+        }
+        if (args.shading.mode == ShadingMode::Diffuse) {
+            throw std::runtime_error(
+                "run_raytrace_stage: a point light needs a world-space normal, "
+                "and an instance's edges are in its own space — the "
+                "inverse-transpose that would carry one across is not built");
+        }
+    }
+    if (args.traversal != Traversal::Linear && args.stack_depth == 0) {
         throw std::runtime_error(
             "run_raytrace_stage: a tree to walk and no stack to walk it with — "
             "set stack_depth from Bvh::max_depth");
     }
-    if (args.traversal == Traversal::Bvh) {
+    if (args.traversal != Traversal::Linear) {
         // One slice a lane, and a block is one warp wide. A stack that did not
         // fit would silently write into the next lane's slice, which shows up as
         // geometry appearing in the wrong pixel rather than as a failure.
-        const size_t floats = static_cast<size_t>(args.stack_depth) * WARP_SIZE;
+        //
+        // Both levels at once: the upper one is still on the stack while the
+        // lower is walked, which is what makes a two-level slice the sum.
+        const size_t floats =
+            static_cast<size_t>(args.stack_depth + args.tlas_stack_depth) * WARP_SIZE;
         if (floats > SHARED_MEM_FLOATS) {
             throw std::runtime_error(
-                "run_raytrace_stage: a stack " + std::to_string(args.stack_depth) +
-                " deep for " + std::to_string(WARP_SIZE) + " lanes is " +
-                std::to_string(floats) + " floats, and a block holds " +
-                std::to_string(SHARED_MEM_FLOATS));
+                "run_raytrace_stage: a stack " +
+                std::to_string(args.stack_depth + args.tlas_stack_depth) + " deep for " +
+                std::to_string(WARP_SIZE) + " lanes is " + std::to_string(floats) +
+                " floats, and a block holds " + std::to_string(SHARED_MEM_FLOATS));
         }
     }
     if (args.shading.mode == ShadingMode::Custom && !args.shading.shade) {

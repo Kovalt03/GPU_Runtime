@@ -167,6 +167,16 @@ enum class VertexStage {
 // Vertices on the device, and where pass 1 will leave them. Buffers a draw
 // writes but does not own — the framebuffer — are in DeviceFrame instead, so
 // that one geometry can be drawn into two frames and from two cameras.
+// One object drawn from shared geometry: where it is, and nothing else yet.
+//
+// A material would belong here too and is not here, because nothing reads one.
+// It arrives with the ray tracer's second level, where the instance a ray hits
+// is what decides the shader — which is the divergence SER exists for, and the
+// first in this repository that will not have been built to be measured.
+struct Instance {
+    Float4x4 model;
+};
+
 struct DeviceGeometry {
     void* world = nullptr;   // world-space vertices; the unique ones if indexed
     void* screen = nullptr;  // pass 1's output, one slot a world vertex
@@ -188,6 +198,13 @@ struct DeviceGeometry {
     void* bvh = nullptr;
     uint32_t bvh_depth = 0;
     TraversalOrder bvh_order = TraversalOrder::Unordered;
+
+    // The second level, when the geometry was uploaded to be drawn many times.
+    // The tree above holds one copy in its own space; these hold where the
+    // copies went and how to get a ray into each.
+    void* tlas = nullptr;
+    void* tlas_instances = nullptr;
+    uint32_t tlas_depth = 0;
 
     uint32_t vertex_count = 0;
     uint32_t triangle_count = 0;
@@ -217,19 +234,21 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
                                   uint32_t leaf_size = BVH_DEFAULT_LEAF,
                                   TraversalOrder order = TraversalOrder::Unordered);
 
+// The same geometry, placed many times, with a tree over the placements.
+//
+// One tree over the triangles however many copies there are: what a ray walks at
+// an instance is that one tree, reached by moving the ray into the instance's
+// space rather than by building geometry there. Instancing pays for itself in
+// memory before it pays for anything in time.
+DeviceGeometry upload_instanced_accelerated(
+    MyGPURuntime& rt, const std::vector<Float3>& world,
+    const std::vector<Instance>& instances, BvhSplit split = BvhSplit::SAH,
+    uint32_t leaf_size = BVH_DEFAULT_LEAF,
+    TraversalOrder order = TraversalOrder::Unordered);
+
 // An indexed upload, which is what makes pass 1 transform a shared corner once.
 // The ray tracer cannot draw one — see its overload below.
 DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh);
-
-// One object drawn from shared geometry: where it is, and nothing else yet.
-//
-// A material would belong here too and is not here, because nothing reads one.
-// It arrives with the ray tracer's second level, where the instance a ray hits
-// is what decides the shader — which is the divergence SER exists for, and the
-// first in this repository that will not have been built to be measured.
-struct Instance {
-    Float4x4 model;
-};
 
 // Where a draw puts its pixels, kept apart from the geometry because it belongs
 // to the target rather than to the model.
