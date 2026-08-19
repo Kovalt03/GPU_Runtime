@@ -51,7 +51,7 @@ inline Corrected emit_correct(IRBuilder& k, Reg<Scalar> w0, Reg<Scalar> w1,
 // three, and this is the single place that decides it.
 inline void emit_covered_pixel(IRBuilder& k, const Shading& shading, Reg<Vec3> dst,
                                Fragment& fragment, const Corrected& c, Reg<Scalar> cx,
-                               Reg<Scalar> cy, Reg<Scalar> depth)
+                               Reg<Scalar> cy, Reg<Scalar> depth, Reg<Scalar> material)
 {
     if (shading.mode != ShadingMode::Custom) {
         k.copy_into(dst.component(0), c.w1);
@@ -66,6 +66,11 @@ inline void emit_covered_pixel(IRBuilder& k, const Shading& shading, Reg<Vec3> d
     fragment.w0 = c.w0;
     fragment.w1 = c.w1;
     fragment.w2 = c.w2;
+
+    // Zero on every raster route: a rasteriser draws triangles rather than
+    // objects, so nothing here knows which one a pixel came from. Passed in
+    // rather than made here, so a launch that never shades pays nothing.
+    fragment.material = material;
     shading.shade(k, fragment);
 }
 

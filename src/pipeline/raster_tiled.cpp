@@ -181,7 +181,7 @@ Program build_tiled_raster_program(void** args)
                           Fragment fragment;
                           emit_covered_pixel(k, a.shading, dst, fragment,
                                              emit_correct(k, w0, w1, w2, iw0, iw1, iw2),
-                                             cx, cy, depth);
+                                             cx, cy, depth, zero);
                       });
 
             k.fma(tri_addr, stride, one);
@@ -299,7 +299,8 @@ void emit_shared_walk(IRBuilder& k, const TiledRasterStageArgs& a,
         emit_keep(k, a.predicated, take, best_z, best, depth, one, [&](Reg<Vec3> dst) {
             Fragment fragment;
             emit_covered_pixel(k, a.shading, dst, fragment,
-                               emit_correct(k, w0, w1, w2, iw0, iw1, iw2), cx, cy, depth);
+                               emit_correct(k, w0, w1, w2, iw0, iw1, iw2), cx, cy, depth,
+                               zero);
         });
 
         k.fma(shared_addr, shared_stride, one);

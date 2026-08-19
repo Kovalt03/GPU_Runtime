@@ -1022,17 +1022,24 @@ one. The second is what DXR and Vulkan RT call a TLAS over BLASes.
 
 | Copies | Flat triangles | Flat work | Flat KB | Two-level triangles | Work | KB | Memory | Work |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 4 | 128 | 3,097,101 | 7.2 | 32 | 3,483,023 | 2.2 | **3.2x** | 0.89x |
-| 16 | 512 | 5,175,635 | 28.5 | 32 | 6,681,623 | 3.8 | **7.6x** | 0.77x |
-| 64 | 2,048 | 11,032,700 | 114.7 | 32 | 16,933,096 | 9.8 | **11.8x** | 0.65x |
-| 256 | 8,192 | 35,332,837 | 457.6 | 32 | 59,188,484 | 33.8 | **13.6x** | 0.60x |
+| 4 | 128 | 3,100,506 | 7.2 | 32 | 3,508,652 | 2.3 | **3.1x** | 0.88x |
+| 16 | 512 | 5,177,126 | 28.5 | 32 | 6,761,798 | 3.9 | **7.2x** | 0.77x |
+| 64 | 2,048 | 11,028,704 | 114.7 | 32 | 17,213,247 | 10.5 | **10.9x** | 0.64x |
+| 256 | 8,192 | 35,306,486 | 457.6 | 32 | 60,311,759 | 36.8 | **12.5x** | 0.59x |
 
 64x32, 32 triangles a copy.
 
 **It is a memory answer, not a speed one.** The device holds 32 triangles instead
-of 8,192, and 33.8 KB instead of 457.6 — the ratio growing with the copies,
+of 8,192, and 36.8 KB instead of 457.6 — the ratio growing with the copies,
 because one tree serves however many there are. Work goes the other way, from
-0.89x to 0.60x, and by a widening margin.
+0.88x to 0.59x, and by a widening margin.
+
+An instance record is nineteen floats: sixteen of inverse, two naming where its
+own lower tree and triangles begin, one saying what it is made of. The two
+offsets are what make this a scene rather than a field of copies — with the
+lower tree's address baked into the kernel, a hundred cubes were expressible and
+a cube beside a sphere was not. They cost two loads where sixteen were already
+being spent, and about 3 KB of the 36.8 above.
 
 **The same missing instruction, named a second time.** An instance visited costs
 sixteen scalar loads to fetch its inverse, and a global access is charged 100 —
@@ -1047,6 +1054,13 @@ the plumbing: two lanes at the same TLAS leaf may still be at different
 instances, so the address is not warp-uniform and the window's charge would be a
 lie. Where instancing put a block on one instance and could use it, a ray tracer
 cannot.
+
+**The material is the other thing the record carries**, and nothing in the
+runtime reads it — it reaches a fragment shader and stops. That is deliberate: a
+shader branching on it splits a warp along the scene's own seams rather than
+along a key invented to make it split, which is the input `REORDER` has been
+waiting for since *Regrouping the threads before they disagree* closed on a
+synthetic one.
 
 **What this does not settle.** The upper level has no traversal unit in front of
 it, so the two levels are the same instructions in the same kernel and the

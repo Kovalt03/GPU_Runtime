@@ -234,12 +234,27 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
                                   uint32_t leaf_size = BVH_DEFAULT_LEAF,
                                   TraversalOrder order = TraversalOrder::Unordered);
 
-// The same geometry, placed many times, with a tree over the placements.
+// Several pieces of geometry, each placed as often as a caller likes, with a
+// tree over the placements.
 //
-// One tree over the triangles however many copies there are: what a ray walks at
-// an instance is that one tree, reached by moving the ray into the instance's
-// space rather than by building geometry there. Instancing pays for itself in
-// memory before it pays for anything in time.
+// One lower-level tree a piece of geometry however many copies of it there are:
+// what a ray walks at an instance is that tree, reached by moving the ray into
+// the instance's space rather than by building geometry there. Instancing pays
+// for itself in memory before it pays for anything in time.
+//
+// `instances` names geometries by index and carries a material each. The
+// material reaches a fragment shader and nothing else reads it — what makes
+// lanes of a warp take different paths has to come from the scene.
+DeviceGeometry upload_scene(MyGPURuntime& rt,
+                            const std::vector<std::vector<Float3>>& geometries,
+                            const std::vector<TlasInstance>& instances,
+                            BvhSplit split = BvhSplit::SAH,
+                            uint32_t leaf_size = BVH_DEFAULT_LEAF,
+                            TraversalOrder order = TraversalOrder::Unordered);
+
+// One geometry placed many times, which is the case above with a single entry
+// and every instance naming it. Kept because most of the tests and both
+// benchmarks want exactly that and say so more clearly this way.
 DeviceGeometry upload_instanced_accelerated(
     MyGPURuntime& rt, const std::vector<Float3>& world,
     const std::vector<Instance>& instances, BvhSplit split = BvhSplit::SAH,

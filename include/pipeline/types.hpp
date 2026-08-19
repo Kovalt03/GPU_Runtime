@@ -191,6 +191,16 @@ struct Fragment {
     Reg<Scalar> w0;
     Reg<Scalar> w1;
     Reg<Scalar> w2;
+
+    // What the instance this hit belongs to is made of, and zero on every route
+    // that has no instances.
+    //
+    // The only field here that differs between lanes for a reason the geometry
+    // did not choose: two neighbouring pixels can hit different objects, so a
+    // shader that branches on this splits the warp along the scene's own seams.
+    // That is what makes it the input SER wants, and why it is a number the
+    // runtime carries and never interprets.
+    Reg<Scalar> material;
 };
 
 // One unit normal a triangle, which is what the raster routes read rather than

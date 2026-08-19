@@ -586,7 +586,9 @@ this project exists to measure.
 | Traversal and intersection units | **absent** — traversal is instructions in the same kernel, the same choice made for rasterisation. So the divergence a tree causes is charged rather than hidden, which is where the interesting number is |
 | Ray reordering hardware | **absent as a unit**, present as an instruction: `REORDER` exists and the tree is the first thing here that gives it real divergence to regroup. What it still lacks is several materials to regroup *by* |
 | Index buffer as BLAS input | **absent** — and note it is real hardware's too: DXR and Vulkan RT both name one. What differs is when it is read, the builder consuming it once where the raster side reads it every draw |
-| Instance transforms (TLAS) | **built** — a tree over the placements, and the ray moved into an instance's space at its leaves. 13.6x less memory at 256 copies and 0.60x the work, an instance visited costing sixteen scalar loads for its matrix |
+| Instance transforms (TLAS) | **built** — a tree over the placements, and the ray moved into an instance's space at its leaves. 12.5x less memory at 256 copies and 0.59x the work, an instance visited costing sixteen scalar loads for its matrix |
+| Several bottom-level structures | **built** — an instance carries where its own tree and triangles begin, so a scene holds different meshes rather than copies of one |
+| Instance ID / material in the hit | **built** — a number the runtime carries and never interprets, reaching a fragment shader. What a warp diverging on it splits along is the scene rather than a key invented to split it |
 | Wide nodes | **absent** — two children a node. Hardware fetches four or eight bounds at once to spend one cache line rather than two |
 
 The tree removes 16.4x of the lane work on 4,096 triangles and the warp keeps

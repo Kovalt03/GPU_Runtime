@@ -157,18 +157,18 @@ int main(int argc, char** argv)
             draw_raytrace(rt, g, frame, target);
 
             const Bvh blas = build_bvh(world);
-            std::vector<Float4x4> models;
+            std::vector<TlasInstance> models;
             for (const Instance& instance : instances) {
-                models.push_back(instance.model);
+                models.push_back(TlasInstance{0, instance.model, 0});
             }
-            const Tlas tlas = build_tlas(blas, models, BvhSplit::SAH, 1);
+            const Tlas tlas = build_tlas({blas}, models, BvhSplit::SAH, 1);
             row.two_level.work = rt.stats().weighted_lane_ops;
             row.two_level.issued = rt.stats().warp_steps;
             row.two_level.triangles = g.triangle_count;
-            row.two_level.bytes = world.size() * sizeof(Float3) +
-                                  blas.nodes.size() * sizeof(float) +
-                                  tlas.tree.nodes.size() * sizeof(float) +
-                                  tlas.instances.size() * sizeof(float);
+            row.two_level.bytes =
+                world.size() * sizeof(Float3) + blas.nodes.size() * sizeof(float) +
+                tlas.tree.nodes.size() * sizeof(float) +
+                static_cast<size_t>(tlas.instance_count()) * TLAS_INSTANCE_BYTES;
             release(rt, frame);
             release(rt, g);
         }

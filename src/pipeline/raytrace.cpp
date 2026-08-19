@@ -105,6 +105,22 @@ Program build_raytrace_program(void** args)
         const Reg<Scalar> stride = k.constant(static_cast<float>(3 * WORLD_VERTEX_BYTES));
         const Reg<Scalar> count = k.constant(static_cast<float>(a.triangle_count));
         const Reg<Scalar> cursor = k.constant(static_cast<float>(a.triangles_offset));
+
+        // Where this instance's lower-level tree and triangles begin.
+        //
+        // Baked constants until there was a second level: every instance then
+        // walked the same tree at the same address, which made a hundred copies
+        // of one mesh expressible and a cube beside a sphere not. Read from the
+        // instance instead, and the traversal below is unchanged — an address is
+        // an address whichever way it arrived.
+        const Reg<Scalar> blas_nodes = k.constant(
+            static_cast<float>(a.traversal == Traversal::Linear ? 0 : a.bvh_offset));
+        const Reg<Scalar> blas_triangles =
+            k.constant(static_cast<float>(a.triangles_offset));
+
+        // What this instance is made of. Zero without a second level, and a
+        // shader that never asks pays nothing for it either way.
+        const Reg<Scalar> material = k.constant(0.0f);
         const Reg<Scalar> i = k.constant(0.0f);
 
         // Above the traversal, not merely above k.place(top): a leaf falls
@@ -283,6 +299,13 @@ Program build_raytrace_program(void** args)
                     k.copy_into(inv_dir.component(c), k.rcp(moved_dir.component(c)));
                 }
 
+                // The three past the matrix: this instance's own tree, its own
+                // triangles, and what it is made of. Two loads to make a scene
+                // out of what was a field of copies, and one for [m7].
+                k.copy_into(blas_nodes, k.load(inst_addr, 64.0f));
+                k.copy_into(blas_triangles, k.load(inst_addr, 68.0f));
+                k.copy_into(material, k.load(inst_addr, 72.0f));
+
                 // And into the lower level, which is the loop below unchanged.
                 k.copy_into(sp, zero);
                 k.store_shared(blas_slot, zero);
@@ -296,9 +319,8 @@ Program build_raytrace_program(void** args)
             k.fma(sp, one, k.constant(-1.0f));
             const Reg<Scalar> node =
                 k.load_shared(k.add(blas_slot, k.mul(sp, k.constant(4.0f))));
-            const Reg<Scalar> node_addr =
-                k.add(k.constant(static_cast<float>(a.bvh_offset)),
-                      k.mul(node, k.constant(static_cast<float>(BVH_NODE_BYTES))));
+            const Reg<Scalar> node_addr = k.add(
+                blas_nodes, k.mul(node, k.constant(static_cast<float>(BVH_NODE_BYTES))));
 
             // The slab test. Two wide loads for six floats, and the same
             // arithmetic nodes_visited runs on the host — a box the two disagree
@@ -341,7 +363,7 @@ Program build_raytrace_program(void** args)
                 // price of the ordering, paid whether or not it prunes anything.
                 const auto entry = [&](Reg<Scalar> index) {
                     const Reg<Scalar> addr = k.add(
-                        k.constant(static_cast<float>(a.bvh_offset)),
+                        blas_nodes,
                         k.mul(index, k.constant(static_cast<float>(BVH_NODE_BYTES))));
                     const Reg<Vec3> clo = k.load_vec3(addr, 0.0f);
                     const Reg<Vec3> chi = k.load_vec3(addr, 12.0f);
@@ -379,8 +401,8 @@ Program build_raytrace_program(void** args)
             // A leaf runs the loop below over its own range instead of the scene.
             k.place(leaf_found);
             k.copy_into(count, node_count);
-            k.copy_into(cursor, k.add(k.constant(static_cast<float>(a.triangles_offset)),
-                                      k.mul(k.load(node_addr, 24.0f), stride)));
+            k.copy_into(cursor,
+                        k.add(blas_triangles, k.mul(k.load(node_addr, 24.0f), stride)));
             k.copy_into(i, zero);
         }
 
@@ -493,6 +515,7 @@ Program build_raytrace_program(void** args)
                 fragment.w0 = k.sub(k.sub(one, u), v);
                 fragment.w1 = u;
                 fragment.w2 = v;
+                fragment.material = material;
                 a.shading.shade(k, fragment);
                 return;
             }

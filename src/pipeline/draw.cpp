@@ -274,45 +274,95 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
     return geometry;
 }
 
+DeviceGeometry upload_scene(MyGPURuntime& rt,
+                            const std::vector<std::vector<Float3>>& geometries,
+                            const std::vector<TlasInstance>& instances, BvhSplit split,
+                            uint32_t leaf_size, TraversalOrder order)
+{
+    if (geometries.empty() || instances.empty()) {
+        throw std::runtime_error("upload_scene: nothing to place, or nowhere to put it");
+    }
+
+    // One tree a geometry, and the triangles in that tree's order — a leaf is a
+    // range, so they have to sit the way the build left them.
+    //
+    // All of them go up as one buffer each, concatenated. What separates them is
+    // an offset an instance carries, which is exactly what makes a scene of
+    // different meshes expressible where a baked address made it not.
+    std::vector<Bvh> trees;
+    std::vector<Float3> triangles;
+    std::vector<float> nodes;
+    std::vector<size_t> node_base;
+    std::vector<size_t> triangle_base;
+    for (const std::vector<Float3>& geometry : geometries) {
+        const Bvh tree = build_bvh(geometry, split, leaf_size);
+        node_base.push_back(nodes.size() * sizeof(float));
+        triangle_base.push_back(triangles.size() * sizeof(Float3));
+
+        // The child index a node holds is relative to its own tree, so the base
+        // is added on the device rather than folded in here. Folding it in would
+        // make a tree that could only live at one address.
+        nodes.insert(nodes.end(), tree.nodes.begin(), tree.nodes.end());
+        triangles.insert(triangles.end(), tree.triangles.begin(), tree.triangles.end());
+        trees.push_back(tree);
+    }
+
+    const Tlas tlas = build_tlas(trees, instances, split, 1);
+
+    DeviceGeometry geometry = upload_positions(rt, triangles, VertexStage::None);
+    geometry.bvh = rt.myrt_malloc(nodes.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.bvh, nodes.data(), nodes.size() * sizeof(float),
+                   Direction::HostToDevice);
+    geometry.bvh_order = order;
+
+    geometry.tlas = rt.myrt_malloc(tlas.tree.nodes.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.tlas, tlas.tree.nodes.data(),
+                   tlas.tree.nodes.size() * sizeof(float), Direction::HostToDevice);
+    geometry.tlas_depth = tlas.tree.max_depth;
+
+    // The deepest of the lower trees, since a ray may reach any of them and the
+    // stack is sized once for the launch.
+    geometry.bvh_depth = 0;
+    for (const Bvh& tree : trees) {
+        geometry.bvh_depth = std::max(geometry.bvh_depth, tree.max_depth);
+    }
+
+    // The records, in the tree's order, with the offsets an instance needs to
+    // find its own tree. Absolute device offsets: the kernel adds nothing.
+    const size_t nodes_at = rt.myrt_device_offset(geometry.bvh);
+    const size_t triangles_at = rt.myrt_device_offset(geometry.world);
+    std::vector<float> records;
+    records.reserve(tlas.instance_count() * TLAS_INSTANCE_FLOATS);
+    for (uint32_t i = 0; i < tlas.instance_count(); ++i) {
+        for (uint32_t row = 0; row < 4; ++row) {
+            for (uint32_t col = 0; col < 4; ++col) {
+                records.push_back(tlas.inverses[i].at(row, col));
+            }
+        }
+        const uint32_t which = tlas.placed[i].blas;
+        records.push_back(static_cast<float>(nodes_at + node_base[which]));
+        records.push_back(static_cast<float>(triangles_at + triangle_base[which]));
+        records.push_back(static_cast<float>(tlas.placed[i].material));
+    }
+
+    geometry.tlas_instances = rt.myrt_malloc(records.size() * sizeof(float));
+    rt.myrt_memcpy(geometry.tlas_instances, records.data(),
+                   records.size() * sizeof(float), Direction::HostToDevice);
+    return geometry;
+}
+
 DeviceGeometry upload_instanced_accelerated(MyGPURuntime& rt,
                                             const std::vector<Float3>& world,
                                             const std::vector<Instance>& instances,
                                             BvhSplit split, uint32_t leaf_size,
                                             TraversalOrder order)
 {
-    if (instances.empty()) {
-        throw std::runtime_error("upload_instanced_accelerated: nowhere to place it");
-    }
-
-    const Bvh blas = build_bvh(world, split, leaf_size);
-
-    std::vector<Float4x4> models;
-    models.reserve(instances.size());
+    std::vector<TlasInstance> placed;
+    placed.reserve(instances.size());
     for (const Instance& instance : instances) {
-        models.push_back(instance.model);
+        placed.push_back(TlasInstance{0, instance.model, 0});
     }
-
-    // One instance a leaf. A leaf of several would put two matrices behind one
-    // box, and the loop over them is a lane's serial work rather than a warp's —
-    // where a BLAS leaf of four triangles is four tests every lane was going to
-    // run anyway.
-    const Tlas tlas = build_tlas(blas, models, split, 1);
-
-    DeviceGeometry geometry = upload_positions(rt, blas.triangles, VertexStage::None);
-    geometry.bvh = rt.myrt_malloc(blas.nodes.size() * sizeof(float));
-    rt.myrt_memcpy(geometry.bvh, blas.nodes.data(), blas.nodes.size() * sizeof(float),
-                   Direction::HostToDevice);
-    geometry.bvh_depth = blas.max_depth;
-    geometry.bvh_order = order;
-
-    geometry.tlas = rt.myrt_malloc(tlas.tree.nodes.size() * sizeof(float));
-    rt.myrt_memcpy(geometry.tlas, tlas.tree.nodes.data(),
-                   tlas.tree.nodes.size() * sizeof(float), Direction::HostToDevice);
-    geometry.tlas_instances = rt.myrt_malloc(tlas.instances.size() * sizeof(float));
-    rt.myrt_memcpy(geometry.tlas_instances, tlas.instances.data(),
-                   tlas.instances.size() * sizeof(float), Direction::HostToDevice);
-    geometry.tlas_depth = tlas.tree.max_depth;
-    return geometry;
+    return upload_scene(rt, {world}, placed, split, leaf_size, order);
 }
 
 DeviceGeometry upload(MyGPURuntime& rt, const Mesh& mesh)

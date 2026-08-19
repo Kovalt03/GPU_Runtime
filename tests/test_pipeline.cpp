@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -3218,4 +3219,143 @@ TEST(Pipeline, TheSecondLevelRefusesAPointLight)
 
     release(rt, frame);
     release(rt, placed);
+}
+
+TEST(Pipeline, ASceneMayHoldMoreThanOneShapeAtOnce)
+{
+    // What the two offsets on an instance record bought. Before them the lower
+    // tree's address was baked into the kernel, so a hundred copies of one mesh
+    // was expressible and a cube beside a sphere was not.
+    //
+    // Two geometries far enough apart in x that each pixel belongs to one of
+    // them, held against the same scene flattened into a single tree.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> small = compact_scene(6, 3);
+    const std::vector<Float3> large = compact_scene(18, 11);
+
+    std::vector<TlasInstance> instances;
+    for (uint32_t i = 0; i < 6; ++i) {
+        Float4x4 model = Float4x4::identity();
+        model.at(0, 3) = -1.25f + static_cast<float>(i) * 0.5f;
+        model.at(1, 3) = static_cast<float>(i % 2) * 0.5f - 0.25f;
+        instances.push_back(TlasInstance{i % 2, model, i});
+    }
+
+    std::vector<Float3> flattened;
+    for (const TlasInstance& instance : instances) {
+        for (const Float3& v : (instance.blas == 0 ? small : large)) {
+            const Float4 w = transform(instance.model, v, 1.0f);
+            flattened.push_back(Float3{w.x, w.y, w.z});
+        }
+    }
+
+    MyGPURuntime flat_rt(1u << 26);
+    DeviceGeometry flat = upload_accelerated(flat_rt, flattened);
+    DeviceFrame flat_frame = allocate_frame(flat_rt, target);
+    const std::vector<Float3> one_level =
+        draw_raytrace(flat_rt, flat, flat_frame, target);
+
+    MyGPURuntime rt(1u << 26);
+    DeviceGeometry scene = upload_scene(rt, {small, large}, instances);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> two_level = draw_raytrace(rt, scene, frame, target);
+
+    // Both geometries on the device once, not once an instance.
+    EXPECT_EQ(scene.triangle_count, (small.size() + large.size()) / 3);
+
+    uint32_t lit = 0;
+    for (size_t i = 0; i < one_level.size(); ++i) {
+        ASSERT_NEAR(two_level[i].x, one_level[i].x, PIXEL_EPS) << "pixel " << i;
+        ASSERT_NEAR(two_level[i].y, one_level[i].y, PIXEL_EPS) << "pixel " << i;
+        ASSERT_NEAR(two_level[i].z, one_level[i].z, PIXEL_EPS) << "pixel " << i;
+        lit += one_level[i].x + one_level[i].y + one_level[i].z > 0.01f ? 1u : 0u;
+    }
+    EXPECT_GT(lit, 0u) << "nothing was drawn, so nothing was compared";
+
+    release(rt, frame);
+    release(rt, scene);
+    release(flat_rt, flat_frame);
+    release(flat_rt, flat);
+}
+
+TEST(Pipeline, AShaderSeesWhichInstanceItHit)
+{
+    // The material is a number the runtime carries and never interprets, and
+    // this is the whole of what it is for: a shader branching on it splits a
+    // warp along the scene's own seams rather than along a key invented to make
+    // it split. That is the input SER wants.
+    //
+    // Each instance is given a material and the shader writes it straight out,
+    // so the frame is a map of which object each pixel belongs to.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = compact_scene(8);
+
+    std::vector<TlasInstance> instances;
+    for (uint32_t i = 0; i < 4; ++i) {
+        Float4x4 model = Float4x4::identity();
+        model.at(0, 3) = -1.1f + static_cast<float>(i) * 0.75f;
+        instances.push_back(TlasInstance{0, model, i + 1});
+    }
+
+    Shading custom;
+    custom.mode = ShadingMode::Custom;
+    custom.shade = [](IRBuilder& k, const Fragment& f) {
+        k.copy_into(f.out.component(0), k.mul(f.material, k.constant(0.2f)));
+        k.copy_into(f.out.component(1), f.w1);
+        k.copy_into(f.out.component(2), f.w2);
+    };
+
+    MyGPURuntime rt(1u << 26);
+    DeviceGeometry scene = upload_scene(rt, {geometry}, instances);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> pixels = draw_raytrace(rt, scene, frame, target, custom);
+
+    // One distinct red channel an instance, and every instance visible.
+    std::set<int> seen;
+    for (const Float3& pixel : pixels) {
+        if (pixel.x > 0.01f) {
+            seen.insert(static_cast<int>(pixel.x * 5.0f + 0.5f));
+        }
+    }
+    EXPECT_EQ(seen.size(), instances.size())
+        << "expected one material a instance to reach the frame";
+
+    release(rt, frame);
+    release(rt, scene);
+}
+
+TEST(Pipeline, ARasterFragmentHasNoInstanceToNameAndSaysSo)
+{
+    // A rasteriser draws triangles rather than objects, so nothing there knows
+    // which one a pixel came from. Zero rather than left uninitialised, since a
+    // shader written for the tracer runs unchanged on the walk.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+
+    Shading custom;
+    custom.mode = ShadingMode::Custom;
+    custom.shade = [](IRBuilder& k, const Fragment& f) {
+        k.copy_into(f.out.component(0), k.add(f.material, k.constant(0.5f)));
+        k.copy_into(f.out.component(1), f.material);
+        k.copy_into(f.out.component(2), f.material);
+    };
+
+    MyGPURuntime rt(1u << 25);
+    DeviceGeometry geometry = upload(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> pixels =
+        draw_walk(rt, geometry, frame, target, false, custom);
+
+    uint32_t lit = 0;
+    for (const Float3& pixel : pixels) {
+        if (pixel.x > 0.01f) {
+            ++lit;
+            EXPECT_NEAR(pixel.x, 0.5f, PIXEL_EPS);
+            EXPECT_NEAR(pixel.y, 0.0f, PIXEL_EPS);
+        }
+    }
+    EXPECT_GT(lit, 0u) << "nothing was drawn, so nothing was compared";
+
+    release(rt, frame);
+    release(rt, geometry);
 }

@@ -324,7 +324,7 @@ Program build_raster_program(void** args)
                     fragment.varyings[i] = value;
                 }
 
-                emit_covered_pixel(k, a.shading, dst, fragment, c, cx, cy, depth);
+                emit_covered_pixel(k, a.shading, dst, fragment, c, cx, cy, depth, zero);
                 return;
             }
 
@@ -332,7 +332,7 @@ Program build_raster_program(void** args)
                 Fragment unused;
                 emit_covered_pixel(k, a.shading, dst, unused,
                                    emit_correct(k, w0, w1, w2, t.iw0, t.iw1, t.iw2), cx,
-                                   cy, depth);
+                                   cy, depth, zero);
                 return;
             }
 

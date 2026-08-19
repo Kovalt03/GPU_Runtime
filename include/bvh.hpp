@@ -120,41 +120,66 @@ Bvh build_bvh_over(const std::vector<Box>& boxes, BvhSplit split = BvhSplit::SAH
 // object space is the hit at t in world space, provided the direction is carried
 // as a vector and left unnormalised.
 
-// Sixteen floats an instance: the world-to-object matrix and nothing else yet.
-// A material belongs here and is not here, nothing reading one.
-inline constexpr uint32_t TLAS_INSTANCE_FLOATS = 16;
+// Nineteen floats an instance: the world-to-object matrix, then where the
+// instance's own lower-level tree and triangles begin, then what it is made of.
+//
+// The two offsets are what make this a scene rather than a field of copies. With
+// them baked into the kernel every instance walked the same tree at the same
+// address, so a hundred cubes were expressible and a cube beside a sphere was
+// not. They cost two loads at a leaf where sixteen were already being spent.
+//
+//   [0..15]  world to object, row-major
+//   [16]     byte offset of this instance's lower-level nodes
+//   [17]     byte offset of its triangles
+//   [18]     which material — read by a shader, and nothing else looks at it
+inline constexpr uint32_t TLAS_INSTANCE_FLOATS = 19;
 inline constexpr uint32_t TLAS_INSTANCE_BYTES = TLAS_INSTANCE_FLOATS * sizeof(float);
 
-// Where one copy of the geometry went, and how to get a ray into its space.
+// Which geometry, placed where, made of what.
+//
+// The material is a number this file never interprets. It reaches a fragment
+// shader and stops there, which is the point — what makes lanes of a warp take
+// different paths has to come from the scene rather than from a key invented to
+// produce it.
 struct TlasInstance {
-    // World to object. The inverse is what a ray needs; the forward matrix only
-    // ever serves to work out the box the instance occupies, which the build
-    // does once here.
-    Float4x4 inverse_model;
+    // Index into the trees passed to build_tlas.
+    uint32_t blas = 0;
+
+    // Object to world. The inverse is what a ray needs, and the build works it
+    // out; this one is here because the instance's box comes from it.
+    Float4x4 model;
+
+    uint32_t material = 0;
 };
 
 struct Tlas {
-    // Over the instances' world-space boxes. A leaf names a range of `instances`
-    // below, the build having already permuted them.
+    // Over the instances' world-space boxes. A leaf names a range of the two
+    // vectors below, the build having already permuted them into its order.
     Bvh tree;
 
-    // Sixteen floats each, in the tree's order, ready to upload.
-    std::vector<float> instances;
+    // What the caller passed, reordered. A caller that keeps its own per-instance
+    // data has to permute it the same way, which is what `tree.order` is for.
+    std::vector<TlasInstance> placed;
+
+    // World to object, one per placed instance and in the same order. Kept apart
+    // from the struct above because it is derived rather than given, and mixing
+    // the two would invite a caller to fill in the wrong one.
+    std::vector<Float4x4> inverses;
 
     uint32_t instance_count() const;
 };
 
 // Builds one over the boxes each instance's geometry lands in.
 //
-// `blas` supplies the object-space bounds, so a caller passes the tree it
+// The trees supply the object-space bounds, so a caller passes the ones it
 // already built rather than the geometry again. An instance's box is the AABB of
-// the eight transformed corners of that one — loose for a rotation, and the
-// standard answer, since keeping it tight would mean re-deriving bounds from
-// geometry the upper level does not read.
+// the eight transformed corners of its own tree's root — loose for a rotation,
+// and the standard answer, since keeping it tight would mean re-deriving bounds
+// from geometry the upper level does not read.
 //
-// Throws std::runtime_error if there are no instances or a matrix cannot be
-// inverted.
-Tlas build_tlas(const Bvh& blas, const std::vector<Float4x4>& models,
+// Throws std::runtime_error if there are no instances, an instance names a tree
+// that is not there, or a matrix cannot be inverted.
+Tlas build_tlas(const std::vector<Bvh>& trees, const std::vector<TlasInstance>& instances,
                 BvhSplit split = BvhSplit::SAH, uint32_t leaf_size = 1);
 
 // How many nodes a ray from `origin` through `direction` would visit, counted on

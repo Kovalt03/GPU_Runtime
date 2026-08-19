@@ -298,15 +298,15 @@ TEST(Bvh, TheUpperLevelBoundsWhereTheCopiesWent)
     const std::vector<Float3> world = scattered_triangles(100);
     const Bvh blas = build_bvh(world);
 
-    std::vector<Float4x4> models;
+    std::vector<TlasInstance> models;
     for (uint32_t i = 0; i < 8; ++i) {
         Float4x4 m = Float4x4::identity();
         m.at(0, 3) = static_cast<float>(i) * 12.0f;
         m.at(1, 1) = 0.5f + static_cast<float>(i) * 0.1f;
-        models.push_back(m);
+        models.push_back(TlasInstance{0, m, i});
     }
 
-    const Tlas tlas = build_tlas(blas, models);
+    const Tlas tlas = build_tlas({blas}, models);
     EXPECT_EQ(tlas.instance_count(), models.size());
     EXPECT_EQ(tlas.tree.order.size(), models.size());
 
@@ -338,27 +338,23 @@ TEST(Bvh, AnInstanceMatrixArrivesInverted)
     // that ended up at position k, not of the k-th one the caller passed.
     const Bvh blas = build_bvh(scattered_triangles(40));
 
-    std::vector<Float4x4> models;
+    std::vector<TlasInstance> models;
     for (uint32_t i = 0; i < 6; ++i) {
         Float4x4 m = Float4x4::identity();
         m.at(0, 3) = 20.0f - static_cast<float>(i) * 7.0f;  // deliberately not
         m.at(2, 3) = static_cast<float>(i % 3) * 5.0f;      // in tree order
-        models.push_back(m);
+        models.push_back(TlasInstance{0, m, 100 + i});
     }
 
-    const Tlas tlas = build_tlas(blas, models);
+    const Tlas tlas = build_tlas({blas}, models);
     for (uint32_t slot = 0; slot < tlas.instance_count(); ++slot) {
-        const Float4x4& original = models[tlas.tree.order[slot]];
-        const float* stored = &tlas.instances[slot * TLAS_INSTANCE_FLOATS];
+        const TlasInstance& original = models[tlas.tree.order[slot]];
 
-        Float4x4 held{};
-        for (uint32_t row = 0; row < 4; ++row) {
-            for (uint32_t col = 0; col < 4; ++col) {
-                held.at(row, col) = stored[row * 4 + col];
-            }
-        }
+        // The whole record travels together: a permutation that moved the matrix
+        // and not the material would put a sphere's shader on a cube.
+        EXPECT_EQ(tlas.placed[slot].material, original.material) << "slot " << slot;
 
-        const Float4x4 product = original * held;
+        const Float4x4 product = original.model * tlas.inverses[slot];
         for (uint32_t row = 0; row < 4; ++row) {
             for (uint32_t col = 0; col < 4; ++col) {
                 EXPECT_NEAR(product.at(row, col), row == col ? 1.0f : 0.0f, 1e-4f)
@@ -371,6 +367,11 @@ TEST(Bvh, AnInstanceMatrixArrivesInverted)
 TEST(Bvh, AnUpperLevelOverNothingIsRefused)
 {
     const Bvh blas = build_bvh(scattered_triangles(8));
-    EXPECT_THROW(build_tlas(blas, {}), std::runtime_error);
-    EXPECT_THROW(build_tlas(Bvh{}, {Float4x4::identity()}), std::runtime_error);
+    EXPECT_THROW(build_tlas({blas}, {}), std::runtime_error);
+    EXPECT_THROW(build_tlas({Bvh{}}, {TlasInstance{}}), std::runtime_error);
+
+    // And an instance naming a tree that was not passed, which a scene of
+    // several geometries makes easy to get wrong.
+    EXPECT_THROW(build_tlas({blas}, {TlasInstance{1, Float4x4::identity(), 0}}),
+                 std::runtime_error);
 }
