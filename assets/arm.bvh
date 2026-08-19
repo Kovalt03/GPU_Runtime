@@ -1,0 +1,32 @@
+HIERARCHY
+ROOT Shoulder
+{
+	OFFSET 0.00 0.00 0.00
+	CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation
+	JOINT UpperArm
+	{
+		OFFSET 0.00 -1.00 0.00
+		CHANNELS 3 Zrotation Xrotation Yrotation
+		JOINT ForeArm
+		{
+			OFFSET 0.00 -2.00 0.00
+			CHANNELS 3 Zrotation Xrotation Yrotation
+			JOINT Hand
+			{
+				OFFSET 0.00 -1.50 0.00
+				CHANNELS 3 Zrotation Xrotation Yrotation
+				End Site
+				{
+					OFFSET 0.00 -0.50 0.00
+				}
+			}
+		}
+	}
+}
+MOTION
+Frames: 4
+Frame Time: 0.033333
+0.00 0.00 0.00 0.00 0.00 0.00  0.00 0.00 0.00  0.00 0.00 0.00  0.00 0.00 0.00
+0.00 0.00 0.00 0.00 0.00 0.00  0.00 0.00 0.00 30.00 0.00 0.00  0.00 0.00 0.00
+0.00 0.00 0.00 0.00 0.00 0.00  0.00 0.00 0.00 60.00 0.00 0.00  0.00 0.00 0.00
+0.00 0.00 0.00 0.00 0.00 0.00 90.00 0.00 0.00 60.00 0.00 0.00  0.00 0.00 0.00
