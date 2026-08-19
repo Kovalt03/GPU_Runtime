@@ -18,3 +18,8 @@ target_link_libraries(mesh_render PRIVATE gpurt project_warnings)
 # The directory is tracked via benchmarks/result/.gitkeep; create it if a fresh clone has
 # not got one yet.
 file(MAKE_DIRECTORY ${CMAKE_SOURCE_DIR}/output)
+
+# The shortest program that draws something of its own: geometry, a varying, a
+# fragment shader written by the caller. This is the one to read first.
+add_executable(hello_shader hello_shader.cpp)
+target_link_libraries(hello_shader PRIVATE gpurt project_warnings)

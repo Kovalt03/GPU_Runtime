@@ -75,7 +75,7 @@ grows only with the perimeter.
   │               Virtual ISA                        │
   │              include/isa.hpp                     │
   │   Opcode · Instruction · Program                 │
-  │   41 opcodes, 8 bytes each                       │
+  │   43 opcodes, 8 bytes each                       │
   │   V_MUL_F32 / V_DOT_VEC3_F32 / V_MATVEC_MAT4_F32 │
   │   V_LD_GLOBAL_F32 / V_CP_ASYNC_SHARED_GLOBAL_F32 │
   │   S_BALLOT / S_SYNCWARP / V_SHUFFLE_F32          │
@@ -127,6 +127,91 @@ opcodes are added.
 
 ---
 
+## Writing a shader
+
+A rendering program is host C++ that allocates buffers, describes two passes and
+reads the frame back. What makes it a *program* rather than a configuration is
+the fragment shader: a C++ callable that runs once, as the kernel is assembled,
+and emits instructions.
+
+`kernels/hello_shader.cpp` is the whole of it in about eighty lines. The two
+parts that are not bookkeeping:
+
+```cpp
+// Three floats a vertex, alongside the position, carried to the pixels.
+vertex.attribute_offset = rt.myrt_device_offset(attribute_buffer);
+vertex.varying_count    = 3;
+
+// The shader. Called at build time; f holds registers, not values.
+raster.shading.mode = ShadingMode::Custom;
+raster.varying_count = 3;
+raster.shading.shade = [](IRBuilder& k, const Fragment& f) {
+    const Reg<Scalar> rim = k.min(f.w0, k.min(f.w1, f.w2));
+    const Reg<Scalar> gain = k.constant(0.4f);
+    k.fma(gain, rim, k.constant(2.4f));
+    for (uint32_t channel = 0; channel < 3; ++channel) {
+        k.copy_into(f.out.component(channel), k.mul(f.varyings[channel], gain));
+    }
+};
+```
+
+`Fragment` hands over what a GLSL fragment stage receives: the interpolated
+varyings, the pixel's position and depth, the three barycentric weights — all
+perspective-corrected, because that correction is what an attribute has to be
+interpolated with and it should not be a caller's job to rediscover — and the
+register the colour goes in. Uniforms arrive through the constant window
+(`Uniforms::Window`), which is charged once a warp rather than once a thread.
+
+Three things follow from the shader being a builder rather than a text:
+
+- **The whole instruction set is available**, branches included. There is no
+  shading language to gate what a caller may write, so anything the ISA can do a
+  shader can do — the cost is that the shader is C++ and its errors are C++
+  errors, not compile diagnostics against a shading grammar.
+- **Loops over varyings unroll before the kernel exists.** The `for` above runs
+  on the host; the device sees three straight-line multiplies. A shading language
+  would need a compiler to reach the same place.
+- **It costs what it emits.** The divergence and throughput a run reports include
+  the shader, so a branch in it shows up in the same figures as a branch in the
+  rasteriser.
+
+The two built-in modes remain: `ShadingMode::Barycentric` fills with the weights
+and `Diffuse` applies a point light. A `Custom` shader that interpolates a
+per-vertex colour produces a frame **pixel-identical** to `Barycentric`, which is
+how the varying path is tested — `Barycentric` was already checked against a host
+reference, so the new path inherits that check rather than needing its own.
+
+The shader rides inside `Shading`, which every route that can colour a pixel
+already takes — so the ray tracer picks up the same function without a signature
+of its own, and one shader draws the same picture down both. That is a claim
+about naming as much as arithmetic: the walk interpolates corrected weights
+across a projected triangle while the tracer reads Möller–Trumbore's `u` and `v`
+out of a world-space solve, and a test holds the two frames against each other.
+
+All four routes take a shader. What differs is what each can put in a fragment:
+
+| | walk | tiled / shared | ray tracer |
+|---|---|---|---|
+| custom shader | yes | yes | yes |
+| varyings | yes | refused — the tile format is fixed | none: no vertex stage |
+| `Diffuse` | yes | refused — no world position | yes |
+| `f.depth` | NDC, as the depth buffer holds it | NDC | the ray parameter |
+
+The refusals are narrow on purpose. A tile carries three vertices of four floats,
+fixed inside the kernel, so a varying has nowhere to go and a point light has no
+world position to work from — but the weights, the pixel and the depth are all
+there already, and a shader that asks the geometry no questions wants nothing
+else. Refusing the shader outright would have been the wider claim, not the safer
+one. What is refused throws rather than draws a plausible frame that is not the
+one asked for.
+
+A shader runs for fragments that lose: under `predicated` nothing is masked and
+the colour is blended away, and the tracer shades once per candidate triangle.
+Writing `out` is safe; a store or an atomic in a shader fires for candidates the
+frame never shows.
+
+---
+
 ## Build and run
 
 GoogleTest is fetched automatically on the first configure.
@@ -155,6 +240,9 @@ behind by a different generator, which otherwise blocks configuring while
 leaving the stale binaries in place.
 
 ```bash
+# A shader of your own — read this one first
+./build/kernels/hello_shader
+
 # Render (PPM, no image library needed)
 ./build/kernels/ray_triangle 256 256
 sips -s format png benchmarks/result/result.ppm --out result.png   # macOS
@@ -565,8 +653,14 @@ gpu-runtime-sim/
 │   ├── grid.obj
 │   ├── sphere.obj
 │   └── tetrahedron.obj
+├── machines/                # a machine a benchmark can be pointed at
+│   ├── default.spec
+│   ├── one-sm.spec
+│   ├── v100.spec
+│   └── a100.spec
 ├── include/
 │   ├── app_run.hpp         # --out and run directories, shared by the executables
+│   ├── gpu_spec.hpp        # the machine in one place: SMs, caches, prices
 │   ├── isa.hpp
 │   ├── memory.hpp
 │   ├── thread.hpp
@@ -574,16 +668,21 @@ gpu-runtime-sim/
 │   ├── runtime.hpp
 │   ├── ir_builder.hpp
 │   ├── math3d.hpp
+│   ├── half.hpp            # f16 conversion and packing, written out by hand
 │   ├── mesh.hpp            # Mesh, load_obj, ACMR scoring, Forsyth reorder
+│   ├── gemm.hpp            # a tiled matrix multiply, one flag a hardware feature
 │   └── pipeline/
-│       ├── types.hpp        # strides and ScreenTriangle, shared by the stages
+│       ├── types.hpp        # strides, ScreenTriangle, Fragment and ShadeFn
 │       ├── vertex.hpp
 │       ├── raster.hpp
 │       ├── raster_tiled.hpp
 │       ├── raytrace.hpp
+│       ├── clip.hpp         # near-plane clipping, compacted with an atomic
+│       ├── swap_chain.hpp   # two frames, and a clear that overlaps the draw
 │       └── draw.hpp          # the routes, each taking a mesh or a vertex list
 ├── src/
 │   ├── app_run.cpp
+│   ├── gpu_spec.cpp
 │   ├── isa.cpp
 │   ├── memory.cpp
 │   ├── thread.cpp
@@ -591,7 +690,9 @@ gpu-runtime-sim/
 │   ├── runtime.cpp
 │   ├── ir_builder.cpp
 │   ├── math3d.cpp
+│   ├── half.cpp
 │   ├── mesh.cpp
+│   ├── gemm.cpp
 │   └── pipeline/
 │       ├── raster_emit.hpp   # private: the emitters the raster kernels share,
 │       │                     #   including the branch/blend the flag selects
@@ -599,9 +700,12 @@ gpu-runtime-sim/
 │       ├── vertex.cpp
 │       ├── raster.cpp
 │       ├── raster_tiled.cpp
-│       └── raytrace.cpp
+│       ├── raytrace.cpp
+│       ├── clip.cpp
+│       └── swap_chain.cpp
 ├── kernels/
 │   ├── ppm.hpp
+│   ├── hello_shader.cpp    # the shortest program with a shader of its own
 │   ├── ray_triangle.cpp
 │   ├── raster_triangle.cpp
 │   └── mesh_render.cpp     # renders an .obj down every route and compares
@@ -611,22 +715,32 @@ gpu-runtime-sim/
 │   ├── test_memory.cpp
 │   ├── test_thread.cpp
 │   ├── test_scheduler.cpp
+│   ├── test_streams.cpp
 │   ├── test_runtime.cpp
 │   ├── test_ir_builder.cpp
 │   ├── test_math3d.cpp
 │   ├── test_mesh.cpp
+│   ├── test_gemm.cpp
 │   ├── test_pipeline.cpp
 │   ├── reference.hpp        # host oracles, built into the test target only
 │   └── reference.cpp
 ├── benchmarks/
 │   ├── CMakeLists.txt
 │   ├── RESULTS.md
-│   ├── divergence_bench.cpp
 │   ├── scenes.hpp           # the scenes render_bench and model_bench share
+│   ├── divergence_bench.cpp
 │   ├── render_bench.cpp     # generates the measurement tables in RESULTS.md
 │   ├── reduction_bench.cpp  # summing a warp, two ways
 │   ├── cache_bench.cpp      # a cache against a working set that outgrows it
 │   ├── model_bench.cpp      # the flat model's conclusions under the others
+│   ├── occupancy_bench.cpp  # what several SMs buy, and what caps them
+│   ├── stream_bench.cpp     # a second queue, and a grid the host never learns
+│   ├── async_bench.cpp      # a copy the warp does not wait for
+│   ├── mma_bench.cpp        # one instruction against 4,096 multiply-adds
+│   ├── ser_bench.cpp        # regrouping a block's threads, and when it taxes
+│   ├── cluster_bench.cpp    # a block reading its neighbour's shared memory
+│   ├── gemm_bench.cpp       # the tiled multiply, one feature at a time
+│   ├── bandwidth_bench.cpp  # what happens when the memory system has a ceiling
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```
