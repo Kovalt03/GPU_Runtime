@@ -98,19 +98,43 @@ void add_box(std::vector<Float3>& tris, std::vector<float>& material, Float3 lo,
     quad({lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, lo.y, hi.z}, {lo.x, lo.y, hi.z});
 }
 
-// Six faces of a cube, then the ground, then a mirror. MATERIAL_FLOATS each: a
-// colour, then what the surface does not keep — how much leaves along the
-// mirror direction and how much through it, and the index the second bends by.
+// One face, wound so its normal points back down `-z` at the camera.
+//
+// A pane rather than a box for the glass, because a box would bend the ray once
+// and not twice: the intersection test rejects a back face, so a ray already
+// inside a closed volume never meets the far wall from within. One surface is
+// what this route can actually model, so it is what the scene puts there.
+void add_pane(std::vector<Float3>& tris, std::vector<float>& material, float which,
+              Float3 lo, Float3 hi)
+{
+    tris.push_back(Float3{hi.x, lo.y, lo.z});
+    tris.push_back(Float3{lo.x, lo.y, lo.z});
+    tris.push_back(Float3{lo.x, hi.y, hi.z});
+    tris.push_back(Float3{hi.x, lo.y, lo.z});
+    tris.push_back(Float3{lo.x, hi.y, hi.z});
+    tris.push_back(Float3{hi.x, hi.y, hi.z});
+    material.push_back(which);
+    material.push_back(which);
+}
+
+// Six faces of a cube, then the ground, a mirror, and a pane of glass.
+// MATERIAL_FLOATS each: a colour, then what the surface does not keep —
+// how much leaves along the mirror direction and how much through it, and the
+// index the second of those bends by.
 //
 // The arrangement is the one Vulkan-Samples uses for its reflection sample —
 // two cubes with a different colour a face, a ground that reflects a tenth, and
 // two mirrors facing each other at nine tenths. The cubes are what a reflection
 // has to show, the faces are how one tells which reflection it is looking at,
-// and the facing pair is what makes a reflection contain another.
+// and the facing pair is what makes a reflection contain another. The glass is
+// this project's, and is here because refraction is the one direction a mirror
+// scene never produces: every ray in it leaves on the side it arrived.
 enum Material : uint32_t {
     FACE_ZERO = 0,  // six consecutive, one a face
     GROUND = 6,
     MIRROR = 7,
+    GLASS = 8,
+    BALL = 9,
 };
 
 // clang-format off
@@ -124,10 +148,62 @@ inline constexpr float MATERIAL_TABLE[] = {
     0.85f, 0.25f, 0.85f,  0.00f,  0.00f,  1.00f,  // -y  magenta
     0.70f, 0.70f, 0.70f,  0.10f,  0.00f,  1.00f,  // ground
     0.30f, 0.90f, 1.00f,  0.90f,  0.00f,  1.00f,  // mirror
+    0.80f, 0.92f, 1.00f,  0.10f,  0.85f,  1.52f,  // glass, near enough to crown
+    0.30f, 0.60f, 0.95f,  0.05f,  0.00f,  1.00f,  // the thrown ball
 };
 // clang-format on
-static_assert(sizeof(MATERIAL_TABLE) / sizeof(float) == (MIRROR + 1) * MATERIAL_FLOATS,
+static_assert(sizeof(MATERIAL_TABLE) / sizeof(float) == (BALL + 1) * MATERIAL_FLOATS,
               "a material is MATERIAL_FLOATS wide and the kernel indexes by that");
+
+// A walk with a material a triangle. The only route that has a shadow, a
+// reflection or a refraction to give: all three read the table, and a shader
+// that names one colour has nowhere to put them.
+std::vector<Float3> trace_materials(MyGPURuntime& rt, const std::vector<Float3>& world,
+                                    const std::vector<float>& material,
+                                    const DrawTarget& target, Float3 light,
+                                    uint32_t bounces, bool shadows)
+{
+    DeviceGeometry traced = upload_accelerated(rt, world);
+    DeviceFrame buffer = allocate_frame(rt, target);
+
+    // The tree moved the triangles, so the materials move with them. One float
+    // a triangle, permuted by the order the build reports.
+    std::vector<float> placed(material.size());
+    for (size_t i = 0; i < traced.triangle_order.size(); ++i) {
+        placed[i] = material[traced.triangle_order[i]];
+    }
+
+    void* indices = rt.myrt_malloc(placed.size() * sizeof(float));
+    void* table = rt.myrt_malloc(sizeof(MATERIAL_TABLE));
+    rt.myrt_memcpy(indices, placed.data(), placed.size() * sizeof(float),
+                   Direction::HostToDevice);
+    rt.myrt_memcpy(table, MATERIAL_TABLE, sizeof(MATERIAL_TABLE),
+                   Direction::HostToDevice);
+
+    RaytraceStageArgs walk;
+    walk.basis = ray_basis(target.camera, target.aspect());
+    walk.triangles_offset = rt.myrt_device_offset(traced.world);
+    walk.framebuffer_offset = rt.myrt_device_offset(buffer.pixels);
+    walk.width = target.width;
+    walk.height = target.height;
+    walk.triangle_count = traced.triangle_count;
+    walk.traversal = Traversal::Bvh;
+    walk.stack_depth = traced.bvh_depth;
+    walk.bvh_offset = rt.myrt_device_offset(traced.bvh);
+    walk.shade_when = ShadeWhen::Deferred;
+    walk.bounces = bounces;
+    walk.material_offset = rt.myrt_device_offset(indices);
+    walk.material_table_offset = rt.myrt_device_offset(table);
+    walk.shading.light_position = light;
+    walk.shadows = shadows;
+    run_raytrace_stage(rt, walk);
+
+    std::vector<Float3> pixels = read_back(rt, buffer);
+    release(rt, buffer);
+    release(rt, traced);
+    return pixels;
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -256,6 +332,13 @@ int main(int argc, char** argv)
                 static_cast<float>(MIRROR));
         add_box(room, room_material, {-5.0f, -1.0f, 6.9f}, {5.0f, 4.0f, 7.1f},
                 static_cast<float>(MIRROR));
+
+        // Behind the cubes, so the cubes hide its near half and what reaches
+        // the camera is the part standing against the far mirror. Refraction
+        // reads as a displacement of whatever is behind it, and the mirror is
+        // the one thing in this room with enough structure to show one.
+        add_pane(room, room_material, static_cast<float>(GLASS), {-2.20f, -1.0f, 2.20f},
+                 {2.20f, 1.20f, 2.20f});
     }
 
     std::vector<std::vector<Float3>> animation;
@@ -294,79 +377,72 @@ int main(int argc, char** argv)
 
         MyGPURuntime rt(1u << 27);
 
+        // The scheduler's guard is a flat number of cycles, which a large
+        // enough grid reaches for an honest reason — a thousand pixels a side
+        // with shadow rays is twelve traversals over a million pixels. Scaled
+        // by the pixels asked for, which lands on the default at the sizes
+        // these scenes are usually run at and still bounds a kernel that does
+        // not end.
+        rt.myrt_cycle_budget(static_cast<uint64_t>(size) * size * 4096ull);
+
+        // How the light arrives. Named a scene at a time: the mirror room is
+        // in world units of its own, and the throw wants the ball's shadow to
+        // land where the camera can see it.
+        const Float3 light =
+            mirror ? Float3{0.55f, 1.0f, 0.45f} : Float3{0.35f, 1.0f, 0.5f};
+        const bool shadows = args.flag("shadows", 1) != 0;
+
         if (mirror) {
-            MyGPURuntime& r = rt;
-            DeviceGeometry traced = upload_accelerated(r, room);
-            DeviceFrame frame_buffer = allocate_frame(r, target);
-
-            // The tree moved the triangles, so the materials move with them.
-            // One float a triangle, permuted by the order the build reports.
-            std::vector<float> placed(room_material.size());
-            for (size_t i = 0; i < traced.triangle_order.size(); ++i) {
-                placed[i] = room_material[traced.triangle_order[i]];
-            }
-
-            void* material = r.myrt_malloc(placed.size() * sizeof(float));
-            void* table = r.myrt_malloc(sizeof(MATERIAL_TABLE));
-            r.myrt_memcpy(material, placed.data(), placed.size() * sizeof(float),
-                          Direction::HostToDevice);
-            r.myrt_memcpy(table, MATERIAL_TABLE, sizeof(MATERIAL_TABLE),
-                          Direction::HostToDevice);
-
-            RaytraceStageArgs walk;
-            walk.basis = ray_basis(camera, target.aspect());
-            walk.triangles_offset = r.myrt_device_offset(traced.world);
-            walk.framebuffer_offset = r.myrt_device_offset(frame_buffer.pixels);
-            walk.width = size;
-            walk.height = size;
-            walk.triangle_count = traced.triangle_count;
-            walk.traversal = Traversal::Bvh;
-            walk.stack_depth = traced.bvh_depth;
-            walk.bvh_offset = r.myrt_device_offset(traced.bvh);
-            walk.shade_when = ShadeWhen::Deferred;
-            walk.bounces = bounces;
-            walk.material_offset = r.myrt_device_offset(material);
-            walk.material_table_offset = r.myrt_device_offset(table);
-            walk.shading.light_position = Float3{0.55f, 1.0f, 0.45f};
-            run_raytrace_stage(r, walk);
-
-            animation.push_back(read_back(r, frame_buffer));
+            animation.push_back(trace_materials(rt, room, room_material, target, light,
+                                                bounces, shadows));
             if (frame % 12 == 0) {
                 std::printf("  frame %2u  divergence %5.2f%%\n", frame,
-                            r.divergence_rate() * 100.0);
+                            rt.divergence_rate() * 100.0);
             }
-            release(r, frame_buffer);
-            release(r, traced);
             continue;
         }
 
-        if (!cube) {
+        if (thrown) {
             // The throw moves the geometry and leaves everything else alone,
             // which is the cheaper of the two ways to animate: no matrix reaches
             // the device and no stage is asked to apply one.
             std::vector<Float3> placed = world;
-            if (thrown) {
-                const Float3 to = thrown_at(frame);
-                for (Float3& v : placed) {
-                    v = Float3{v.x - centre.x + to.x, v.y - centre.y + to.y,
-                               v.z - centre.z + to.z};
-                }
-                // The floor the arcs are solved against, drawn so the
-                // shrinking reads as a bounce rather than as a drift. It does
-                // not move, so it goes in after the sphere is translated.
-                const float y = ground - radius;
-                const float x0 = flight_lo.x - radius * 2.0f;
-                const float x1 = flight_hi.x + radius * 2.0f;
-                const float z0 = centre.z - radius * 8.0f;
-                const float z1 = centre.z + radius * 8.0f;
-                placed.push_back(Float3{x0, y, z0});
-                placed.push_back(Float3{x1, y, z1});
-                placed.push_back(Float3{x1, y, z0});
-                placed.push_back(Float3{x0, y, z0});
-                placed.push_back(Float3{x0, y, z1});
-                placed.push_back(Float3{x1, y, z1});
+            const Float3 to = thrown_at(frame);
+            for (Float3& v : placed) {
+                v = Float3{v.x - centre.x + to.x, v.y - centre.y + to.y,
+                           v.z - centre.z + to.z};
             }
-            DeviceGeometry traced = upload_accelerated(rt, placed);
+            std::vector<float> which(placed.size() / 3, static_cast<float>(BALL));
+
+            // The floor the arcs are solved against, drawn so the shrinking
+            // reads as a bounce rather than as a drift, and so the ball has
+            // somewhere to cast onto. It does not move, so it goes in after the
+            // sphere is translated.
+            const float y = ground - radius;
+            const float x0 = flight_lo.x - radius * 2.0f;
+            const float x1 = flight_hi.x + radius * 2.0f;
+            const float z0 = centre.z - radius * 8.0f;
+            const float z1 = centre.z + radius * 8.0f;
+            placed.push_back(Float3{x0, y, z0});
+            placed.push_back(Float3{x1, y, z1});
+            placed.push_back(Float3{x1, y, z0});
+            placed.push_back(Float3{x0, y, z0});
+            placed.push_back(Float3{x0, y, z1});
+            placed.push_back(Float3{x1, y, z1});
+            which.push_back(static_cast<float>(GROUND));
+            which.push_back(static_cast<float>(GROUND));
+
+            animation.push_back(
+                trace_materials(rt, placed, which, target, light, bounces, shadows));
+            if (frame % 12 == 0) {
+                std::printf("  frame %2u  divergence %5.2f%%\n", frame,
+                            rt.divergence_rate() * 100.0);
+            }
+            continue;
+        }
+
+        if (!cube) {
+            DeviceGeometry traced = upload_accelerated(rt, world);
             DeviceFrame frame_buffer = allocate_frame(rt, target);
             animation.push_back(draw_raytrace(rt, traced, frame_buffer, target, shading));
             if (frame % 12 == 0) {
@@ -429,18 +505,24 @@ int main(int argc, char** argv)
                              : thrown ? "orbit_throw"
                              : mirror ? "orbit_mirror"
                                       : "orbit_sphere";
-    const std::string gif = args.images_dir() + name + ".gif";
-    write_gif(gif, animation, size, size, 4);
-
-    std::vector<float> flat;
-    for (const Float3& pixel : animation.front()) {
-        flat.push_back(pixel.x);
-        flat.push_back(pixel.y);
-        flat.push_back(pixel.z);
+    // One frame is a picture and several are an animation, so a run writes one
+    // or the other. It also lets the two be taken at different sizes without
+    // the second overwriting the first: a still can afford an hour a frame and
+    // an animation cannot.
+    if (frames == 1) {
+        std::vector<float> flat;
+        for (const Float3& pixel : animation.front()) {
+            flat.push_back(pixel.x);
+            flat.push_back(pixel.y);
+            flat.push_back(pixel.z);
+        }
+        const std::string still = args.images_dir() + name + ".ppm";
+        write_ppm(still, flat, size, size);
+        std::printf("\nwrote %s\n", still.c_str());
+    } else {
+        const std::string gif = args.images_dir() + name + ".gif";
+        write_gif(gif, animation, size, size, 4);
+        std::printf("\nwrote %s\n", gif.c_str());
     }
-    const std::string still = args.images_dir() + name + ".ppm";
-    write_ppm(still, flat, size, size);
-
-    std::printf("\nwrote %s and %s\n", gif.c_str(), still.c_str());
     return 0;
 }
