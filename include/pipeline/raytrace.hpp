@@ -99,6 +99,34 @@ enum class TraversalOrder {
     Nearest,
 };
 
+// When the winning hit is coloured.
+//
+// A ray tracer that shades inside its loop shades every candidate and blends the
+// loser away, which costs nothing to write and is what this route did from the
+// start. It also makes reordering impossible: REORDER is a rendezvous, so it can
+// only run where every thread of the block has finished traversing, and by then
+// the shading has already happened.
+//
+// Deferring keeps four scalars — the two barycentrics, the parameter and the
+// material — and colours once at the end. Which is what the hardware asks for
+// too: trace, then optixReorder(material), then shade.
+enum class ShadeWhen {
+    // At every candidate that beats the running best.
+    Inline,
+
+    // Once, after the whole traversal, from what the loop kept.
+    Deferred,
+
+    // The same, with the block's threads regrouped by material first, so lanes
+    // about to run the same shader share a warp.
+    //
+    // Held apart from Deferred rather than folded into it because the two
+    // changes have to be separable: one moves the shading and the other sorts
+    // the threads, and a single flag would report their sum as though it were
+    // the reorder's doing.
+    DeferredReordered,
+};
+
 struct RaytraceStageArgs {
     RayBasis basis;
     Shading shading;
@@ -149,6 +177,24 @@ struct RaytraceStageArgs {
     size_t tlas_offset = 0;
     size_t instances_offset = 0;
     uint32_t tlas_stack_depth = 0;
+
+    // Where the colour is worked out. Deferring needs a shader that asks only
+    // for what the loop can keep, which Barycentric and Custom do and a point
+    // light does not — it wants the winning triangle's edges, and keeping those
+    // is six more registers carried through the whole traversal.
+    ShadeWhen shade_when = ShadeWhen::Inline;
+
+    // How many rows of pixels a block covers.
+    //
+    // One is what every figure in benchmarks/ was taken on, and it means a block
+    // is a single warp. Which makes REORDER a no-op: it moves threads between
+    // the warps of a block, and there is only the one. A route that wants to
+    // reorder has to ask for the room first.
+    //
+    // Threads are flattened row-major and cut into warps of 32, so a block N
+    // rows tall holds the same warps grouped differently — the same lanes on the
+    // same pixels, with somewhere for them to go.
+    uint32_t block_rows = 1;
 };
 
 // Builds the ray tracer. args[0] must point at a RaytraceStageArgs.

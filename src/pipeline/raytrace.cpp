@@ -93,6 +93,24 @@ Program build_raytrace_program(void** args)
         k.set(best.component(1), 0.0f);
         k.set(best.component(2), 0.0f);
 
+        // What a deferred shade is worked out from. Zeroed rather than left
+        // alone: a ray that meets nothing colours the background, and the shader
+        // still runs on it.
+        const bool deferred = a.shade_when != ShadeWhen::Inline;
+        const Reg<Scalar> best_u = k.constant(0.0f);
+        const Reg<Scalar> best_v = k.constant(0.0f);
+        const Reg<Scalar> best_material = k.constant(0.0f);
+
+        // Whether anything was hit at all. Shading inline never needed one — a
+        // ray that meets nothing simply never reaches the shade — but a deferred
+        // one runs after the loop whatever happened, so without this the
+        // background is coloured by whichever arm material zero selects.
+        //
+        // This is the distinction a miss shader draws in DXR, arrived at from
+        // the other side: the flag has to exist before there is anywhere to hang
+        // one.
+        const Reg<Scalar> anything_hit = k.constant(0.0f);
+
         // What the triangle loop runs over. Linear, these are the whole scene and
         // never change; traversing a tree, a leaf writes both before entering.
         //
@@ -170,8 +188,17 @@ Program build_raytrace_program(void** args)
         Reg<Scalar> inst_i = zero;
         Reg<Scalar> inst_count = zero;
         if (bvh) {
-            const Reg<Scalar> lane =
+            // Which lane of the block this is, not of the warp: a block several
+            // rows tall holds several warps, and they cannot share a stack.
+            const Reg<Scalar> lane_x =
                 k.sub(px, k.mul(k.block_x(), k.constant(static_cast<float>(WARP_SIZE))));
+            const Reg<Scalar> lane =
+                a.block_rows == 1
+                    ? lane_x
+                    : k.add(lane_x, k.mul(k.sub(py, k.mul(k.block_y(),
+                                                          k.constant(static_cast<float>(
+                                                              a.block_rows)))),
+                                          k.constant(static_cast<float>(WARP_SIZE))));
             // Both levels: the upper one is still on the stack while the lower
             // is walked, so a lane's slice has to hold the sum. Sizing it by the
             // lower level alone put lane 0's BLAS stack on top of lane 1's TLAS
@@ -538,7 +565,17 @@ Program build_raytrace_program(void** args)
         if (!a.predicated) {
             k.if_(k.lt(t, best_t), [&] {
                 k.copy_into(best_t, t);
-                shade(best);
+                if (deferred) {
+                    // Four scalars instead of a colour. Everything a shader that
+                    // asks nothing of the geometry needs, which is why deferring
+                    // costs registers rather than a second pass over anything.
+                    k.copy_into(best_u, u);
+                    k.copy_into(best_v, v);
+                    k.copy_into(best_material, material);
+                    k.copy_into(anything_hit, one);
+                } else {
+                    shade(best);
+                }
             });
             k.place(next);
         } else {
@@ -551,7 +588,9 @@ Program build_raytrace_program(void** args)
             // Into a scratch range rather than into best, the blend still
             // needing the old value — emit_keep does the same for coverage.
             const Reg<Vec3> shaded = k.vec3();
-            shade(shaded);
+            if (!deferred) {
+                shade(shaded);
+            }
 
             // take*new + (1 - take)*old, not the cheaper old + take*(new - old):
             // that one rounds, and the raster variant drifted on 69,715 pixels
@@ -562,9 +601,16 @@ Program build_raytrace_program(void** args)
                 k.fma(dst, take, src);
             };
             blend(best_t, t);
-            blend(best.component(0), shaded.component(0));
-            blend(best.component(1), shaded.component(1));
-            blend(best.component(2), shaded.component(2));
+            if (deferred) {
+                blend(best_u, u);
+                blend(best_v, v);
+                blend(best_material, material);
+                blend(anything_hit, one);
+            } else {
+                blend(best.component(0), shaded.component(0));
+                blend(best.component(1), shaded.component(1));
+                blend(best.component(2), shaded.component(2));
+            }
         }
         k.fma(cursor, stride, one);
         k.fma(i, one, one);
@@ -587,6 +633,41 @@ Program build_raytrace_program(void** args)
             k.place(done);
         }
 
+        // The shading, once the traversal is over and everything a shader wants
+        // is in four registers.
+        if (deferred) {
+            if (a.shade_when == ShadeWhen::DeferredReordered) {
+                // A rendezvous, so it belongs exactly here: every thread of the
+                // block has finished traversing and none has started shading.
+                // Registers and pc travel with a thread, so the frame is
+                // unchanged and only which lane runs which arm moves.
+                k.reorder(best_material);
+            }
+
+            // Guarded, so a ray that met nothing keeps the cleared frame. The
+            // guard is inside the reorder rather than around it: REORDER is a
+            // rendezvous, and a block whose misses skipped it would wait for
+            // threads that had gone.
+            k.if_(anything_hit, [&] {
+                if (a.shading.mode == ShadingMode::Custom) {
+                    Fragment fragment;
+                    fragment.out = best;
+                    fragment.x = px;
+                    fragment.y = py;
+                    fragment.depth = best_t;
+                    fragment.w0 = k.sub(k.sub(one, best_u), best_v);
+                    fragment.w1 = best_u;
+                    fragment.w2 = best_v;
+                    fragment.material = best_material;
+                    a.shading.shade(k, fragment);
+                } else {
+                    k.copy_into(best.component(0), best_u);
+                    k.copy_into(best.component(1), best_v);
+                    k.copy_into(best.component(2), k.sub(k.sub(one, best_u), best_v));
+                }
+            });
+        }
+
         // One pixel, once, after the whole scene has been walked.
         const Reg<Scalar> row = k.mul(py, k.constant(static_cast<float>(a.width)));
         const Reg<Scalar> index = k.add(row, px);
@@ -607,6 +688,21 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
     }
     if (args.triangle_count == 0) {
         throw std::runtime_error("run_raytrace_stage: nothing to trace");
+    }
+    if (args.block_rows == 0) {
+        throw std::runtime_error("run_raytrace_stage: a block covering no rows");
+    }
+    if (args.shade_when == ShadeWhen::DeferredReordered && args.block_rows < 2) {
+        throw std::runtime_error(
+            "run_raytrace_stage: reordering moves threads between the warps of a "
+            "block, and a block one row tall is one warp — raise block_rows");
+    }
+    if (args.shade_when != ShadeWhen::Inline &&
+        args.shading.mode == ShadingMode::Diffuse) {
+        throw std::runtime_error(
+            "run_raytrace_stage: a point light wants the winning triangle's "
+            "edges, and a deferred shade keeps four scalars — shade it inline "
+            "or colour it with something that asks the geometry nothing");
     }
     if (args.traversal == Traversal::Tlas) {
         if (args.tlas_stack_depth == 0 || args.tlas_offset == 0 ||
@@ -635,7 +731,8 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
         // Both levels at once: the upper one is still on the stack while the
         // lower is walked, which is what makes a two-level slice the sum.
         const size_t floats =
-            static_cast<size_t>(args.stack_depth + args.tlas_stack_depth) * WARP_SIZE;
+            static_cast<size_t>(args.stack_depth + args.tlas_stack_depth) * WARP_SIZE *
+            args.block_rows;
         if (floats > SHARED_MEM_FLOATS) {
             throw std::runtime_error(
                 "run_raytrace_stage: a stack " +
@@ -650,8 +747,9 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
             "Shading::shade");
     }
 
-    const dim3 block{WARP_SIZE, 1, 1};
-    const dim3 grid{(args.width + WARP_SIZE - 1) / WARP_SIZE, args.height, 1};
+    const dim3 block{WARP_SIZE, args.block_rows, 1};
+    const dim3 grid{(args.width + WARP_SIZE - 1) / WARP_SIZE,
+                    (args.height + args.block_rows - 1) / args.block_rows, 1};
 
     void* raw[] = {const_cast<RaytraceStageArgs*>(&args)};
     rt.myrt_launch(build_raytrace_program, grid, block, raw);

@@ -356,7 +356,9 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                   const DeviceFrame& frame, const DrawTarget& target,
                                   const Shading& shading = Shading{},
-                                  bool predicated = false);
+                                  bool predicated = false,
+                                  ShadeWhen shade_when = ShadeWhen::Inline,
+                                  uint32_t block_rows = 1);
 
 // The same geometry drawn several times, each with its own transform.
 //

@@ -3359,3 +3359,167 @@ TEST(Pipeline, ARasterFragmentHasNoInstanceToNameAndSaysSo)
     release(rt, frame);
     release(rt, geometry);
 }
+
+namespace {
+
+// A scene of one shape placed many times with the materials interleaved, so
+// neighbouring pixels land on different ones and a shader that branches on the
+// material splits a warp. The divergence is the scene's, not a key's.
+std::vector<TlasInstance> interleaved_materials(uint32_t count, uint32_t materials)
+{
+    std::vector<TlasInstance> instances;
+    for (uint32_t i = 0; i < count; ++i) {
+        Float4x4 model = Float4x4::identity();
+        model.at(0, 3) = -0.9f + static_cast<float>(i % 16) * 0.12f;
+        model.at(1, 3) = static_cast<float>(i / 16) * 0.2f - 0.3f;
+        instances.push_back(TlasInstance{0, model, i % materials});
+    }
+    return instances;
+}
+
+// One arm a material, each a different length, so which arm a lane takes is
+// worth something. The constants are hoisted: made inside the loop they would
+// cost a register an iteration, which is how the first draft of this ran the
+// builder out of registers.
+Shading branching_shader(uint32_t materials, uint32_t weight)
+{
+    Shading shading;
+    shading.mode = ShadingMode::Custom;
+    shading.shade = [materials, weight](IRBuilder& k, const Fragment& f) {
+        const Reg<Scalar> step = k.constant(0.01f);
+        const Reg<Scalar> half = k.constant(0.5f);
+        const Reg<Scalar> zero = k.constant(0.0f);
+        const Reg<Scalar> one = k.constant(1.0f);
+        for (uint32_t m = 0; m < materials; ++m) {
+            const Reg<Scalar> from_here =
+                k.sub(f.material, k.constant(static_cast<float>(m) - 0.5f));
+            k.if_(k.min(k.gt(from_here, zero), k.lt(from_here, one)), [&] {
+                Reg<Scalar> acc = k.constant(0.1f * static_cast<float>(m + 1));
+                for (uint32_t w = 0; w < (m + 1) * weight; ++w) {
+                    k.fma(acc, f.w1, step);
+                }
+                k.copy_into(f.out.component(0), k.min(acc, half));
+                k.copy_into(f.out.component(1), f.w1);
+                k.copy_into(f.out.component(2), f.w2);
+            });
+        }
+    };
+    return shading;
+}
+
+}  // namespace
+
+TEST(Pipeline, WhenTheColourIsWorkedOutDoesNotChangeIt)
+{
+    // Three ways to reach the same frame: shade every candidate and blend the
+    // losers away, shade once at the end from what the loop kept, or do that
+    // with the block's threads regrouped first. Reordering moves registers and
+    // pc together, so the answer cannot move — and deferring only changes when
+    // the same arithmetic runs.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = compact_scene(8);
+    const std::vector<TlasInstance> instances = interleaved_materials(32, 4);
+    const Shading shading = branching_shader(4, 8);
+
+    std::vector<Float3> inline_frame;
+    for (ShadeWhen when :
+         {ShadeWhen::Inline, ShadeWhen::Deferred, ShadeWhen::DeferredReordered}) {
+        MyGPURuntime rt(1u << 27);
+        DeviceGeometry scene = upload_scene(rt, {geometry}, instances);
+        DeviceFrame frame = allocate_frame(rt, target);
+        const std::vector<Float3> pixels =
+            draw_raytrace(rt, scene, frame, target, shading, false, when,
+                          when == ShadeWhen::DeferredReordered ? 4u : 1u);
+
+        if (inline_frame.empty()) {
+            inline_frame = pixels;
+            uint32_t lit = 0;
+            for (const Float3& pixel : pixels) {
+                lit += pixel.x + pixel.y + pixel.z > 0.01f ? 1u : 0u;
+            }
+            ASSERT_GT(lit, 0u) << "nothing was drawn, so nothing was compared";
+        } else {
+            for (size_t i = 0; i < pixels.size(); ++i) {
+                ASSERT_EQ(pixels[i].x, inline_frame[i].x) << "pixel " << i;
+                ASSERT_EQ(pixels[i].y, inline_frame[i].y) << "pixel " << i;
+                ASSERT_EQ(pixels[i].z, inline_frame[i].z) << "pixel " << i;
+            }
+        }
+
+        release(rt, frame);
+        release(rt, scene);
+    }
+}
+
+TEST(Pipeline, AMissKeepsTheBackgroundWhenTheShadeIsDeferred)
+{
+    // Shading inline never needed a hit flag: a ray that meets nothing simply
+    // never reaches the shade. A deferred one runs after the loop whatever
+    // happened, so without the flag the background is coloured by whichever arm
+    // material zero selects — 1,949 pixels of a 2,048-pixel frame, in the run
+    // that found this.
+    //
+    // Which is the distinction a miss shader draws in DXR, met from the other
+    // side: the flag has to exist before there is anywhere to hang one.
+    const DrawTarget target{WIDTH, HEIGHT, angled_camera()};
+    const std::vector<Float3> geometry = compact_scene(4);
+
+    // One small instance, so most of the frame is background.
+    const std::vector<TlasInstance> instances = {
+        TlasInstance{0, Float4x4::identity(), 0}};
+
+    Shading shading;
+    shading.mode = ShadingMode::Custom;
+    shading.shade = [](IRBuilder& k, const Fragment& f) {
+        // Writes something for every material including zero, which is what
+        // makes an unguarded background visible.
+        k.copy_into(f.out.component(0), k.add(f.material, k.constant(0.7f)));
+        k.copy_into(f.out.component(1), f.w1);
+        k.copy_into(f.out.component(2), f.w2);
+    };
+
+    MyGPURuntime rt(1u << 26);
+    DeviceGeometry scene = upload_scene(rt, {geometry}, instances);
+    DeviceFrame frame = allocate_frame(rt, target);
+    const std::vector<Float3> pixels =
+        draw_raytrace(rt, scene, frame, target, shading, false, ShadeWhen::Deferred);
+
+    uint32_t background = 0;
+    uint32_t lit = 0;
+    for (const Float3& pixel : pixels) {
+        if (pixel.x + pixel.y + pixel.z > 0.01f) {
+            ++lit;
+        } else {
+            ++background;
+        }
+    }
+    EXPECT_GT(lit, 0u) << "the instance did not reach the frame";
+    EXPECT_GT(background, lit) << "the background was shaded as though it were hit";
+
+    release(rt, frame);
+    release(rt, scene);
+}
+
+TEST(Pipeline, ReorderingNeedsMoreThanOneWarpToMoveThreadsBetween)
+{
+    // REORDER moves threads between the warps of a block. Every figure in
+    // benchmarks/ was taken with a block one row tall, which is one warp — and
+    // there the instruction is a rendezvous that regroups nothing. A route that
+    // wants to reorder has to ask for the room, so asking with a block of one
+    // is refused rather than quietly costing something for nothing.
+    MyGPURuntime rt(1u << 22);
+    RaytraceStageArgs args;
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = 1;
+    args.shade_when = ShadeWhen::DeferredReordered;
+    args.block_rows = 1;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+
+    // And a point light cannot be deferred at all: it wants the winning
+    // triangle's edges, which the loop does not keep.
+    args.block_rows = 4;
+    args.shade_when = ShadeWhen::Deferred;
+    args.shading.mode = ShadingMode::Diffuse;
+    EXPECT_THROW(run_raytrace_stage(rt, args), std::runtime_error);
+}

@@ -728,7 +728,8 @@ std::vector<Float3> draw_shared(MyGPURuntime& rt, const DeviceGeometry& geometry
 
 std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geometry,
                                   const DeviceFrame& frame, const DrawTarget& target,
-                                  const Shading& shading, bool predicated)
+                                  const Shading& shading, bool predicated,
+                                  ShadeWhen shade_when, uint32_t block_rows)
 {
     if (geometry.indexed()) {
         throw std::runtime_error(
@@ -745,6 +746,8 @@ std::vector<Float3> draw_raytrace(MyGPURuntime& rt, const DeviceGeometry& geomet
     args.height = target.height;
     args.triangle_count = geometry.triangle_count;
     args.predicated = predicated;
+    args.shade_when = shade_when;
+    args.block_rows = block_rows;
     if (geometry.bvh != nullptr) {
         args.traversal = Traversal::Bvh;
         args.order = geometry.bvh_order;
