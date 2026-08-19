@@ -97,8 +97,14 @@ Program build_raytrace_program(void** args)
         // alone: a ray that meets nothing colours the background, and the shader
         // still runs on it.
         const bool deferred = a.shade_when != ShadeWhen::Inline;
-        const Reg<Scalar> best_u = k.constant(0.0f);
-        const Reg<Scalar> best_v = k.constant(0.0f);
+        //
+        // The barycentrics are the exception: a walk that bounces overwrites
+        // `best` with what it accumulated and never reaches the shade below, so
+        // they are neither read nor allocated there. Two registers, which is
+        // what a shadow needs to fit.
+        const bool keeps_bary = deferred && a.bounces == 1;
+        const Reg<Scalar> best_u = keeps_bary ? k.constant(0.0f) : Reg<Scalar>{};
+        const Reg<Scalar> best_v = keeps_bary ? k.constant(0.0f) : Reg<Scalar>{};
         const Reg<Scalar> best_material = k.constant(0.0f);
 
         // Whether anything was hit at all. Shading inline never needed one — a
@@ -114,11 +120,12 @@ Program build_raytrace_program(void** args)
         // What a bounce carries between turns. `accumulated` is the pixel so
         // far; `attenuation` is how much of the next surface still reaches it,
         // and a surface that reflects nothing sets it to zero.
-        // Allocated only when they are used. Ten registers is nothing on a walk
-        // that fits and everything on one that does not — the two-level
-        // traversal was already at the ceiling, and taking them unconditionally
-        // put it over.
+        // Allocated only where they are read. A handful of registers is nothing
+        // on a walk that fits and everything on one that does not — the
+        // two-level traversal was already at the ceiling, and taking them
+        // unconditionally put it over. Shadow rays found the same wall again.
         const bool bouncing = a.bounces > 1;
+        const bool shadowing = bouncing && a.shadows;
         const Reg<Vec3> accumulated =
             bouncing ? k.constant(0.0f, 0.0f, 0.0f) : Reg<Vec3>{};
         const Reg<Vec3> attenuation =
@@ -126,6 +133,31 @@ Program build_raytrace_program(void** args)
         const Reg<Vec3> best_normal =
             bouncing ? k.constant(0.0f, 0.0f, 1.0f) : Reg<Vec3>{};
         const Reg<Scalar> bounce = bouncing ? k.constant(0.0f) : Reg<Scalar>{};
+        // Only where a walk lights the hit it just found. One that asks about
+        // the light keeps the term across a turn instead, in hit_lambert below.
+        const Reg<Scalar> lambert =
+            bouncing && !shadowing ? k.constant(0.0f) : Reg<Scalar>{};
+
+        // With shadows the walk runs two rays a bounce: the one that carries
+        // the picture, and the one that asks whether the light reaches where it
+        // stopped. Both are the same traversal, so what separates them is a
+        // register saying which turn this is — and that register holds the same
+        // value in every lane of every warp, being the parity of a counter, so
+        // branching on it splits nothing.
+        //
+        // What the surface turn found has to survive the shadow turn, which
+        // overwrites everything the traversal writes. The lit term is kept
+        // rather than the normal it came from: one register instead of three,
+        // and nothing downstream wants the direction back.
+        //
+        // Declared here rather than beside their use, which is below the label
+        // the loop returns to: an initial value is an instruction, and one
+        // emitted inside the loop is one that runs every time round.
+        const Reg<Scalar> shadow_turn = shadowing ? k.constant(0.0f) : Reg<Scalar>{};
+        const Reg<Scalar> hit_any = shadowing ? k.constant(0.0f) : Reg<Scalar>{};
+        const Reg<Scalar> hit_material = shadowing ? k.constant(0.0f) : Reg<Scalar>{};
+        const Reg<Scalar> hit_lambert = shadowing ? k.constant(0.0f) : Reg<Scalar>{};
+        const Reg<Vec3> onward = shadowing ? k.constant(0.0f, 0.0f, 1.0f) : Reg<Vec3>{};
         const Label bounce_top = k.label();
         if (bouncing) {
             k.place(bounce_top);
@@ -173,7 +205,10 @@ Program build_raytrace_program(void** args)
         const Float3& lp = a.shading.light_position;
         const Float3& bc = a.shading.base_colour;
         const Reg<Vec3> light = k.constant(lp.x, lp.y, lp.z);
-        const Reg<Vec3> base = k.constant(bc.x, bc.y, bc.z);
+        // Unallocated where nothing reads it: a walk that bounces takes its
+        // colour from the material table, and the shader that would have used
+        // this never runs.
+        const Reg<Vec3> base = bouncing ? Reg<Vec3>{} : k.constant(bc.x, bc.y, bc.z);
 
         // --- traversal ------------------------------------------------------
         // Emitted before the triangle loop so that the loop's bottom test can
@@ -609,11 +644,14 @@ Program build_raytrace_program(void** args)
             k.if_(k.lt(t, best_t), [&] {
                 k.copy_into(best_t, t);
                 if (deferred) {
-                    // Four scalars instead of a colour. Everything a shader that
-                    // asks nothing of the geometry needs, which is why deferring
-                    // costs registers rather than a second pass over anything.
-                    k.copy_into(best_u, u);
-                    k.copy_into(best_v, v);
+                    // A handful of scalars instead of a colour. Everything a
+                    // shader that asks nothing of the geometry needs, which is
+                    // why deferring costs registers rather than a second pass
+                    // over anything.
+                    if (keeps_bary) {
+                        k.copy_into(best_u, u);
+                        k.copy_into(best_v, v);
+                    }
                     k.copy_into(best_material, per_triangle_material());
                     k.copy_into(anything_hit, one);
                     if (bouncing) {
@@ -654,8 +692,10 @@ Program build_raytrace_program(void** args)
             };
             blend(best_t, t);
             if (deferred) {
-                blend(best_u, u);
-                blend(best_v, v);
+                if (keeps_bary) {
+                    blend(best_u, u);
+                    blend(best_v, v);
+                }
                 blend(best_material, per_triangle_material());
                 blend(anything_hit, one);
                 if (bouncing) {
@@ -694,118 +734,252 @@ Program build_raytrace_program(void** args)
         // One turn of the walk is over. Add what this surface returns, aim at
         // where the next one would be, and go round again.
         if (bouncing) {
-            const Reg<Vec3> table_colour = k.vec3();
-            const Reg<Scalar> reflectivity = k.constant(0.0f);
-            const Reg<Scalar> lit = k.constant(0.0f);
-
             // A miss leaves best_t at the ceiling it was reset to, and a point
             // that far along the ray overflows. The attenuation is about to be
             // zeroed either way, but zero times an infinity is a NaN and that
             // spreads into the pixel — so the distance is clamped rather than
             // the arithmetic being skipped, which would split the warp.
             const Reg<Scalar> reach = k.min(best_t, k.constant(1.0e6f));
-            {
+
+            // How much of the light a surface facing this way takes.
+            //
+            // Two-sided, because a mesh built by concatenating boxes has no
+            // winding worth trusting and a face turned away should be dim
+            // rather than black. Directional, not a point light: the position
+            // is read as a direction and the hit point never enters the
+            // arithmetic. A point light needs one, and a ray that met nothing
+            // has none — only the ceiling best_t was reset to. Taking a point
+            // that far out and normalising towards a light beside the scene
+            // loses every digit and returns a NaN, which survives being
+            // multiplied by an attenuation of zero and reaches the pixel. A
+            // walk that bounces wants a light at infinity anyway.
+            const auto lambert_of = [&](Reg<Vec3> normal, Reg<Scalar> dst) {
+                IRBuilder::Scratch scope(k);
+                const Reg<Scalar> raw = k.dot(k.normalize(normal), k.normalize(light));
+                k.copy_into(dst, k.max(raw, k.sub(zero, raw)));
+            };
+
+            // Adds what a surface returns to the pixel and takes the rest of the
+            // walk down by what it kept. `blocked` is 1 where something stands
+            // between the surface and the light, and 0 on a walk that never
+            // asked.
+            //
+            // Every register it takes is inside the scope, so what it costs is
+            // a peak rather than a residue: the direction below is worked out
+            // after this has given its registers back.
+            const auto absorb = [&](Reg<Scalar> hit, Reg<Scalar> mat, Reg<Scalar> lambert,
+                                    Reg<Scalar> blocked, Reg<Scalar> terminal) {
                 IRBuilder::Scratch scope(k);
                 const Reg<Scalar> entry = k.mul(
-                    best_material, k.constant(static_cast<float>(4 * sizeof(float))));
-                const Reg<Vec3> loaded =
+                    mat, k.constant(static_cast<float>(MATERIAL_FLOATS * sizeof(float))));
+                const Reg<Vec3> colour =
                     k.load_vec3(entry, static_cast<float>(a.material_table_offset));
-                const Reg<Scalar> r =
-                    k.load(entry, static_cast<float>(a.material_table_offset + 12));
 
-                // Two-sided, because a mesh built by concatenating boxes has no
-                // winding worth trusting and a face turned away should be dim
-                // rather than black.
-                // Directional, not a point light: the position is read as a
-                // direction and the hit point never enters the arithmetic.
+                // What the surface passes on, and nothing on the last turn.
                 //
-                // A point light needs one, and a ray that met nothing has none —
-                // only the ceiling best_t was reset to. Taking a point that far
-                // out and normalising towards a light beside the scene loses
-                // every digit and returns a NaN, which survives being multiplied
-                // by an attenuation of zero and reaches the pixel. A walk that
-                // bounces wants a light at infinity anyway.
-                const Reg<Vec3> n = k.normalize(best_normal);
-                const Reg<Scalar> raw = k.dot(n, k.normalize(light));
-                const Reg<Scalar> lambert = k.max(raw, k.sub(zero, raw));
+                // A walk that simply stops is still travelling when it does,
+                // and the weight it was still carrying has nowhere to go: drop
+                // it and the deepest thing the ray reached comes back black,
+                // which in a room of facing mirrors is a hole at the end of the
+                // tunnel rather than a tunnel. Reading the last surface as
+                // matte spends that weight where the ray actually was, so the
+                // reflections run out into the colour of the last mirror
+                // rather than into nothing.
+                const Reg<Scalar> carried = k.mul(
+                    k.add(
+                        k.load(entry, static_cast<float>(a.material_table_offset + 12)),
+                        k.load(entry, static_cast<float>(a.material_table_offset + 16))),
+                    k.sub(one, terminal));
 
+                // Ambient and the lit term, so nothing is wholly black. A
+                // blocked surface keeps the ambient and loses the rest, which is
+                // what makes a shadow dark rather than absent.
+                const Reg<Scalar> lit = k.constant(0.3f);
+                k.fma(lit, k.mul(lambert, k.sub(one, blocked)), k.constant(0.7f));
+
+                // A miss returns the sky and ends the walk: nothing beyond it
+                // can add anything, which zeroing the attenuation says without a
+                // branch.
+                const Reg<Scalar> missed = k.sub(one, hit);
                 for (uint32_t c = 0; c < 3; ++c) {
-                    k.copy_into(table_colour.component(c), loaded.component(c));
+                    const float sky = c == 2 ? 0.35f : (c == 1 ? 0.25f : 0.18f);
+
+                    // hit  : attenuation * colour * lit * (1 - carried)
+                    // miss : attenuation * sky
+                    const Reg<Scalar> surface =
+                        k.mul(k.mul(colour.component(c), lit), k.sub(one, carried));
+                    const Reg<Scalar> gives =
+                        k.add(k.mul(hit, surface), k.mul(missed, k.constant(sky)));
+                    k.fma(accumulated.component(c), attenuation.component(c), gives);
+
+                    // What the next turn may still contribute. A miss leaves
+                    // nothing.
+                    k.copy_into(attenuation.component(c),
+                                k.mul(attenuation.component(c), k.mul(hit, carried)));
                 }
-                k.copy_into(reflectivity, r);
+            };
 
-                // Ambient and the lit term, so nothing is wholly black.
-                k.copy_into(lit, k.constant(0.3f));
-                k.fma(lit, lambert, k.constant(0.7f));
-            }
-
-            // A miss returns the sky and ends the walk: nothing beyond it can
-            // add anything, which zeroing the attenuation says without a branch.
-            const Reg<Scalar> missed = k.sub(one, anything_hit);
-            for (uint32_t c = 0; c < 3; ++c) {
-                const float sky = c == 2 ? 0.35f : (c == 1 ? 0.25f : 0.18f);
-
-                // hit  : attenuation * colour * lit * (1 - reflectivity)
-                // miss : attenuation * sky
-                const Reg<Scalar> surface = k.mul(k.mul(table_colour.component(c), lit),
-                                                  k.sub(one, reflectivity));
-                const Reg<Scalar> gives =
-                    k.add(k.mul(anything_hit, surface), k.mul(missed, k.constant(sky)));
-                k.fma(accumulated.component(c), attenuation.component(c), gives);
-
-                // What the next turn may still contribute. A miss leaves nothing.
-                k.copy_into(
-                    attenuation.component(c),
-                    k.mul(attenuation.component(c), k.mul(anything_hit, reflectivity)));
-            }
-
-            {
+            // Where the ray goes on from a surface, written into `out`, and the
+            // point it leaves from, written into `origin`. A ray that met
+            // nothing keeps the ray it had — blended by `hit` rather than
+            // branched on, because aiming a finished walk from where a miss
+            // "ended" would put the origin a million units out and trace from
+            // there. The intersection arithmetic loses every digit it has at
+            // that distance and hands back NaN, which then survives being
+            // multiplied by an attenuation of zero.
+            //
+            // `out` may be `dir` itself, so nothing is written until the last
+            // loop and `point` is taken from the incoming ray before then.
+            const auto leave = [&](Reg<Scalar> hit, Reg<Scalar> mat, Reg<Vec3> normal,
+                                   Reg<Vec3> out) {
                 IRBuilder::Scratch scope(k);
-
-                // d - 2 (d . n) n, and the origin lifted off the surface so the
-                // next walk does not meet the triangle it just left.
-                const Reg<Vec3> n = k.normalize(best_normal);
+                const Reg<Scalar> entry = k.mul(
+                    mat, k.constant(static_cast<float>(MATERIAL_FLOATS * sizeof(float))));
+                const Reg<Scalar> transmission =
+                    k.load(entry, static_cast<float>(a.material_table_offset + 16));
                 const Reg<Vec3> point = k.add(origin, k.scale(dir, reach));
-                const Reg<Scalar> along = k.dot(dir, n);
-                const Reg<Vec3> reflected = k.sub(dir, k.scale(n, k.add(along, along)));
+                const Reg<Vec3> d = k.normalize(dir);
+                const Reg<Vec3> n = k.normalize(normal);
 
-                // Off the surface along the reflected ray rather than along the
-                // normal: a grazing bounce leaves at a shallow angle, and the
-                // normal would push it through a neighbouring face.
-                const Reg<Vec3> lifted =
-                    k.add(point, k.scale(k.normalize(reflected), k.constant(1e-3f)));
-
-                // A ray that met nothing keeps the ray it had. Aiming it from
-                // where a miss "ended" would put the origin a million units out
-                // and trace from there — the intersection arithmetic loses every
-                // digit it has at that distance and hands back NaN, which then
-                // survives being multiplied by an attenuation of zero.
-                //
-                // Blended rather than branched: the remaining turns of a
-                // finished walk cost traversal either way, and splitting the
-                // warp on "did this pixel finish" is the cost this whole
-                // arrangement avoids.
+                // The normal as the ray meets it. A scene built by concatenating
+                // boxes has no winding worth trusting, and both the lift and
+                // Snell's law want the side the ray is on rather than the side
+                // the triangle claims.
+                const Reg<Scalar> inside = k.gt(k.dot(d, n), zero);
+                const Reg<Scalar> flip = k.sub(one, k.add(inside, inside));
                 for (uint32_t c = 0; c < 3; ++c) {
-                    const Reg<Scalar> next_origin =
-                        k.add(origin.component(c),
-                              k.mul(anything_hit,
-                                    k.sub(lifted.component(c), origin.component(c))));
-                    const Reg<Scalar> next_dir =
+                    k.copy_into(n.component(c), k.mul(n.component(c), flip));
+                }
+                const Reg<Scalar> cosi = k.sub(zero, k.dot(d, n));
+
+                const Reg<Vec3> chosen = k.vec3();
+                {
+                    IRBuilder::Scratch mirror(k);
+                    const Reg<Scalar> twice = k.sub(zero, k.add(cosi, cosi));
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        k.copy_into(chosen.component(c),
+                                    k.sub(d.component(c), k.mul(n.component(c), twice)));
+                    }
+                }
+                {
+                    // Snell's law, with the ratio picked by which side the ray
+                    // is on: entering divides by the index, leaving multiplies
+                    // by it. A negative discriminant is total internal
+                    // reflection — at this angle the ray has no way out — and is
+                    // clamped before the root so the arithmetic stays a number,
+                    // the direction then being left at the mirror one.
+                    //
+                    // One direction, not a blend of the two: a blend points at
+                    // neither surface. Splitting into both is what recursion
+                    // buys and a loop keeping no stack does not have.
+                    IRBuilder::Scratch bend(k);
+                    const Reg<Scalar> inv = k.rcp(
+                        k.load(entry, static_cast<float>(a.material_table_offset + 20)));
+                    const Reg<Scalar> eta =
+                        k.add(inv, k.mul(inside, k.sub(k.rcp(inv), inv)));
+                    const Reg<Scalar> disc =
+                        k.sub(one, k.mul(k.mul(eta, eta), k.sub(one, k.mul(cosi, cosi))));
+                    const Reg<Scalar> bends =
+                        k.mul(k.gt(transmission, zero), k.ge(disc, zero));
+                    const Reg<Scalar> coef =
+                        k.sub(k.mul(eta, cosi), k.sqrt(k.max(disc, zero)));
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        const Reg<Scalar> bent = k.add(k.mul(eta, d.component(c)),
+                                                       k.mul(coef, n.component(c)));
+                        k.copy_into(
+                            chosen.component(c),
+                            k.add(chosen.component(c),
+                                  k.mul(bends, k.sub(bent, chosen.component(c)))));
+                    }
+                }
+                {
+                    // Off the surface along the way out rather than along the
+                    // normal: a grazing turn leaves at a shallow angle, and the
+                    // normal would push it through a neighbouring face.
+                    IRBuilder::Scratch lift(k);
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        const Reg<Scalar> lifted =
+                            k.add(point.component(c),
+                                  k.mul(chosen.component(c), k.constant(1e-3f)));
+                        k.copy_into(
+                            origin.component(c),
+                            k.add(origin.component(c),
+                                  k.mul(hit, k.sub(lifted, origin.component(c)))));
+                    }
+                }
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(
+                        out.component(c),
                         k.add(dir.component(c),
-                              k.mul(anything_hit,
-                                    k.sub(reflected.component(c), dir.component(c))));
-                    k.copy_into(origin.component(c), next_origin);
-                    k.copy_into(dir.component(c), next_dir);
-                    k.copy_into(inv_dir.component(c), k.rcp(next_dir));
+                              k.mul(hit, k.sub(chosen.component(c), dir.component(c)))));
+                }
+            };
+
+            // Republishes the ray to everything that reads one, `dir` having
+            // just been set. Two levels keep a second copy, the world one, which
+            // an instance's leaf transforms into the first.
+            const auto republish = [&] {
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(inv_dir.component(c), k.rcp(dir.component(c)));
                     k.copy_into(world_inv.component(c), inv_dir.component(c));
                     k.copy_into(world_origin.component(c), origin.component(c));
                     k.copy_into(world_dir.component(c), dir.component(c));
                 }
+            };
+
+            // Whether this is the last turn the walk has. One comparison a turn,
+            // and the same in every lane — a loop counter is.
+            const Reg<Scalar> terminal = k.ge(
+                bounce,
+                k.constant(static_cast<float>(a.bounces * (a.shadows ? 2u : 1u)) - 1.0f));
+
+            if (!shadowing) {
+                lambert_of(best_normal, lambert);
+                absorb(anything_hit, best_material, lambert, zero, terminal);
+                leave(anything_hit, best_material, best_normal, dir);
+                republish();
+            } else {
+                const Label surface_turn = k.label();
+                const Label turn_end = k.label();
+                k.branch_to(surface_turn, k.sub(one, shadow_turn));
+
+                // The shadow turn. What the traversal just found is not a
+                // surface but an answer: something stood between the last one
+                // and the light. Colour that surface, then go where it sent the
+                // ray.
+                absorb(hit_any, hit_material, hit_lambert, anything_hit, terminal);
+                for (uint32_t c = 0; c < 3; ++c) {
+                    k.copy_into(dir.component(c), onward.component(c));
+                }
+                republish();
+                k.copy_into(shadow_turn, zero);
+                k.branch_to(turn_end);
+
+                // The surface turn. Put this hit where the next traversal will
+                // not overwrite it, work out where the ray goes on from here,
+                // and then spend the traversal asking about the light instead.
+                k.place(surface_turn);
+                k.copy_into(hit_any, anything_hit);
+                k.copy_into(hit_material, best_material);
+                lambert_of(best_normal, hit_lambert);
+                leave(anything_hit, best_material, best_normal, onward);
+                {
+                    IRBuilder::Scratch scope(k);
+                    const Reg<Vec3> towards = k.normalize(light);
+                    for (uint32_t c = 0; c < 3; ++c) {
+                        k.copy_into(dir.component(c), towards.component(c));
+                    }
+                }
+                republish();
+                k.copy_into(shadow_turn, one);
+                k.place(turn_end);
             }
 
             k.fma(bounce, one, one);
-            k.branch_to(bounce_top,
-                        k.lt(bounce, k.constant(static_cast<float>(a.bounces))));
+            k.branch_to(
+                bounce_top,
+                k.lt(bounce,
+                     k.constant(static_cast<float>(a.bounces * (a.shadows ? 2u : 1u)))));
 
             for (uint32_t c = 0; c < 3; ++c) {
                 k.copy_into(best.component(c), accumulated.component(c));
@@ -878,6 +1052,11 @@ void run_raytrace_stage(MyGPURuntime& rt, const RaytraceStageArgs& args)
     }
     if (args.bounces == 0) {
         throw std::runtime_error("run_raytrace_stage: a walk of no bounces");
+    }
+    if (args.shadows && args.bounces < 2) {
+        throw std::runtime_error(
+            "run_raytrace_stage: a shadow is a second traversal, so the walk has to "
+            "have room for one — raise bounces");
     }
     if (args.bounces > 1) {
         if (args.shade_when != ShadeWhen::Deferred) {

@@ -2740,6 +2740,210 @@ std::vector<Float3> compact_scene(uint32_t count, uint32_t seed = 7)
 
 }  // namespace
 
+namespace {
+
+void add_quad(std::vector<Float3>& tris, std::vector<float>& material, float which,
+              Float3 a, Float3 b, Float3 c, Float3 d)
+{
+    tris.push_back(a);
+    tris.push_back(b);
+    tris.push_back(c);
+    tris.push_back(a);
+    tris.push_back(c);
+    tris.push_back(d);
+    material.push_back(which);
+    material.push_back(which);
+}
+
+// A walk with a material a triangle, which is what a bounce and everything
+// hanging off one needs. The tree moves the triangles, so the materials move
+// with them.
+std::vector<Float3> bounce_frame(const std::vector<Float3>& world,
+                                 const std::vector<float>& material,
+                                 const std::vector<float>& table, const Camera& camera,
+                                 bool shadows, Float3 light)
+{
+    const DrawTarget target{WIDTH, HEIGHT, camera};
+    MyGPURuntime rt(1u << 26);
+    DeviceGeometry geometry = upload_accelerated(rt, world);
+    DeviceFrame frame = allocate_frame(rt, target);
+
+    std::vector<float> placed(material.size());
+    for (size_t i = 0; i < geometry.triangle_order.size(); ++i) {
+        placed[i] = material[geometry.triangle_order[i]];
+    }
+
+    void* materials = rt.myrt_malloc(placed.size() * sizeof(float));
+    void* entries = rt.myrt_malloc(table.size() * sizeof(float));
+    rt.myrt_memcpy(materials, placed.data(), placed.size() * sizeof(float),
+                   Direction::HostToDevice);
+    rt.myrt_memcpy(entries, table.data(), table.size() * sizeof(float),
+                   Direction::HostToDevice);
+
+    RaytraceStageArgs args;
+    args.basis = ray_basis(camera, target.aspect());
+    args.triangles_offset = rt.myrt_device_offset(geometry.world);
+    args.framebuffer_offset = rt.myrt_device_offset(frame.pixels);
+    args.width = WIDTH;
+    args.height = HEIGHT;
+    args.triangle_count = geometry.triangle_count;
+    args.traversal = Traversal::Bvh;
+    args.stack_depth = geometry.bvh_depth;
+    args.bvh_offset = rt.myrt_device_offset(geometry.bvh);
+    args.shade_when = ShadeWhen::Deferred;
+    args.bounces = 3;
+    args.shadows = shadows;
+    args.material_offset = rt.myrt_device_offset(materials);
+    args.material_table_offset = rt.myrt_device_offset(entries);
+    args.shading.light_position = light;
+    run_raytrace_stage(rt, args);
+
+    const std::vector<Float3> out = read_back(rt, frame);
+    release(rt, frame);
+    release(rt, geometry);
+    return out;
+}
+
+// A matte white surface and nothing else, so that what a test changes is the
+// only thing that can move a pixel.
+const std::vector<float> MATTE_TABLE = {
+    0.90f, 0.90f, 0.90f, 0.0f, 0.0f, 1.0f,  // 0: what the light lands on
+    0.60f, 0.20f, 0.20f, 0.0f, 0.0f, 1.0f,  // 1: something behind the glass
+    0.90f, 0.95f, 1.00f, 0.0f, 0.9f, 1.5f,  // 2: glass, bending
+    0.90f, 0.95f, 1.00f, 0.0f, 0.9f, 1.0f,  // 3: the same, bending nothing
+    0.90f, 0.95f, 1.00f, 0.0f, 0.0f, 1.5f,  // 4: the same, transmitting nothing
+};
+
+Camera looking_down()
+{
+    Camera cam;
+    cam.eye = Float3{0.0f, 3.0f, -4.0f};
+    cam.target = Float3{0.0f, 0.0f, 0.0f};
+    return cam;
+}
+
+}  // namespace
+
+TEST(Pipeline, AShadowRayChangesNothingWhenNothingCanBlockIt)
+{
+    // The exact frame, not a near one. A shadow ray that finds nothing has to
+    // leave the lit term where it was, so a scene with a single surface in it
+    // renders the same either way — and any drift here is the shadow turn
+    // disturbing state the surface turn owns.
+    std::vector<Float3> world;
+    std::vector<float> material;
+    add_quad(world, material, 0.0f, {-6.0f, 0.0f, -6.0f}, {-6.0f, 0.0f, 6.0f},
+             {6.0f, 0.0f, 6.0f}, {6.0f, 0.0f, -6.0f});
+
+    const Float3 light{0.4f, 1.0f, 0.2f};
+    const std::vector<Float3> plain =
+        bounce_frame(world, material, MATTE_TABLE, looking_down(), false, light);
+    const std::vector<Float3> asked =
+        bounce_frame(world, material, MATTE_TABLE, looking_down(), true, light);
+
+    ASSERT_EQ(plain.size(), asked.size());
+    for (size_t i = 0; i < plain.size(); ++i) {
+        EXPECT_EQ(plain[i].x, asked[i].x) << "pixel " << i << " .x";
+        EXPECT_EQ(plain[i].y, asked[i].y) << "pixel " << i << " .y";
+        EXPECT_EQ(plain[i].z, asked[i].z) << "pixel " << i << " .z";
+    }
+}
+
+TEST(Pipeline, AShadowRayDarkensWhatABlockerStandsInFrontOf)
+{
+    // A panel over a floor, and the light coming across it at an angle so the
+    // shadow lands beside the panel rather than under it. Asking has to darken
+    // somewhere and brighten nowhere: a shadow can only take light away.
+    std::vector<Float3> world;
+    std::vector<float> material;
+    add_quad(world, material, 0.0f, {-6.0f, 0.0f, -6.0f}, {-6.0f, 0.0f, 6.0f},
+             {6.0f, 0.0f, 6.0f}, {6.0f, 0.0f, -6.0f});
+    // Wound downwards, towards the floor. The intersection test rejects a back
+    // face, so this is invisible to the camera above it and solid to a ray
+    // going up from the floor — which is the only thing the test is asking
+    // about, and keeps the panel out of the frame it compares.
+    add_quad(world, material, 0.0f, {-1.0f, 1.5f, -1.0f}, {1.0f, 1.5f, -1.0f},
+             {1.0f, 1.5f, 1.0f}, {-1.0f, 1.5f, 1.0f});
+
+    const Float3 light{0.9f, 1.0f, 0.2f};
+    const std::vector<Float3> plain =
+        bounce_frame(world, material, MATTE_TABLE, looking_down(), false, light);
+    const std::vector<Float3> asked =
+        bounce_frame(world, material, MATTE_TABLE, looking_down(), true, light);
+
+    ASSERT_EQ(plain.size(), asked.size());
+    uint32_t darker = 0;
+    for (size_t i = 0; i < plain.size(); ++i) {
+        EXPECT_LE(asked[i].y, plain[i].y + 1e-6f)
+            << "pixel " << i << " brightened by being asked about the light";
+        if (asked[i].y < plain[i].y - 1e-4f) {
+            ++darker;
+        }
+    }
+    EXPECT_GT(darker, 0u) << "nothing fell into shadow";
+}
+
+TEST(Pipeline, RefractionBendsByTheIndexAndOnlyWhereSomethingTransmits)
+{
+    // A pane in front of a striped wall. Striped because a bend is a lateral
+    // shift and a flat backdrop hides one: the ray lands somewhere else and
+    // reads the same colour, so the frame comes back identical from a walk that
+    // did something different.
+    //
+    // An index of one is the case Snell's law leaves alone — the ratio is one,
+    // the discriminant collapses to the cosine, and the outgoing direction is
+    // the incoming one — so it is the reference the bent frame is held against
+    // rather than a frame with no pane at all, which would differ by a surface
+    // as well as by a direction.
+    std::vector<Float3> world;
+    std::vector<float> material;
+    for (int stripe = -4; stripe < 4; ++stripe) {
+        const float x0 = static_cast<float>(stripe) * 1.5f;
+        const float x1 = x0 + 1.5f;
+        add_quad(world, material, (stripe & 1) == 0 ? 0.0f : 1.0f, {x0, -6.0f, -2.0f},
+                 {x1, -6.0f, -2.0f}, {x1, 6.0f, -2.0f}, {x0, 6.0f, -2.0f});
+    }
+    const size_t pane = material.size();
+    add_quad(world, material, 2.0f, {-1.2f, -1.2f, 0.0f}, {1.2f, -1.2f, 0.0f},
+             {1.2f, 1.2f, 0.0f}, {-1.2f, 1.2f, 0.0f});
+
+    const Float3 light{0.4f, 1.0f, 0.2f};
+    const Camera camera = default_camera();
+
+    const std::vector<Float3> bent =
+        bounce_frame(world, material, MATTE_TABLE, camera, false, light);
+
+    std::vector<float> straight = material;
+    straight[pane] = 3.0f;
+    straight[pane + 1] = 3.0f;
+    const std::vector<Float3> at_one =
+        bounce_frame(world, straight, MATTE_TABLE, camera, false, light);
+
+    ASSERT_EQ(bent.size(), at_one.size());
+    uint32_t moved = 0;
+    for (size_t i = 0; i < bent.size(); ++i) {
+        if (std::abs(bent[i].x - at_one[i].x) > 1e-4f) {
+            ++moved;
+        }
+    }
+    EXPECT_GT(moved, 0u) << "an index of 1.5 bent nothing";
+
+    // Where nothing is transmitted the index is not read, so two entries that
+    // differ only in it have to draw the same frame.
+    std::vector<float> opaque = material;
+    opaque[pane] = 4.0f;
+    opaque[pane + 1] = 4.0f;
+    std::vector<float> table_at_one = MATTE_TABLE;
+    table_at_one[4 * MATERIAL_FLOATS + 5] = 1.0f;
+    const std::vector<Float3> sealed =
+        bounce_frame(world, opaque, MATTE_TABLE, camera, false, light);
+    const std::vector<Float3> sealed_at_one =
+        bounce_frame(world, opaque, table_at_one, camera, false, light);
+    for (size_t i = 0; i < sealed.size(); ++i) {
+        EXPECT_EQ(sealed[i].x, sealed_at_one[i].x) << "pixel " << i;
+    }
+}
+
 TEST(Pipeline, TheReportedOrderNamesWhereEachUploadedTriangleCameFrom)
 {
     // A tree moves the triangles, and anything the caller keeps beside them —

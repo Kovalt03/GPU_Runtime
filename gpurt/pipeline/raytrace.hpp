@@ -56,6 +56,23 @@ RayBasis ray_basis(const Camera& camera, float aspect);
 // face along with it. Against t it keeps a hit behind the origin from counting.
 inline constexpr float INTERSECT_EPSILON = 1e-6f;
 
+// How many floats a material entry holds, in the order the kernel reads them:
+//
+//   0..2  colour
+//   3     reflectivity — how much leaves along the mirror direction
+//   4     transmission — how much leaves along the refracted direction
+//   5     index of refraction, read only where transmission is above zero
+//
+// The two weights are what the surface does not keep: a hit contributes
+// colour * (1 - reflectivity - transmission), so a table whose two weights sum
+// above one brightens a surface instead of dimming it.
+//
+// A surface with any transmission at all follows the refracted direction rather
+// than a blend of the two, the blend being a direction that points at neither.
+// One ray a surface is the shape of a loop that keeps no stack; splitting into
+// both is what recursion buys and this route does not have.
+inline constexpr uint32_t MATERIAL_FLOATS = 6;
+
 // How the kernel finds the triangles a ray might meet.
 //
 // Same launch, same thread meaning, same intersection test — what differs is
@@ -198,9 +215,30 @@ struct RaytraceStageArgs {
     // coverage, made the same way.
     uint32_t bounces = 1;
 
-    // Four floats a material: a colour and how much of the light it returns
-    // along the mirror direction. A triangle's material index sits in a buffer
-    // beside the triangles, one float each.
+    // Whether a hit asks what stands between it and the light before it is lit.
+    //
+    // That question is another traversal of the same scene from the same place,
+    // so the walk runs two rays a bounce rather than carrying a second copy of
+    // the traversal: one for where the ray goes, one for whether the light
+    // arrives. Which is why it doubles the traversals a walk runs, and why it
+    // is a flag rather than always on: what a shadow costs is measurable only
+    // against the same walk without one.
+    //
+    // Any hit shadows, whatever the material: a pane of glass between a surface
+    // and the light casts as black a shadow here as a wall does. Tinting a
+    // shadow means carrying the blocker's colour back, and the loop keeps one
+    // hit.
+    //
+    // Reusing the loop also means the shadow ray finds the *nearest* blocker
+    // where any would do. Hardware has a separate any-hit path that stops at
+    // the first, and one here would be a second traversal to maintain — this
+    // trades that for the one already written.
+    //
+    // Needs the material path, so bounces must be above one.
+    bool shadows = false;
+
+    // MATERIAL_FLOATS floats a material. A triangle's material index sits in a
+    // buffer beside the triangles, one float each.
     //
     // Indexed from the cursor the loop already has rather than from a triangle
     // number it does not: the two buffers are parallel, so the offset from one

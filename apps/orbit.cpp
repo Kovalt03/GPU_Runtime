@@ -98,8 +98,9 @@ void add_box(std::vector<Float3>& tris, std::vector<float>& material, Float3 lo,
     quad({lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, lo.y, hi.z}, {lo.x, lo.y, hi.z});
 }
 
-// Six faces of a cube, then the ground, then a mirror. Four floats each: a
-// colour, and how much of the light leaves along the mirror direction.
+// Six faces of a cube, then the ground, then a mirror. MATERIAL_FLOATS each: a
+// colour, then what the surface does not keep — how much leaves along the
+// mirror direction and how much through it, and the index the second bends by.
 //
 // The arrangement is the one Vulkan-Samples uses for its reflection sample —
 // two cubes with a different colour a face, a ground that reflects a tenth, and
@@ -112,16 +113,21 @@ enum Material : uint32_t {
     MIRROR = 7,
 };
 
+// clang-format off
 inline constexpr float MATERIAL_TABLE[] = {
-    0.90f, 0.15f, 0.15f, 0.00f,  // +z  red
-    0.15f, 0.80f, 0.20f, 0.00f,  // -z  green
-    0.20f, 0.35f, 0.90f, 0.00f,  // -x  blue
-    0.90f, 0.85f, 0.20f, 0.00f,  // +x  yellow
-    0.20f, 0.85f, 0.85f, 0.00f,  // +y  cyan
-    0.85f, 0.25f, 0.85f, 0.00f,  // -y  magenta
-    0.70f, 0.70f, 0.70f, 0.10f,  // ground
-    0.30f, 0.90f, 1.00f, 0.90f,  // mirror
+    // colour            mirror  through  index
+    0.90f, 0.15f, 0.15f,  0.00f,  0.00f,  1.00f,  // +z  red
+    0.15f, 0.80f, 0.20f,  0.00f,  0.00f,  1.00f,  // -z  green
+    0.20f, 0.35f, 0.90f,  0.00f,  0.00f,  1.00f,  // -x  blue
+    0.90f, 0.85f, 0.20f,  0.00f,  0.00f,  1.00f,  // +x  yellow
+    0.20f, 0.85f, 0.85f,  0.00f,  0.00f,  1.00f,  // +y  cyan
+    0.85f, 0.25f, 0.85f,  0.00f,  0.00f,  1.00f,  // -y  magenta
+    0.70f, 0.70f, 0.70f,  0.10f,  0.00f,  1.00f,  // ground
+    0.30f, 0.90f, 1.00f,  0.90f,  0.00f,  1.00f,  // mirror
 };
+// clang-format on
+static_assert(sizeof(MATERIAL_TABLE) / sizeof(float) == (MIRROR + 1) * MATERIAL_FLOATS,
+              "a material is MATERIAL_FLOATS wide and the kernel indexes by that");
 }  // namespace
 
 int main(int argc, char** argv)
