@@ -199,6 +199,12 @@ struct DeviceGeometry {
     uint32_t bvh_depth = 0;
     TraversalOrder bvh_order = TraversalOrder::Unordered;
 
+    // That permutation, handed back. A caller holding anything indexed by
+    // triangle — a material a triangle is the case that found this — has to
+    // apply it too, and cannot derive it from what was uploaded. Empty when no
+    // tree was built, which is also when there is nothing to apply.
+    std::vector<uint32_t> triangle_order;
+
     // The second level, when the geometry was uploaded to be drawn many times.
     // The tree above holds one copy in its own space; these hold where the
     // copies went and how to get a ray into each.

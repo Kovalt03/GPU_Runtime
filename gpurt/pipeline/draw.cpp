@@ -272,6 +272,7 @@ DeviceGeometry upload_accelerated(MyGPURuntime& rt, const std::vector<Float3>& w
                    Direction::HostToDevice);
     geometry.bvh_depth = tree.max_depth;
     geometry.bvh_order = order;
+    geometry.triangle_order = tree.order;
     return geometry;
 }
 

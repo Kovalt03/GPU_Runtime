@@ -2740,6 +2740,41 @@ std::vector<Float3> compact_scene(uint32_t count, uint32_t seed = 7)
 
 }  // namespace
 
+TEST(Pipeline, TheReportedOrderNamesWhereEachUploadedTriangleCameFrom)
+{
+    // A tree moves the triangles, and anything the caller keeps beside them —
+    // a material a triangle is the case that raised this — has to move the same
+    // way. The permutation is not recoverable from what was uploaded, so the
+    // upload hands it back, and this is what that hand-back has to mean.
+    const std::vector<Float3> world = as_vertex_list(shared_scene());
+
+    for (BvhSplit split : {BvhSplit::Median, BvhSplit::SAH}) {
+        MyGPURuntime rt(1u << 24);
+        DeviceGeometry geometry = upload_accelerated(rt, world, split, 1u);
+
+        const size_t triangles = world.size() / 3;
+        ASSERT_EQ(geometry.triangle_order.size(), triangles);
+
+        std::vector<Float3> uploaded(world.size());
+        rt.myrt_memcpy(uploaded.data(), geometry.world, uploaded.size() * sizeof(Float3),
+                       Direction::DeviceToHost);
+
+        std::vector<bool> claimed(triangles, false);
+        for (size_t i = 0; i < triangles; ++i) {
+            const uint32_t from = geometry.triangle_order[i];
+            ASSERT_LT(from, triangles);
+            ASSERT_FALSE(claimed[from]) << "triangle " << from << " placed twice";
+            claimed[from] = true;
+            for (uint32_t v = 0; v < 3; ++v) {
+                EXPECT_EQ(uploaded[i * 3 + v].x, world[from * 3 + v].x);
+                EXPECT_EQ(uploaded[i * 3 + v].y, world[from * 3 + v].y);
+                EXPECT_EQ(uploaded[i * 3 + v].z, world[from * 3 + v].z);
+            }
+        }
+        release(rt, geometry);
+    }
+}
+
 TEST(Pipeline, TheTreeDrawsTheFrameTheWholeSceneDid)
 {
     // The claim a BVH makes is that skipping is safe. Nothing else here checks
