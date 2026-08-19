@@ -16,6 +16,7 @@ cmake --build build -j8
 ./build/benchmarks/bvh_bench        #         plus benchmarks/result/bvh.{md,csv}
 ./build/benchmarks/instance_bench   #         plus benchmarks/result/instance.{md,csv}
 ./build/benchmarks/tlas_bench       #         plus benchmarks/result/tlas.{md,csv}
+./build/benchmarks/material_bench   #         plus benchmarks/result/material.{md,csv}
 ```
 
 **Which machine.** Every benchmark takes `--machine machines/<name>.spec` and
@@ -1009,6 +1010,60 @@ Nothing stopped a kernel keeping its uniforms in global memory, and under
 `Coalesced` a warp reading one address was already one transaction. What the
 space adds is that it **cannot be anything else**: an address that varies by lane
 cannot be built here, so a uniform read cannot quietly become 32.
+
+---
+
+## Reordering, on divergence the scene put there
+
+*Regrouping the threads before they disagree* measured `REORDER` on a key built
+for the purpose, and closed at -75% scattered and +13% coherent. The objection to
+it was always the same: the answer might be a property of the key rather than of
+the technique. This is the same instruction with the key taken from the scene —
+the material of whichever instance the ray hit, which nothing here arranges.
+
+| Arm work | Inline | div | Deferred | div | Reordered | div | Deferring | Reordering |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 43,280 | 64.2% | 41,722 | 62.4% | 41,905 | 61.5% | -3.6% | **+0.4%** |
+| 4 | 44,105 | 64.8% | 42,154 | 62.8% | 42,052 | 61.6% | -4.4% | **-0.2%** |
+| 16 | 47,405 | 67.1% | 43,882 | 64.0% | 42,640 | 61.9% | -7.4% | **-2.8%** |
+| 64 | 60,605 | 73.5% | 50,794 | 68.2% | 44,992 | 63.1% | -16.2% | **-11.4%** |
+| 256 | 113,405 | 84.4% | 78,442 | 77.6% | 54,400 | 66.8% | -30.8% | **-30.6%** |
+
+64x32, 64 instances, 4 materials interleaved, block 4 rows. Three arms rather
+than two, because two changes are involved and their sum would credit the wrong
+one.
+
+**The synthetic result holds, and the crossing sits where it said.** Reordering
+pays for the divergent stretch that follows it: below an arm of about four it
+costs more than it saves, and by 256 it is worth 30.6%. That is the same shape
+the built key gave, arrived at without one.
+
+**Two changes, and the first is not the reorder.** Shading inline colours every
+candidate that beats the running best and blends the losers away; deferring keeps
+four scalars and colours once. That alone is -30.8% at the heaviest arm, and it
+is a prerequisite rather than a bonus — `REORDER` is a rendezvous, so it can only
+run where every thread of the block has finished traversing, and inline shading
+has already happened by then. The hardware asks for the same order: trace, then
+`optixReorder`, then shade.
+
+**A block one row tall is one warp, and there is nothing to regroup.** Every
+figure in this file before this section was taken that way, which is why they are
+unaffected by the instruction existing. Asking to reorder now requires asking for
+the room, and a block of one is refused rather than charged for nothing.
+
+**What reordering cannot touch is the larger half.** Traversal divergence is 85%
+on its own (*A tree, and what SIMT takes back from it*) and it is upstream of the
+rendezvous — by the time the threads can be regrouped, the tree has already been
+walked. Reordering fixes the shading tail. The tail is what a path tracer spends
+most of its time in, which is why the technique exists; here it is one arm of a
+switch, and the ceiling shows.
+
+**What this does not settle.** A scene sorted by material would give the reorder
+nothing, and that is ser_bench's coherent row rather than a second measurement
+here. The shader arms are a `BRA_DIV` chain and not a shader binding table, so
+the number of them is fixed when the kernel is built — a real SBT selects a
+shader address at run time, which needs an indirect branch this ISA does not
+have.
 
 ---
 

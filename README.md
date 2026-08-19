@@ -289,6 +289,9 @@ convert benchmarks/result/result.ppm result.png                    # ImageMagick
 # A tiled matrix multiply — what the matrix unit and cp.async were waiting for
 ./build/benchmarks/gemm_bench               # benchmarks/result/gemm.{md,csv}
 
+# Reordering the threads, on divergence the scene put there
+./build/benchmarks/material_bench            # benchmarks/result/material.{md,csv}
+
 # One tree over the copies, or one over all of them
 ./build/benchmarks/tlas_bench                # benchmarks/result/tlas.{md,csv}
 
@@ -584,7 +587,8 @@ this project exists to measure.
 |---|---|
 | BVH / acceleration structure | **built** — SAH or a median split, leaf size a parameter, and a stack in shared memory because an instruction names its registers immediately |
 | Traversal and intersection units | **absent** — traversal is instructions in the same kernel, the same choice made for rasterisation. So the divergence a tree causes is charged rather than hidden, which is where the interesting number is |
-| Ray reordering hardware | **absent as a unit**, present as an instruction: `REORDER` exists and the tree is the first thing here that gives it real divergence to regroup. What it still lacks is several materials to regroup *by* |
+| Ray reordering hardware | **absent as a unit**, present as an instruction: `REORDER` regroups a block's threads by material, worth 30.6% on a heavy shader and negative on a light one. What it cannot touch is traversal divergence, which is upstream of the rendezvous and the larger half |
+| Shader binding table | **absent** — the arms are a `BRA_DIV` chain, so how many there are is fixed when the kernel is built. A real SBT picks a shader address at run time, which needs an indirect branch this ISA does not have |
 | Index buffer as BLAS input | **absent** — and note it is real hardware's too: DXR and Vulkan RT both name one. What differs is when it is read, the builder consuming it once where the raster side reads it every draw |
 | Instance transforms (TLAS) | **built** — a tree over the placements, and the ray moved into an instance's space at its leaves. 12.5x less memory at 256 copies and 0.59x the work, an instance visited costing sixteen scalar loads for its matrix |
 | Several bottom-level structures | **built** — an instance carries where its own tree and triangles begin, so a scene holds different meshes rather than copies of one |
@@ -764,6 +768,7 @@ gpu-runtime-sim/
 │   ├── bvh_bench.cpp        # a tree, and what SIMT takes back from it
 │   ├── instance_bench.cpp   # where a model matrix meets the view-projection
 │   ├── tlas_bench.cpp       # one tree over the copies, or one over all of them
+│   ├── material_bench.cpp   # reordering, on divergence the scene put there
 │   └── result/              # every run writes here, one directory per run
 │       └── .gitkeep
 ```

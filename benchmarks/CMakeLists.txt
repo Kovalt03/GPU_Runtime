@@ -67,3 +67,7 @@ target_link_libraries(instance_bench PRIVATE gpurt project_warnings)
 # One tree over the copies, or one over all of them.
 add_executable(tlas_bench tlas_bench.cpp)
 target_link_libraries(tlas_bench PRIVATE gpurt project_warnings)
+
+# Reordering the threads, on divergence nobody put there to be reordered.
+add_executable(material_bench material_bench.cpp)
+target_link_libraries(material_bench PRIVATE gpurt project_warnings)
