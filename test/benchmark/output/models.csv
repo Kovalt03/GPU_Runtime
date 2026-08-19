@@ -1,0 +1,65 @@
+comparison,case,route,triangles,model,base,variant,change_pct
+predication,"small, spread over the frame",walk,16,flat,41665120,42481664,1.95978
+predication,"small, spread over the frame",walk,16,coalesced,3015520,3832064,27.078
+predication,"small, spread over the frame",walk,16,cached,1849850,2666394,44.1411
+predication,"small, spread over the frame",walk,16,cycles,583526,684774,17.3511
+predication,"small, spread over the frame",tiled,16,flat,6210144,6309888,1.60615
+predication,"small, spread over the frame",tiled,16,coalesced,494944,594688,20.1526
+predication,"small, spread over the frame",tiled,16,cached,307172,406916,32.4717
+predication,"small, spread over the frame",tiled,16,cycles,15463,18204,17.7262
+predication,"small, spread over the frame",raytrace,16,flat,31570734,32968704,4.42806
+predication,"small, spread over the frame",raytrace,16,coalesced,1868334,3266304,74.8244
+predication,"small, spread over the frame",raytrace,16,cached,1515514,2913484,92.244
+predication,"small, spread over the frame",raytrace,16,cycles,205334,323706,57.6485
+predication,"full-frame, stacked",walk,16,flat,41681408,42481664,1.91994
+predication,"full-frame, stacked",walk,16,coalesced,3031808,3832064,26.3953
+predication,"full-frame, stacked",walk,16,cached,1866138,2666394,42.883
+predication,"full-frame, stacked",walk,16,cycles,583398,684774,17.3768
+predication,"full-frame, stacked",tiled,16,flat,41980416,42780672,1.90626
+predication,"full-frame, stacked",tiled,16,coalesced,2934016,3734272,27.2751
+predication,"full-frame, stacked",tiled,16,cached,1760924,2561180,45.4452
+predication,"full-frame, stacked",tiled,16,cycles,86492,107240,23.9883
+predication,"full-frame, stacked",raytrace,16,flat,32179744,32968704,2.45173
+predication,"full-frame, stacked",raytrace,16,coalesced,2477344,3266304,31.847
+predication,"full-frame, stacked",raytrace,16,cached,2124524,2913484,37.1358
+predication,"full-frame, stacked",raytrace,16,cycles,244346,323706,32.4785
+indexed,"cube",walk,12,flat,31416592,38842640,23.6373
+indexed,"cube",walk,12,coalesced,2290192,2573840,12.3853
+indexed,"cube",walk,12,cached,1407102,1478808,5.09601
+indexed,"cube",walk,12,cycles,438226,513862,17.2596
+indexed,"sphere",walk,360,flat,923013408,1145676064,24.1234
+indexed,"sphere",walk,360,coalesced,65368608,73778464,12.8653
+indexed,"sphere",walk,360,cached,39900112,41933998,5.09744
+indexed,"sphere",walk,360,cycles,12904080,15155882,17.4503
+prepass,"stacked, barycentric",early-Z,4,flat,10993664,21673088,97.1416
+prepass,"stacked, barycentric",early-Z,4,coalesced,913664,1673088,83.1185
+prepass,"stacked, barycentric",early-Z,4,cached,595756,1068120,79.2882
+prepass,"stacked, barycentric",early-Z,4,cycles,166292,319912,92.3797
+prepass,"stacked, barycentric",early-Z,8,flat,21315584,42174080,97.8556
+prepass,"stacked, barycentric",early-Z,8,coalesced,1712384,3127680,82.6506
+prepass,"stacked, barycentric",early-Z,8,cached,1111896,1957552,76.0553
+prepass,"stacked, barycentric",early-Z,8,cycles,325864,607312,86.3698
+prepass,"stacked, barycentric",early-Z,16,flat,41957888,83175968,98.2368
+prepass,"stacked, barycentric",early-Z,16,coalesced,3308288,6036768,82.4741
+prepass,"stacked, barycentric",early-Z,16,cached,2142618,3736276,74.379
+prepass,"stacked, barycentric",early-Z,16,cycles,644838,1181772,83.2665
+prepass,"stacked, barycentric",early-Z,32,flat,83231744,165179072,98.4568
+prepass,"stacked, barycentric",early-Z,32,coalesced,6489344,11854272,82.6729
+prepass,"stacked, barycentric",early-Z,32,cached,4193288,7293008,73.921
+prepass,"stacked, barycentric",early-Z,32,cycles,1282616,2330352,81.6874
+prepass,"stacked, lit",early-Z,4,flat,16915200,23189312,37.0916
+prepass,"stacked, lit",early-Z,4,coalesced,1260800,1800512,42.8071
+prepass,"stacked, lit",early-Z,4,cached,842818,1166126,38.3604
+prepass,"stacked, lit",early-Z,4,cycles,222270,338514,52.2986
+prepass,"stacked, lit",early-Z,8,flat,32978688,43690304,32.4804
+prepass,"stacked, lit",early-Z,8,coalesced,2380288,3255104,36.7525
+prepass,"stacked, lit",early-Z,8,cached,1579652,2055558,30.1273
+prepass,"stacked, lit",early-Z,8,cycles,435260,625914,43.8023
+prepass,"stacked, lit",early-Z,16,flat,64984512,84692192,30.3267
+prepass,"stacked, lit",early-Z,16,coalesced,4613312,6157792,33.4788
+prepass,"stacked, lit",early-Z,16,cached,3047438,3833840,25.8053
+prepass,"stacked, lit",early-Z,16,cycles,861440,1200574,39.3683
+prepass,"stacked, lit",early-Z,32,flat,128148096,166695296,30.0802
+prepass,"stacked, lit",early-Z,32,coalesced,9037696,11975296,32.5039
+prepass,"stacked, lit",early-Z,32,cached,5941346,7390594,24.3926
+prepass,"stacked, lit",early-Z,32,cycles,1713800,2349324,37.0827

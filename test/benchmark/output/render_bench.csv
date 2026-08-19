@@ -1,0 +1,31 @@
+scene,triangles,route,weighted_lane_ops,divergence_rate
+"small, spread over the frame",4,walk,10918528,0.0109647
+"small, spread over the frame",4,tiled,2372224,0.0423476
+"small, spread over the frame",4,shared,1296304,0.0343483
+"small, spread over the frame",4,raytrace,8460408,0.096896
+"small, spread over the frame",4,walk+pred,11122688,0
+"small, spread over the frame",4,tiled+pred,2397184,0
+"small, spread over the frame",16,walk,41665120,0.0123106
+"small, spread over the frame",16,tiled,6210144,0.0737878
+"small, spread over the frame",16,shared,1759008,0.0653797
+"small, spread over the frame",16,raytrace,31570734,0.147934
+"small, spread over the frame",16,walk+pred,42481664,0
+"small, spread over the frame",16,tiled+pred,6309888,0
+"small, spread over the frame",64,walk,164650880,0.0126448
+"small, spread over the frame",64,tiled,31756160,0.0646322
+"small, spread over the frame",64,shared,4803584,0.0623625
+"small, spread over the frame",64,raytrace,124014548,0.166516
+"small, spread over the frame",64,walk+pred,167917568,0
+"small, spread over the frame",64,tiled+pred,32360448,0
+"medium, stacked at the centre",16,walk,41663264,0.00336018
+"medium, stacked at the centre",16,tiled,21526304,0.00679797
+"medium, stacked at the centre",16,shared,3574304,0.00644841
+"medium, stacked at the centre",16,raytrace,31616716,0.205353
+"medium, stacked at the centre",16,walk+pred,42481664,0
+"medium, stacked at the centre",16,tiled+pred,21935104,0
+"full-frame, stacked",16,walk,41681408,0.00546797
+"full-frame, stacked",16,tiled,41980416,0.00576696
+"full-frame, stacked",16,shared,6027264,0.00559487
+"full-frame, stacked",16,raytrace,32179744,0.130232
+"full-frame, stacked",16,walk+pred,42481664,0
+"full-frame, stacked",16,tiled+pred,42780672,0

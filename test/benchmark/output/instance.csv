@@ -1,0 +1,15 @@
+instances,vertices,transform,weighted_lane_ops
+16,8,per-vertex,105216
+16,8,composed,154080
+16,32,per-vertex,400896
+16,32,composed,437472
+16,64,per-vertex,801792
+16,64,composed,821984
+16,96,per-vertex,1202688
+16,96,composed,1206496
+16,128,per-vertex,1603584
+16,128,composed,1591008
+16,256,per-vertex,3207168
+16,256,composed,3129056
+16,512,per-vertex,6414336
+16,512,composed,6205152

@@ -1,0 +1,7 @@
+blocks,route,launches,weighted_lane_ops,cycles
+2,global,2,7676,2223
+2,cluster,1,15490,976
+4,global,2,11320,2623
+4,cluster,1,26046,976
+8,global,2,18608,3223
+8,cluster,1,47158,976

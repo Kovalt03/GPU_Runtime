@@ -1,0 +1,12 @@
+table,a,b,launches_or_alone_a,blocks_or_alone_b,ordered_cycles,concurrent_cycles,ordered_stalls,concurrent_stalls,ordered_work,concurrent_work
+fill,compute,compute,1,8,90,90,528,528,6688,6688
+fill,compute,compute,2,4,180,90,528,528,6688,6688
+fill,compute,compute,4,2,360,90,528,528,6688,6688
+fill,compute,compute,8,1,720,90,528,528,6688,6688
+pair,compute,compute,90,90,180,92,132,44,1672,1672
+pair,memory,memory,6490,6490,12980,6492,12900,6412,4688,4688
+pair,memory,compute,6490,90,6580,6490,6516,6426,3180,3180
+cull,device,host,8,8,90,900,0,0,6688,6924
+cull,device,host,4,4,90,900,0,0,3344,3580
+cull,device,host,2,2,90,900,0,0,1672,1908
+cull,device,host,0,0,0,810,0,0,0,236

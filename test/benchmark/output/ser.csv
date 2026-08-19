@@ -1,0 +1,11 @@
+spread,taking,branch_instructions,steps,reordered_steps,cycles,reordered_cycles,divergence,reordered_divergence
+scattered,32,32,288,71,288,164,0.78125,0
+scattered,128,32,288,164,288,164,0.458333,0
+scattered,224,32,288,257,288,257,0.135417,0
+coherent,32,32,63,71,153,164,0,0
+coherent,128,32,156,164,156,164,0,0
+coherent,224,32,249,257,249,257,0,0
+scattered,128,2,48,44,48,44,0.25,0
+scattered,128,8,96,68,96,68,0.375,0
+scattered,128,32,288,164,288,164,0.458333,0
+scattered,128,128,1056,548,1056,548,0.488636,0

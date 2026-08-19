@@ -1,0 +1,17 @@
+warps,route,instructions,warp_steps,active_lane_ops,weighted_lane_ops,cycles
+1,shared,68,68,2176,4416,354
+1,shuffle,33,33,1056,2176,149
+1,atomic a lane,5,5,160,3968,1143
+1,shuffle+atomic,39,39,1155,2394,363
+2,shared,68,136,4352,8832,370
+2,shuffle,33,66,2112,4352,150
+2,atomic a lane,5,10,320,7936,1144
+2,shuffle+atomic,39,78,2310,4788,366
+4,shared,68,272,8704,17664,402
+4,shuffle,33,132,4224,8704,152
+4,atomic a lane,5,20,640,15872,1146
+4,shuffle+atomic,39,156,4620,9576,372
+8,shared,68,544,17408,35328,654
+8,shuffle,33,264,8448,17408,264
+8,atomic a lane,5,40,1280,31744,1162
+8,shuffle+atomic,39,312,9240,19152,504

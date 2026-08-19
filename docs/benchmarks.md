@@ -5,6 +5,13 @@ Every executable writes into `test/benchmark/output/` — tables as `.md` and
 carries the accumulated record, the method behind each table, and the
 predictions the measurements contradicted.
 
+What is in `output/` is committed: it is the run those tables were taken from,
+so a reader can see the numbers and the frames without building anything. It
+also means **running a program rewrites tracked files** — `git status` after a
+benchmark is the diff between that run and the recorded one, which on a
+different host is mostly the wall-clock column. `scripts/bench.sh` writes into a
+timestamped directory instead, and those are ignored.
+
 ```bash
 # A shader of your own — read this one first
 ./build/apps/hello_shader

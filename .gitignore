@@ -5,8 +5,9 @@ compile_commands.json
 # clangd index
 .cache/
 
-# Rendered images and accumulated runs — only .gitkeep is tracked
-test/benchmark/output/*
-!test/benchmark/output/.gitkeep
+# Timestamped run directories, which scripts/bench.sh makes one of a run. The
+# files directly under output/ are tracked: they are the run the tables in
+# RESULTS.md were taken from, and a reader should not have to build to see them.
+test/benchmark/output/[0-9]*
 
 .DS_Store

@@ -1,0 +1,7 @@
+tiles,route,instructions,warp_steps,weighted_lane_ops,cycles
+1,fma,129,129,4128,513
+1,mma,2,2,544,33
+4,fma,513,513,16416,2049
+4,mma,5,5,2080,129
+16,fma,2049,2049,65568,8193
+16,mma,17,17,8224,513

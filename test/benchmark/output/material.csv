@@ -1,0 +1,16 @@
+materials,arm_work,shade_when,issued,divergence_percent
+4,1,inline,43280,64.2108
+4,1,deferred,41722,62.4223
+4,1,reordered,41905,61.5173
+4,4,inline,44105,64.8214
+4,4,deferred,42154,62.7541
+4,4,reordered,42052,61.5984
+4,16,inline,47405,67.0511
+4,16,deferred,43882,64.0156
+4,16,reordered,42640,61.9168
+4,64,inline,60605,73.5419
+4,64,deferred,50794,68.2036
+4,64,reordered,44992,63.1075
+4,256,inline,113405,84.395
+4,256,deferred,78442,77.575
+4,256,reordered,54400,66.8407
