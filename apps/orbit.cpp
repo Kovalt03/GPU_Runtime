@@ -64,11 +64,20 @@ std::vector<float> face_colours(size_t vertices)
     return attributes;
 }
 
-// A box, wound outwards so the back-face test keeps the sides facing the camera
-// and drops the ones behind them.
+// A box, wound so every face's normal points out of it.
+//
+// The intersection test rejects a back face, so a face wound the other way is
+// simply not there — and a box with five of them inside out looks like a box
+// seen through itself rather than like anything failing. cross(b - a, c - a)
+// against the face's own centre is what says which way each one is, and it is
+// worth checking rather than reasoning about.
+//
+// `which` names the first material; `per_face` walks the six from there, which
+// is how a cube gets a colour a face without six calls.
 void add_box(std::vector<Float3>& tris, std::vector<float>& material, Float3 lo,
-             Float3 hi, float which)
+             Float3 hi, float which, bool per_face = false)
 {
+    uint32_t face = 0;
     const auto quad = [&](Float3 a, Float3 b, Float3 c, Float3 d) {
         tris.push_back(a);
         tris.push_back(b);
@@ -76,28 +85,43 @@ void add_box(std::vector<Float3>& tris, std::vector<float>& material, Float3 lo,
         tris.push_back(a);
         tris.push_back(c);
         tris.push_back(d);
-        material.push_back(which);
-        material.push_back(which);
+        const float mine = which + (per_face ? static_cast<float>(face) : 0.0f);
+        material.push_back(mine);
+        material.push_back(mine);
+        ++face;
     };
-    quad({lo.x, lo.y, hi.z}, {lo.x, hi.y, hi.z}, {hi.x, hi.y, hi.z}, {hi.x, lo.y, hi.z});
-    quad({hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z}, {lo.x, lo.y, lo.z});
-    quad({lo.x, lo.y, lo.z}, {lo.x, hi.y, lo.z}, {lo.x, hi.y, hi.z}, {lo.x, lo.y, hi.z});
-    quad({hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {hi.x, hi.y, lo.z}, {hi.x, lo.y, lo.z});
-    quad({lo.x, hi.y, hi.z}, {lo.x, hi.y, lo.z}, {hi.x, hi.y, lo.z}, {hi.x, hi.y, hi.z});
+    quad({lo.x, lo.y, hi.z}, {hi.x, lo.y, hi.z}, {hi.x, hi.y, hi.z}, {lo.x, hi.y, hi.z});
+    quad({hi.x, lo.y, lo.z}, {lo.x, lo.y, lo.z}, {lo.x, hi.y, lo.z}, {hi.x, hi.y, lo.z});
+    quad({lo.x, lo.y, lo.z}, {lo.x, lo.y, hi.z}, {lo.x, hi.y, hi.z}, {lo.x, hi.y, lo.z});
+    quad({hi.x, lo.y, hi.z}, {hi.x, lo.y, lo.z}, {hi.x, hi.y, lo.z}, {hi.x, hi.y, hi.z});
+    quad({lo.x, hi.y, hi.z}, {hi.x, hi.y, hi.z}, {hi.x, hi.y, lo.z}, {lo.x, hi.y, lo.z});
     quad({lo.x, lo.y, lo.z}, {hi.x, lo.y, lo.z}, {hi.x, lo.y, hi.z}, {lo.x, lo.y, hi.z});
 }
 
-// Four floats a material: a colour, then how much of the light leaves along the
-// mirror direction. A floor at 0.15 shows what stands on it faintly; a mirror at
-// 0.8 shows the room.
-enum Material : uint32_t { FLOOR = 0, BLOCK = 1, BLOCK_TWO = 2, MIRROR = 3 };
-inline constexpr float MATERIAL_TABLE[] = {
-    0.82f, 0.80f, 0.78f, 0.15f,  // floor, a little of the room in it
-    0.58f, 0.16f, 0.52f, 0.00f,  // one block
-    0.90f, 0.34f, 0.30f, 0.00f,  // the other
-    0.88f, 0.92f, 0.95f, 0.80f,  // the panel
+// Six faces of a cube, then the ground, then a mirror. Four floats each: a
+// colour, and how much of the light leaves along the mirror direction.
+//
+// The arrangement is the one Vulkan-Samples uses for its reflection sample —
+// two cubes with a different colour a face, a ground that reflects a tenth, and
+// two mirrors facing each other at nine tenths. The cubes are what a reflection
+// has to show, the faces are how one tells which reflection it is looking at,
+// and the facing pair is what makes a reflection contain another.
+enum Material : uint32_t {
+    FACE_ZERO = 0,  // six consecutive, one a face
+    GROUND = 6,
+    MIRROR = 7,
 };
 
+inline constexpr float MATERIAL_TABLE[] = {
+    0.90f, 0.15f, 0.15f, 0.00f,  // +z  red
+    0.15f, 0.80f, 0.20f, 0.00f,  // -z  green
+    0.20f, 0.35f, 0.90f, 0.00f,  // -x  blue
+    0.90f, 0.85f, 0.20f, 0.00f,  // +x  yellow
+    0.20f, 0.85f, 0.85f, 0.00f,  // +y  cyan
+    0.85f, 0.25f, 0.85f, 0.00f,  // -y  magenta
+    0.70f, 0.70f, 0.70f, 0.10f,  // ground
+    0.30f, 0.90f, 1.00f, 0.90f,  // mirror
+};
 }  // namespace
 
 int main(int argc, char** argv)
@@ -163,10 +187,13 @@ int main(int argc, char** argv)
     const float restitution = 0.68f;
     const auto flight = [&](uint32_t count) {
         std::vector<Float3> path;
-        Float3 at{centre.x - radius * 7.0f, centre.y + radius * 3.0f, centre.z};
-        float rise = radius * 0.30f;
-        const float forward = radius * 0.30f;
-        const float pull = radius * 0.075f;
+        // Released at the top of the first arc, so the whole flight is bounces
+        // rather than one long fall — that fall would set the vertical extent
+        // the camera has to hold, and shrink the sphere inside it.
+        Float3 at{centre.x - radius * 5.0f, ground + radius * 4.0f, centre.z};
+        float rise = 0.0f;
+        const float forward = radius * 0.16f;
+        const float pull = radius * 0.09f;
         for (uint32_t i = 0; i < count; ++i) {
             path.push_back(at);
             at = Float3{at.x + forward, at.y + rise, at.z};
@@ -195,31 +222,35 @@ int main(int argc, char** argv)
                                (flight_lo.z + flight_hi.z) * 0.5f};
     const float flight_radius =
         0.5f * std::sqrt(dot(flight_hi - flight_lo, flight_hi - flight_lo)) + radius;
+    // Fitted to the box rather than to a sphere around it. The flight is wide
+    // and shallow, so the sphere that holds it is mostly empty and backs the
+    // camera off far enough to shrink the ball to a dot.
+    const float flight_span =
+        0.5f * std::max(flight_hi.x - flight_lo.x, flight_hi.y - flight_lo.y) + radius;
     const float flight_distance =
-        flight_radius / std::sin(radians(framing.fov_y_degrees) * 0.5f) * 1.15f;
+        flight_span / std::tan(radians(framing.fov_y_degrees) * 0.5f) * 1.08f;
 
-    // The mirror room, built once. Two panels facing each other, a block between
-    // them and a floor wide enough to run out of the frame.
+    // The mirror room, built once. Two panels facing each other, two cubes
+    // between them, and a floor wide enough to run out of the frame.
     std::vector<Float3> room;
     std::vector<float> room_material;
     if (mirror) {
-        const float r = radius;
-
-        // A floor wide enough to run out of the frame, two blocks on it, and one
-        // panel standing behind them. The panel is what the scene is for: what
-        // it shows is a second ray traced from where the first stopped, and a
-        // rasteriser has nothing to put there.
-        add_box(room, room_material, {-r * 9.0f, -r * 0.3f, -r * 9.0f},
-                {r * 9.0f, 0.0f, r * 9.0f}, static_cast<float>(FLOOR));
-        add_box(room, room_material, {-r * 2.3f, 0.0f, -r * 0.6f},
-                {-r * 0.5f, r * 1.8f, r * 1.2f}, static_cast<float>(BLOCK));
-        add_box(room, room_material, {r * 0.6f, 0.0f, -r * 0.2f},
-                {r * 2.6f, r * 2.0f, r * 1.8f}, static_cast<float>(BLOCK_TWO));
-        add_box(room, room_material, {-r * 3.4f, 0.0f, -r * 4.6f},
-                {r * 3.4f, r * 3.6f, -r * 4.3f}, static_cast<float>(MIRROR));
+        // World units of its own, not the loaded mesh's: this scene uses no mesh
+        // and tying it to one would make the camera and the room agree only by
+        // accident. The proportions are the sample's — two cubes a unit either
+        // side of the origin, a ground fifteen across a unit below them, and two
+        // mirrors seven out facing each other.
+        add_box(room, room_material, {-15.0f, -1.2f, -15.0f}, {15.0f, -1.0f, 15.0f},
+                static_cast<float>(GROUND));
+        add_box(room, room_material, {-1.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, 0.5f},
+                static_cast<float>(FACE_ZERO), true);
+        add_box(room, room_material, {0.5f, -0.5f, -0.5f}, {1.5f, 0.5f, 0.5f},
+                static_cast<float>(FACE_ZERO), true);
+        add_box(room, room_material, {-5.0f, -1.0f, -7.1f}, {5.0f, 4.0f, -6.9f},
+                static_cast<float>(MIRROR));
+        add_box(room, room_material, {-5.0f, -1.0f, 6.9f}, {5.0f, 4.0f, 7.1f},
+                static_cast<float>(MIRROR));
     }
-
-    const float room_radius = radius * 5.5f;
 
     std::vector<std::vector<Float3>> animation;
     for (uint32_t frame = 0; frame < frames; ++frame) {
@@ -227,27 +258,32 @@ int main(int argc, char** argv)
             6.2831853f * static_cast<float>(frame) / static_cast<float>(frames);
 
         Camera camera = framing;
-        const float room_distance =
-            room_radius / std::sin(radians(framing.fov_y_degrees) * 0.5f) * 1.15f;
-        camera.target = thrown ? flight_centre
-                               : (mirror ? Float3{centre.x, centre.y + radius * 1.2f,
-                                                  centre.z - radius * 1.6f}
-                                         : centre);
-        camera.eye = thrown ? Float3{flight_centre.x, flight_centre.y,
-                                     flight_centre.z + flight_distance}
-                            : (mirror ? Float3{centre.x + std::sin(turn) * radius * 1.3f,
-                                               centre.y + radius * 3.4f,
-                                               centre.z + radius * 9.5f -
-                                                   std::cos(turn) * radius * 1.2f}
-                                      : Float3{centre.x + std::sin(turn) * distance,
-                                               centre.y + radius * 0.6f,
-                                               centre.z + std::cos(turn) * distance});
+        // The mirror room is in world units of its own, so its camera is too —
+        // deriving it from the loaded mesh would have the two agree by accident.
+        camera.target = thrown   ? flight_centre
+                        : mirror ? Float3{0.0f, 0.2f, 0.0f}
+                                 : centre;
+        camera.eye =
+            thrown ? Float3{flight_centre.x, flight_centre.y + flight_radius * 0.30f,
+                            flight_centre.z + flight_distance}
+            : mirror
+                ? Float3{std::sin(turn) * 1.8f, 0.9f, -2.6f - std::cos(turn) * 0.7f}
+                : Float3{centre.x + std::sin(turn) * distance, centre.y + radius * 0.6f,
+                         centre.z + std::cos(turn) * distance};
 
-        const float framed =
-            thrown ? flight_distance : (mirror ? room_distance : distance);
-        const float held = thrown ? flight_radius : (mirror ? room_radius : radius);
-        camera.near_z = std::max(framed - held, framed * 0.01f);
-        camera.far_z = framed + held * 2.0f;
+        if (mirror) {
+            // Named rather than derived from a framing distance, because this
+            // camera stands among the objects instead of outside them: a near
+            // plane placed where the subject would be if the camera had backed
+            // off puts the cubes behind it and leaves a frame of sky.
+            camera.near_z = 0.1f;
+            camera.far_z = 60.0f;
+        } else {
+            const float framed = thrown ? flight_distance : distance;
+            const float held = thrown ? flight_radius : radius;
+            camera.near_z = std::max(framed - held, framed * 0.01f);
+            camera.far_z = framed + held * 2.0f;
+        }
         const DrawTarget target{size, size, camera};
 
         MyGPURuntime rt(1u << 27);
@@ -257,10 +293,17 @@ int main(int argc, char** argv)
             DeviceGeometry traced = upload_accelerated(r, room);
             DeviceFrame frame_buffer = allocate_frame(r, target);
 
-            void* material = r.myrt_malloc(room_material.size() * sizeof(float));
+            // The tree moved the triangles, so the materials move with them.
+            // One float a triangle, permuted by the order the build reports.
+            std::vector<float> placed(room_material.size());
+            for (size_t i = 0; i < traced.triangle_order.size(); ++i) {
+                placed[i] = room_material[traced.triangle_order[i]];
+            }
+
+            void* material = r.myrt_malloc(placed.size() * sizeof(float));
             void* table = r.myrt_malloc(sizeof(MATERIAL_TABLE));
-            r.myrt_memcpy(material, room_material.data(),
-                          room_material.size() * sizeof(float), Direction::HostToDevice);
+            r.myrt_memcpy(material, placed.data(), placed.size() * sizeof(float),
+                          Direction::HostToDevice);
             r.myrt_memcpy(table, MATERIAL_TABLE, sizeof(MATERIAL_TABLE),
                           Direction::HostToDevice);
 
@@ -302,6 +345,20 @@ int main(int argc, char** argv)
                     v = Float3{v.x - centre.x + to.x, v.y - centre.y + to.y,
                                v.z - centre.z + to.z};
                 }
+                // The floor the arcs are solved against, drawn so the
+                // shrinking reads as a bounce rather than as a drift. It does
+                // not move, so it goes in after the sphere is translated.
+                const float y = ground - radius;
+                const float x0 = flight_lo.x - radius * 2.0f;
+                const float x1 = flight_hi.x + radius * 2.0f;
+                const float z0 = centre.z - radius * 8.0f;
+                const float z1 = centre.z + radius * 8.0f;
+                placed.push_back(Float3{x0, y, z0});
+                placed.push_back(Float3{x1, y, z1});
+                placed.push_back(Float3{x1, y, z0});
+                placed.push_back(Float3{x0, y, z0});
+                placed.push_back(Float3{x0, y, z1});
+                placed.push_back(Float3{x1, y, z1});
             }
             DeviceGeometry traced = upload_accelerated(rt, placed);
             DeviceFrame frame_buffer = allocate_frame(rt, target);
