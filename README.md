@@ -374,4 +374,5 @@ gpu-runtime-sim/
 | [docs/benchmarks.md](docs/benchmarks.md) | every program, and the question each one asks |
 | [docs/findings.md](docs/findings.md) | what the optimisations bought, in full, with the measurements |
 | [docs/scope.md](docs/scope.md) | what is modelled and what is not, block by block, and where it goes next |
+| [docs/implement/README.md](docs/implement/README.md) | the Korean implementation record: 31 linked notes covering the design decisions, code, tests, and benchmark work |
 | [test/benchmark/RESULTS.md](test/benchmark/RESULTS.md) | the measurement record, the method, and the predictions that were wrong |
