@@ -100,9 +100,9 @@ loop:      다음 청크가 있으면 → 발행하고 cp_async_wait(K)      (�
 
 | 씬 | 삼각형 | sync 사이클 | async 사이클 | |
 |---|---:|---:|---:|---|
-| small, spread | 16 | 19,500 | 19,976 | **+2.4%** |
-| full-frame | 64 | 335,258 | 330,398 | -1.4% |
-| full-frame | 128 | 524,954 | 515,678 | **-1.8%** |
+| small, spread | 16 | 19,500 | 20,865 | **+7.0%** |
+| full-frame | 64 | 335,258 | 330,395 | -1.5% |
+| full-frame | 128 | 524,954 | 515,675 | **-1.8%** |
 
 **87% 가 2% 가 된다.** 프레임은 동일하고 기전도 같다. 달라진 것은 **그 기전이 커널의
 몇 %에 적용되는가**뿐이다.
@@ -156,3 +156,10 @@ loop:      다음 청크가 있으면 → 발행하고 cp_async_wait(K)      (�
 ---
 
 [← 이전 문서](./17_streams.md) · [구현 노트 목차](./README.md) · [다음 문서 →](./19_atomics.md)
+
+
+> Timing correction (2026-09-12): cp.async waits now use the latest completion
+> among all required copies, since cache hits can complete out of issue order.
+> GEMM and asynchronous-rendering tables were regenerated after this fix;
+> issued-work counts are unchanged. Earlier timing interpretations should be
+> read against the corrected tables in `test/benchmark/output/`.

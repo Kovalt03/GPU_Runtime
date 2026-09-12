@@ -81,7 +81,7 @@ Program build_clip_program(void** args)
         // The three edges cross the plane at three points, and every case below
         // uses two of them. Computed once, outside the branches: working them out
         // where they are used meant six copies of the arithmetic and about 170
-        // registers of the 250 a thread has.
+        // registers of the 248 a thread has.
         //
         // An edge with both ends on the same side divides by zero here and
         // produces nothing usable. That is safe because the branch that would

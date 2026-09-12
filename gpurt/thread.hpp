@@ -102,6 +102,10 @@ struct Warp {
     std::array<InFlightCopy, CP_ASYNC_QUEUE_DEPTH> copies{};
     uint32_t copies_in_flight = 0;
 
+    // Wait has released these queue slots, but other warps must still wait for
+    // their completion time before reading the destination.
+    std::vector<InFlightCopy> waited_copies;
+
     // Where WarpPolicy::Independent left off, so the next turn can go to a
     // different pc. Unused under LowestPc, which needs no memory of its own —
     // the lowest live pc is a property of the warp's state alone.

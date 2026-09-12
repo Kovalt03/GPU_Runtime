@@ -63,7 +63,7 @@ void emit_staging(IRBuilder& k, const GemmArgs& a, const Position& at, Reg<Scala
 
     // Addresses are advanced in place rather than rebuilt. Every arithmetic call
     // allocates a register, and this is emitted twice in the double-buffered form
-    // — the file holds 250 and the obvious spelling wanted about 120.
+    // — the file holds 248 and the obvious spelling wanted about 120.
     const Reg<Scalar> to = k.copy(buffer);
     const Reg<Scalar> from = k.copy(buffer);
 
@@ -225,7 +225,7 @@ Program build_gemm_program(void** args)
         // The same product one multiply-add at a time. A lane's eight outputs
         // each need a whole row of A against a column of B, so the inner loop is
         // over k rather than unrolled: emitting 144 loads would allocate 144
-        // registers, and the file holds 250.
+        // registers, and the file holds 248.
         const Reg<Scalar> kk = k.copy(zero);
         const Reg<Scalar> a_row = k.add(buffer, k.mul(k.mul(at.row, tile), four));
         const Reg<Scalar> b_col = k.add(

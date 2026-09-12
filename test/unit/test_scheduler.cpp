@@ -2753,3 +2753,97 @@ TEST(Scheduler, AWideMatrixLoadReadsSixteenConsecutiveFloats)
     EXPECT_THROW(misaligned.run(Program{make_v_ld_global_mat4_f32(17, 1), make_ret()}),
                  std::runtime_error);
 }
+
+TEST(Scheduler, ConstantLoadsRejectNonuniformAddresses)
+{
+    for (bool wide : {false, true}) {
+        Fixture f;
+        f.lane(1).regs[1] = 4.0f;
+        const Instruction load =
+            wide ? make_v_ld_const_mat4_f32(4, 1) : make_v_ld_const_f32(4, 1);
+        EXPECT_THROW(f.run(Program{load, make_ret()}), std::runtime_error);
+    }
+}
+
+TEST(Scheduler, ConstantLoadsIgnoreInactiveLanes)
+{
+    Fixture f;
+    f.lane(1).active = false;
+    f.lane(1).regs[1] = 4.0f;
+    f.poke(0, 7.0f);
+    EXPECT_NO_THROW(f.run(Program{make_v_ld_const_f32(4, 1), make_ret()}));
+    EXPECT_FLOAT_EQ(f.lane(0).regs[4], 7.0f);
+}
+
+TEST(Scheduler, WideSharedLoadsRejectOverlappingCopies)
+{
+    for (bool half : {false, true}) {
+        Fixture f;
+        broadcast(f.warp(), 2, 12.0f);
+        const Instruction load =
+            half ? make_v_ld_shared_16x16_f16(4, 1) : make_v_ld_shared_16x16_f32(4, 1);
+        EXPECT_THROW(
+            f.run(Program{make_v_cp_async_shared_global_f32(2, 1), load, make_ret()}),
+            std::runtime_error);
+    }
+}
+
+TEST(Scheduler, SharedLoadsCheckOtherWarpsAndWaitCompletion)
+{
+    for (bool waiting : {false, true}) {
+        ThreadBlock block = make_block(2);
+        // Start the producer at COPY or WAIT, and the consumer at LOAD.
+        block.warps[1].threads.fill(Thread{});
+        for (Thread& t : block.warps[1].threads) {
+            t.pc = 2;
+        }
+        if (waiting) {
+            for (Thread& t : block.warps[0].threads) {
+                t.pc = 1;
+            }
+            auto& producer = block.warps[0];
+            producer.copies_in_flight = 1;
+            producer.copies[0].ready_at = 400;
+            producer.copies[0].first_byte = 0;
+            producer.copies[0].last_byte = 3;
+        }
+        std::vector<uint8_t> memory(64);
+        WarpScheduler scheduler;
+        scheduler.set_latency_model(LatencyModel::Modelled);
+        EXPECT_THROW(scheduler.run(Program{make_v_cp_async_shared_global_f32(0, 0),
+                                           make_s_cp_async_wait(0),
+                                           make_v_ld_shared_f32(4, 0), make_ret()},
+                                   block, DeviceSpan{memory.data(), memory.size()}),
+                     std::runtime_error);
+    }
+}
+
+TEST(Scheduler, ProducerWaitAndBarrierAllowWideReadsByOtherWarps)
+{
+    ThreadBlock block = make_block(2);
+    for (Thread& t : block.warps[1].threads) {
+        t.pc = 2;
+    }
+    std::vector<uint8_t> memory(64);
+    const float value = 7.0f;
+    std::memcpy(memory.data(), &value, sizeof(value));
+    WarpScheduler scheduler;
+    scheduler.set_latency_model(LatencyModel::Modelled);
+    EXPECT_NO_THROW(scheduler.run(
+        Program{make_v_cp_async_shared_global_f32(0, 0), make_s_cp_async_wait(0),
+                make_barrier(), make_v_ld_shared_16x16_f32(4, 0), make_ret()},
+        block, DeviceSpan{memory.data(), memory.size()}));
+    EXPECT_FLOAT_EQ(block.warps[1].threads[0].regs[4], value);
+}
+
+TEST(Scheduler, CopyWaitCoversOutOfOrderCompletion)
+{
+    Fixture f;
+    f.sched.set_latency_model(LatencyModel::Modelled);
+    f.warp().copies_in_flight = 2;
+    f.warp().copies[0] = Warp::InFlightCopy{400, 0, 3};
+    f.warp().copies[1] = Warp::InFlightCopy{30, 4, 7};
+    EXPECT_NO_THROW(
+        f.run(Program{make_s_cp_async_wait(0), make_v_ld_shared_f32(4, 0), make_ret()}));
+    EXPECT_GE(f.sched.stats().cycles, 400u);
+}

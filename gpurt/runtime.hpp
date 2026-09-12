@@ -123,8 +123,8 @@ inline constexpr uint8_t REG_CLUSTER_RANK = 249;
 // having no integer division, so anything a block owns collectively has to be
 // found through these.
 //
-// Reserved below the global ids, which lowers the allocator's ceiling to 250.
-// Kernels here use around sixty registers, so the room costs nothing.
+// Together with the constant base and cluster rank, launch state occupies
+// r248..r255. The IR builder allocates only r0..r247.
 inline constexpr uint8_t REG_BLOCK_ID_X = 250;
 inline constexpr uint8_t REG_BLOCK_ID_Y = 251;
 inline constexpr uint8_t REG_BLOCK_ID_Z = 252;

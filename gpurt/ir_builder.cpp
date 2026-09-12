@@ -7,10 +7,10 @@
 
 namespace {
 
-// The launch writes the thread's and block's coordinates from here upward, so
+// The launch reserves uniforms, cluster rank and coordinates from here upward, so
 // the allocator stops short rather than handing one out and having a kernel
 // quietly overwrite its own identity.
-constexpr uint32_t FIRST_RESERVED_REGISTER = REG_BLOCK_ID_X;
+constexpr uint32_t FIRST_RESERVED_REGISTER = REG_CONST_BASE;
 
 // A label that has been handed out but not yet placed. Distinct from address 0,
 // which is a perfectly ordinary target for a backward branch.
@@ -40,7 +40,7 @@ Reg<Shape> IRBuilder::alloc()
                                  std::to_string(Shape::REGISTERS) + " at r" +
                                  std::to_string(first) + ", but r" +
                                  std::to_string(FIRST_RESERVED_REGISTER) +
-                                 " upward carries the thread coordinates");
+                                 " upward is reserved for launch state");
     }
 
     next_free_ = first + Shape::REGISTERS;

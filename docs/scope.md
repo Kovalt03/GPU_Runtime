@@ -43,8 +43,8 @@ this project exists to measure.
 | Sampling | **absent** — one primary ray a pixel, one continuation a surface, one shadow ray a bounce, no randomness. This is a Whitted tracer, so shadows are hard-edged, reflections are mirror-sharp and there is no indirect diffuse. A Monte Carlo path tracer needs a random number, and the ISA has no integer or bitwise op to hash one from — a host-filled sample buffer read through `V_LD_GLOBAL_F32` is what would fit |
 | Wide nodes | **absent** — two children a node. Hardware fetches four or eight bounds at once to spend one cache line rather than two |
 
-The tree removes 16.4x of the lane work on 4,096 triangles and the warp keeps
-2.9x of it: two adjacent pixels are two rays that leave the root for different
+The tree removes 16.17x of the lane work on 4,096 triangles and the warp keeps
+2.89x of it: two adjacent pixels are two rays that leave the root for different
 children, and from there the lanes are at different pcs. Divergence goes from
 16.5% to 85.1%. That gap is the measurement worth having — it is the argument
 ray-reordering hardware exists to make, arrived at rather than assumed.
@@ -55,10 +55,10 @@ ray-reordering hardware exists to make, arrived at rather than assumed.
 |---|---|
 | L1 / L2 hierarchy | modelled: 1024 lines and 65,536 of 128 bytes, LRU, tags only. Nothing here outgrows L2, so what it demonstrably does is catch what L1 drops |
 | Coalescing | modelled: a warp's 32 addresses are charged by the distinct lines they touch. Transaction counts, not bandwidth contention |
-| DRAM, bandwidth saturation | **absent** — transactions never queue for a shared resource |
+| DRAM, bandwidth saturation | **partly modelled** — an optional fixed-rate queue models memory saturation with Coalesced/Cached memory and modelled latency. DRAM row buffers and detailed read/write traffic are absent |
 | Shared memory + barrier | modelled: 4096 floats a block, `BARRIER`, a load costing 8 |
-| Constant window | modelled: `V_LD_CONST_F32` and a matrix form, addressed from a register the launch seeds so the address is warp-uniform by construction — charged once for the warp rather than once a lane, which is the only such opcode here |
-| Register file | modelled: 256 a thread, 250 of them assignable, which is close to the 255 a real thread gets. What differs is what happens at the ceiling — hardware spills to local memory or holds fewer warps resident, and this throws. So registers are a wall here and a performance axis there; occupancy is limited by blocks, warp slots and shared memory, never by registers |
+| Constant window | modelled: `V_LD_CONST_F32` and a matrix form, normally addressed from the launch-seeded constant base; the executor rejects effective addresses that differ across active lanes — charged once for the warp rather than once a lane, which is the only such opcode here |
+| Register file | modelled: 256 a thread, 248 of them assignable (r0–r247; r248–r255 are launch state), which is close to the 255 a real thread gets. What differs is what happens at the ceiling — hardware spills to local memory or holds fewer warps resident, and this throws. So registers are a wall here and a performance axis there; occupancy is limited by blocks, warp slots and shared memory, never by registers |
 
 ## Scheduling
 
@@ -84,10 +84,12 @@ ray-reordering hardware exists to make, arrived at rather than assumed.
 
 ## The three that matter most
 
-**Bandwidth.** Transactions are counted, never queued. Two warps each needing four
-lines are charged independently, so nothing here saturates: no shared resource, no
-DRAM row buffer, no ceiling. Counting how many transactions a kernel makes is a
-different question from how long they take together, and only the first is answered.
+**Bandwidth.** With the default settings, requests do not queue. Enabling
+`BandwidthModel::Modelled` together with `LatencyModel::Modelled` and
+`MemoryModel::Coalesced` or `Cached` adds a fixed-rate memory queue. Cache hits
+do not consume its capacity. This is a saturation model, not a detailed DRAM
+controller: row buffers, on-chip bandwidth limits and complete read/write
+traffic modelling remain absent.
 
 **A shader worth skipping.** Early-Z is built and loses by 30% on the scene it
 exists for, because what decides that trade is the shade against the coverage test
@@ -138,3 +140,20 @@ scene happened to contain, never on divergence that is the point.
 ---
 
 [← back to the README](../README.md)
+
+
+## Validation boundaries
+
+- Constant loads require equal effective addresses across the active lanes of
+  an issued instruction. The executor checks this before reading or charging
+  the broadcast. An arbitrary register is legal when its address is uniform.
+- Async-copy read checks cover scalar and wide shared loads and cluster loads,
+  checking every producer warp in the source block. A wait releases queue slots,
+  but reads from another warp remain invalid until its completion time. Use a
+  block or cluster barrier after producer waits to coordinate consumers.
+- Copy data is stored immediately; completion is represented by metadata and
+  read guards. Destination ranges are conservative bounding intervals, so holes
+  between scattered destinations can also be rejected. This is not a full race
+  detector or a hardware memory-consistency model.
+- The IR builder reserves r248–r255. Raw ISA programs remain responsible for
+  preserving launch state when writing registers directly.

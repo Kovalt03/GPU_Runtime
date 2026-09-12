@@ -506,3 +506,13 @@ TEST(IRBuilder, GeneratedProgramRunsOnTheScheduler)
     EXPECT_FLOAT_EQ(host[1], 7.0f) << "if_ runs its body when the condition holds";
     EXPECT_FLOAT_EQ(host[2], 42.0f) << "if_else takes the else path";
 }
+
+TEST(IRBuilder, AllocationProtectsAllLaunchRegisters)
+{
+    IRBuilder k;
+    for (unsigned i = 0; i < REG_CONST_BASE; ++i) {
+        EXPECT_NO_THROW(k.scalar());
+    }
+    EXPECT_THROW(k.scalar(), std::runtime_error);
+    EXPECT_EQ(k.registers_used(), REG_CONST_BASE);
+}

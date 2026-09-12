@@ -88,15 +88,10 @@ enum class Opcode : uint8_t {
 
     // A value every thread reads the same way, out of the constant window.
     //
-    // The address is warp-uniform by construction — it comes from the register
-    // the launch seeds, not from a lane — so hardware answers one access and
-    // broadcasts it. That is what this space is for and how it is priced: once a
-    // warp rather than once a lane.
-    //
-    // Nothing stops a kernel putting a uniform in global memory, and under
-    // Coalesced a warp reading one address is already one transaction. What the
-    // space adds is that it *cannot* be anything else: an address that varies by
-    // lane cannot be built here, so a uniform read cannot quietly become 32.
+    // The launch seeds REG_CONST_BASE for the usual uniform-window access.
+    // Any address register is accepted, but the executor requires equal
+    // effective addresses across active lanes before charging one broadcast.
+    // Nonuniform accesses must use global loads instead.
     V_LD_CONST_F32,  // reg[dst] = const[reg[src0] + imm]        (src1 unused)
 
     // Sixteen of them, which is a matrix — the shape a vertex stage wants and the

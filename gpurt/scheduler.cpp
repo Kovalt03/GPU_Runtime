@@ -481,9 +481,8 @@ void WarpScheduler::execute(const Instruction& instr, uint32_t instr_pc, Thread&
         break;
     }
 
-    // The constant window. Addressed from the register the launch seeded, so the
-    // address is the same in every lane by construction — which is what lets the
-    // cost model charge it once for the warp.
+    // The constant window. step_warp checks active-lane address uniformity
+    // before execution, so the cost model can charge one broadcast.
     case Opcode::V_LD_CONST_F32: {
         const size_t addr =
             decode_address(thread.regs[instr.src0] + instr.imm, "V_LD_CONST_F32");
@@ -981,7 +980,18 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     // passed. Time decides when the warp may go on; the wait decides when the
     // bytes may be read, and PTX draws the line the same way — cp.async.wait_group
     // is what makes a copy visible, and no amount of waiting around replaces it.
-    const auto drop_oldest = [&warp](uint32_t count) {
+    const auto drop_oldest = [&warp, now](uint32_t count) {
+        auto& waited = warp.waited_copies;
+        waited.erase(std::remove_if(waited.begin(), waited.end(),
+                                    [now](const Warp::InFlightCopy& copy) {
+                                        return copy.ready_at <= now;
+                                    }),
+                     waited.end());
+        for (uint32_t i = 0; i < count; ++i) {
+            if (warp.copies[i].ready_at > now) {
+                waited.push_back(warp.copies[i]);
+            }
+        }
         for (uint32_t i = count; i < warp.copies_in_flight; ++i) {
             warp.copies[i - count] = warp.copies[i];
         }
@@ -1085,12 +1095,15 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         const auto allowed = static_cast<uint32_t>(program[warp.pc].imm);
 
         if (warp.copies_in_flight > allowed) {
-            // The last one that has to land lands at a time this scheduler
-            // already knows, so the wait is expressed as a latency rather than
+            // Cache hits can finish after issue in a different order. Wait for
+            // every required copy; express their latest completion as latency rather than
             // as turns taken and refused: the warp steps past the instruction
             // now and cannot issue again until then.
             const uint32_t must_land = warp.copies_in_flight - allowed;
-            const uint64_t until = warp.copies[must_land - 1].ready_at;
+            uint64_t until = now;
+            for (uint32_t i = 0; i < must_land; ++i) {
+                until = std::max(until, warp.copies[i].ready_at);
+            }
             issued_latency_ = static_cast<uint32_t>(until > now ? until - now : 0);
             drop_oldest(must_land);
         } else {
@@ -1126,26 +1139,73 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         drop_oldest(1);
     }
 
-    if (program[warp.pc].op == Opcode::V_LD_SHARED_F32) {
-        // Reading bytes a copy has not delivered. Hardware hands back whatever
-        // was there, which is a kernel that passes its tests by luck; this
-        // refuses instead. The range is the copy's own destination bytes, so a
-        // double-buffered kernel reading the half it waited for is untouched.
+    const Instruction& memory_instruction = program[warp.pc];
+    const Opcode memory_op = memory_instruction.op;
+    if (memory_op == Opcode::V_LD_CONST_F32 || memory_op == Opcode::V_LD_CONST_MAT4_F32) {
+        // Broadcast pricing is valid only for a uniform effective address.
+        bool have_address = false;
+        size_t uniform_address = 0;
         for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
             if (!is_active(warp, lane)) {
                 continue;
             }
+            const size_t address = decode_address(
+                warp.threads[lane].regs[memory_instruction.src0] + memory_instruction.imm,
+                "constant load");
+            if (have_address && address != uniform_address) {
+                throw std::runtime_error(
+                    "constant load requires a uniform address across active lanes");
+            }
+            uniform_address = address;
+            have_address = true;
+        }
+    }
+
+    if (memory_op == Opcode::V_LD_SHARED_F32 ||
+        memory_op == Opcode::V_LD_SHARED_16X16_F32 ||
+        memory_op == Opcode::V_LD_SHARED_16X16_F16 ||
+        memory_op == Opcode::V_LD_CLUSTER_F32) {
+        const size_t width = memory_op == Opcode::V_LD_SHARED_16X16_F32   ? 32
+                             : memory_op == Opcode::V_LD_SHARED_16X16_F16 ? 16
+                                                                          : 4;
+        for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
+            if (!is_active(warp, lane)) {
+                continue;
+            }
+            const Thread& thread = warp.threads[lane];
             const size_t addr = decode_address(
-                warp.threads[lane].regs[program[warp.pc].src0] + program[warp.pc].imm,
-                "V_LD_SHARED_F32");
-            for (uint32_t i = 0; i < warp.copies_in_flight; ++i) {
-                if (addr >= warp.copies[i].first_byte &&
-                    addr <= warp.copies[i].last_byte) {
-                    throw std::runtime_error(
-                        "V_LD_SHARED_F32 at pc " + std::to_string(warp.pc) + ": byte " +
-                        std::to_string(addr) +
-                        " is still in flight from a cp.async — S_CP_ASYNC_WAIT "
-                        "has to come first");
+                thread.regs[memory_instruction.src0] + memory_instruction.imm,
+                "shared load");
+            const ThreadBlock* source = &block;
+            if (memory_op == Opcode::V_LD_CLUSTER_F32) {
+                const size_t rank =
+                    decode_address(thread.regs[memory_instruction.src1], "cluster rank");
+                const size_t peers = block.cluster == nullptr ? 1 : block.cluster->size();
+                if (rank >= peers) {
+                    throw std::runtime_error("cluster rank out of range");
+                }
+                if (block.cluster != nullptr) {
+                    source = (*block.cluster)[rank];
+                }
+            }
+            const auto overlaps = [addr, width](const Warp::InFlightCopy& copy) {
+                // Subtraction avoids overflowing addr + width.
+                return addr <= copy.last_byte &&
+                       (addr >= copy.first_byte || copy.first_byte - addr < width);
+            };
+            for (const Warp& producer : source->warps) {
+                for (uint32_t i = 0; i < producer.copies_in_flight; ++i) {
+                    if (overlaps(producer.copies[i])) {
+                        throw std::runtime_error(
+                            "shared load overlaps a cp.async requiring S_CP_ASYNC_WAIT");
+                    }
+                }
+                for (const auto& copy : producer.waited_copies) {
+                    if (copy.ready_at > now && overlaps(copy)) {
+                        throw std::runtime_error(
+                            "shared load precedes cp.async wait completion; synchronize "
+                            "producers and consumers");
+                    }
                 }
             }
         }

@@ -19,10 +19,10 @@ copies before walking this one.
 
 | Scene | triangles | sync issued | async issued | change | sync cycles | async cycles | change |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| small, spread | 16 | 739,844 | 833,028 | 12.6% | 19,500 | 19,976 | **2.4%** |
-| full-frame, stacked | 16 | 4,861,500 | 4,936,892 | 1.6% | 100,834 | 100,359 | **-0.5%** |
-| full-frame, stacked | 64 | 16,491,932 | 16,517,068 | 0.2% | 335,258 | 330,398 | **-1.4%** |
-| full-frame, stacked | 128 | 25,913,884 | 25,955,404 | 0.2% | 524,954 | 515,678 | **-1.8%** |
+| small, spread | 16 | 739,844 | 833,028 | 12.6% | 19,500 | 20,865 | **7.0%** |
+| full-frame, stacked | 16 | 4,861,500 | 4,936,892 | 1.6% | 100,834 | 101,999 | **1.2%** |
+| full-frame, stacked | 64 | 16,491,932 | 16,517,068 | 0.2% | 335,258 | 330,395 | **-1.5%** |
+| full-frame, stacked | 128 | 25,913,884 | 25,955,404 | 0.2% | 524,954 | 515,675 | **-1.8%** |
 
 A staged float is fetched once and read by each of the block's 256 threads.
 Hiding the fetch can save at most that fraction of the walk, whatever the scene.

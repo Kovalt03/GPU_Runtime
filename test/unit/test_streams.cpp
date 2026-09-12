@@ -512,3 +512,35 @@ TEST(Streams, AClusterTooBigForTheMachineIsRefused)
     rt.myrt_launch_async(constant_kernel(Program{make_ret()}), config, nullptr);
     EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
 }
+
+TEST(Streams, ClusterReadsRequireProducerCopyWaits)
+{
+    for (bool wait : {false, true}) {
+        MyGPURuntime rt = make_runtime();
+        SMConfig cfg;
+        cfg.sm_count = 2;
+        rt.myrt_set_sm_config(cfg);
+        void* input = rt.myrt_malloc(sizeof(float));
+        const float value = 7.0f;
+        rt.myrt_memcpy(input, &value, sizeof(value), Direction::HostToDevice);
+        Program p{
+            make_v_mov_f32(1, static_cast<float>(rt.myrt_device_offset(input))),
+            make_v_mov_f32(2, 0.0f),
+            make_v_cp_async_shared_global_f32(2, 1),
+        };
+        if (wait) {
+            p.push_back(make_s_cp_async_wait(0));
+        }
+        p.push_back(make_barrier_cluster());
+        p.push_back(make_v_ld_cluster_f32(4, 2, 2));
+        p.push_back(make_ret());
+        LaunchConfig cfg_launch{dim3{2, 1, 1}, dim3{32, 1, 1}};
+        cfg_launch.cluster_size = 2;
+        if (wait) {
+            EXPECT_NO_THROW(rt.myrt_launch(constant_kernel(p), cfg_launch, nullptr));
+        } else {
+            EXPECT_THROW(rt.myrt_launch(constant_kernel(p), cfg_launch, nullptr),
+                         std::runtime_error);
+        }
+    }
+}

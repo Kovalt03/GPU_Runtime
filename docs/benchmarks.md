@@ -98,3 +98,21 @@ on their own line, `int* ptr`.
 ---
 
 [← back to the README](../README.md)
+
+
+## Interpreting measurements
+
+Always record the commit, machine specification, warp policy, memory model,
+latency model and bandwidth model alongside a comparison. These metrics differ:
+
+- `warp_steps`: issued warp instructions, without opcode cost weighting.
+- `active_lane_ops`: participating lane instructions.
+- `weighted_lane_ops`: work weighted by the simulator's chosen opcode and memory costs.
+- `cycles`: simulated elapsed cycles under the selected scheduling/latency model.
+- Wall-clock seconds and GIOPS: host simulator throughput, not physical GPU speed.
+
+`divergence_rate` is `1 - active_lane_ops / (32 * warp_steps)` (zero for no work).
+It includes partially filled warps and retired lanes, not just branch divergence.
+A reduction in warp steps is not the same percentage reduction in cycles or
+host running time. Cost and latency constants are modelling assumptions, not
+calibrated measurements of a named GPU.

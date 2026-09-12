@@ -110,3 +110,11 @@ V_LD_SHARED_16X16_F32   연속 8 float → 연속 8 레지스터
 ---
 
 [← 이전 문서](./21_ser_and_clusters.md) · [구현 노트 목차](./README.md) · [다음 문서 →](./23_bandwidth.md)
+
+
+
+> Timing correction (2026-09-12): copies can complete out of issue order due to
+> cache hits. WAIT now covers the latest completion among all required copies.
+> At K=128 the wide-fragment route takes 71,570 cycles and the FP16 route 62,823,
+> reductions of 41.5% and 12.2% against their preceding routes. See the
+> [current generated table](../../test/benchmark/output/gemm.md).

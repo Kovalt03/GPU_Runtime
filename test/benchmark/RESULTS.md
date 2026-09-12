@@ -1400,8 +1400,8 @@ for the whole K loop, staging one A tile and four B tiles a step. Cycles.
 | K | fma, sync | mma, sync | change | mma, staged ahead | change | + wide fragments | change | + halves | change |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | 32 | 202,928 | 44,592 | **-78.0%** | 33,418 | **-25.1%** | 20,618 | **-38.3%** | 18,579 | -9.9% |
-| 64 | 402,478 | 85,806 | **-78.7%** | 63,070 | **-26.5%** | 37,470 | **-40.6%** | 33,171 | -11.5% |
-| 128 | 814,196 | 180,852 | **-77.8%** | 122,425 | **-32.3%** | 71,225 | **-41.8%** | 62,355 | **-12.5%** |
+| 64 | 402,478 | 85,806 | **-78.7%** | 63,070 | **-26.5%** | 37,815 | **-40.0%** | 33,639 | -11.0% |
+| 128 | 814,196 | 180,852 | **-77.8%** | 122,425 | **-32.3%** | 71,570 | **-41.5%** | 62,823 | **-12.2%** |
 
 Issued work at K = 128: 27,194,368, then 6,009,856, then 4,811,776 — and 4,811,776
 again, then 3,096,064. **The middle three are the same kernel**: a fragment is
@@ -1452,7 +1452,7 @@ width is saved where the inputs are and kept where the sum is. Two operand
 registers do the work of four, a tile in memory is half the bytes, and the
 multiply is priced at half.
 
-It is worth another 12.5%, and 36% of the issued work. Less than the price
+It is worth another 12.2%, and 36% of the issued work. Less than the price
 suggests, because by now the multiply is not what the loop is spending on — the
 same reason the matrix unit itself came in under its own instruction count.
 
@@ -1695,10 +1695,10 @@ copies before walking this one, so the fetch and the walk overlap.
 
 | Scene | triangles | sync issued | async issued | change | sync cycles | async cycles | change |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| small, spread | 16 | 739,844 | 833,028 | +12.6% | 19,500 | 19,976 | **+2.4%** |
-| full-frame, stacked | 16 | 4,861,500 | 4,936,892 | +1.6% | 100,834 | 100,359 | -0.5% |
-| full-frame, stacked | 64 | 16,491,932 | 16,517,068 | +0.2% | 335,258 | 330,398 | -1.4% |
-| full-frame, stacked | 128 | 25,913,884 | 25,955,404 | +0.2% | 524,954 | 515,678 | **-1.8%** |
+| small, spread | 16 | 739,844 | 833,028 | +12.6% | 19,500 | 20,865 | **+7.0%** |
+| full-frame, stacked | 16 | 4,861,500 | 4,936,892 | +1.6% | 100,834 | 101,999 | +1.2% |
+| full-frame, stacked | 64 | 16,491,932 | 16,517,068 | +0.2% | 335,258 | 330,395 | -1.5% |
+| full-frame, stacked | 128 | 25,913,884 | 25,955,404 | +0.2% | 524,954 | 515,675 | **-1.8%** |
 
 **Eighty-seven percent becomes two.** The frames are identical and the mechanism
 is the same one; what changed is what fraction of the kernel it applies to.
@@ -1818,3 +1818,10 @@ at 64x64 and 128x128. Möller-Trumbore and edge functions share no arithmetic, s
 agreement is evidence neither program can produce alone — the unit tests compare
 each kernel against a host reference written from the same conventions, and a
 sign wrong in both would pass.
+
+
+> Timing correction (2026-09-12): cp.async waits now use the latest completion
+> among all required copies, since cache hits can complete out of issue order.
+> GEMM and asynchronous-rendering tables were regenerated after this fix;
+> issued-work counts are unchanged. Earlier timing interpretations should be
+> read against the corrected tables in `test/benchmark/output/`.
