@@ -33,11 +33,12 @@ Warp make_warp(uint32_t lane_count)
                                  std::to_string(lane_count) + ")");
     }
 
-    // Default member initialisers already zero the threads, so only the mask is left.
-    // Note that Thread::active and the mask answer different questions:
-    // RET clears active for good, while the mask is recomputed every step.
     Warp warp;
     warp.active_mask = lane_mask(lane_count);
+    // The scheduler rebuilds the mask from live threads on every instruction.
+    for (uint32_t lane = lane_count; lane < WARP_SIZE; ++lane) {
+        warp.threads[lane].active = false;
+    }
     return warp;
 }
 

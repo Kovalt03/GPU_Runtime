@@ -2885,3 +2885,20 @@ TEST(Scheduler, ConsecutiveBarriersAllowWarpsAtTheSameInstruction)
         }
     }
 }
+
+TEST(Scheduler, PartialWarpExecutesOnlyRequestedLanes)
+{
+    for (uint32_t count : {0u, 1u, 31u, 32u}) {
+        SCOPED_TRACE(count);
+        Fixture f;
+        f.warp() = make_warp(count);
+        // An extra lane changes memory, even if all lanes use the same address.
+        for (Thread& t : f.warp().threads) {
+            t.regs[0] = 0.0f;
+            t.regs[1] = 1.0f;
+        }
+        f.run(Program{make_v_atom_add_global_f32(2, 0, 1), make_ret()});
+        EXPECT_FLOAT_EQ(f.peek(0), static_cast<float>(count));
+        EXPECT_EQ(f.sched.stats().active_lane_ops, 2u * count);
+    }
+}

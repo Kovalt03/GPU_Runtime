@@ -124,9 +124,9 @@ TEST(Thread, MakeWarpEnablesRequestedLanes)
     EXPECT_EQ(partial.active_mask, 0x000000FFu);
     EXPECT_EQ(active_lane_count(partial), 8u);
 
-    // A partially filled warp still owns all 32 thread slots; only the mask
-    // says which of them run. This is what a tail warp looks like when the
-    // launch size is not a multiple of 32.
+    // A partially filled warp still owns all 32 thread slots; inactive threads
+    // remain disabled when the scheduler rebuilds the mask. This is what a tail warp
+    // looks like when the launch size is not a multiple of 32.
     EXPECT_EQ(partial.threads.size(), WARP_SIZE);
 }
 
