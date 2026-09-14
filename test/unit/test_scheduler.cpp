@@ -2921,3 +2921,68 @@ TEST(Scheduler, GlobalLoadRejectsUnrepresentableAddress)
                                make_v_ld_global_f32(1, 0), make_ret()}),
                  std::runtime_error);
 }
+
+TEST(Scheduler, AsyncWaitRejectsUnrepresentableFactoryCount)
+{
+    Fixture f;
+    EXPECT_THROW(f.run(Program{make_s_cp_async_wait(UINT32_MAX), make_ret()}),
+                 std::runtime_error);
+}
+
+TEST(Scheduler, AsyncWaitRejectsNegativeCount)
+{
+    Fixture f;
+    Instruction wait = make_s_cp_async_wait(0);
+    wait.imm = -1.0f;
+    EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}
+
+TEST(Scheduler, AsyncWaitRejectsInfiniteCount)
+{
+    Fixture f;
+    Instruction wait = make_s_cp_async_wait(0);
+    wait.imm = std::numeric_limits<float>::infinity();
+    EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}
+
+TEST(Scheduler, AsyncWaitRejectsNaNCount)
+{
+    Fixture f;
+    Instruction wait = make_s_cp_async_wait(0);
+    wait.imm = std::numeric_limits<float>::quiet_NaN();
+    EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}
+
+TEST(Scheduler, AsyncWaitRejectsFractionalCount)
+{
+    Fixture f;
+    Instruction wait = make_s_cp_async_wait(0);
+    wait.imm = 0.5f;
+    EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}
+
+TEST(Scheduler, AsyncWaitAcceptsValidCountsWithoutPendingCopies)
+{
+    for (uint32_t count : {0u, 1u, static_cast<uint32_t>(CP_ASYNC_QUEUE_DEPTH)}) {
+        Fixture f;
+        EXPECT_NO_THROW(f.run(Program{make_s_cp_async_wait(count), make_ret()}));
+        EXPECT_EQ(f.sched.stats().active_lane_ops, 2u * WARP_SIZE);
+    }
+}
+
+TEST(Scheduler, AsyncWaitFactoryRejectsLossOfIntegerPrecision)
+{
+    EXPECT_THROW(make_s_cp_async_wait(16777217u), std::runtime_error);
+    for (uint32_t count : {16777216u, 16777218u, 4294967040u}) {
+        Fixture f;
+        EXPECT_NO_THROW(f.run(Program{make_s_cp_async_wait(count), make_ret()}));
+    }
+}
+
+TEST(Scheduler, AsyncWaitRejectsRawCountAboveUint32Range)
+{
+    Fixture f;
+    Instruction wait = make_s_cp_async_wait(0);
+    wait.imm = 4294967296.0f;
+    EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}

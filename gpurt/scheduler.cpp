@@ -1120,7 +1120,12 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
     if (program[warp.pc].op == Opcode::S_CP_ASYNC_WAIT) {
         // How many copies may still be in flight when the warp goes on. The
         // landed ones are already gone, so what is left is genuinely in flight.
-        const auto allowed = static_cast<uint32_t>(program[warp.pc].imm);
+        const float count = program[warp.pc].imm;
+        if (!std::isfinite(count) || count < 0.0f || count != std::floor(count) ||
+            count >= std::ldexp(1.0f, std::numeric_limits<uint32_t>::digits)) {
+            throw std::runtime_error("S_CP_ASYNC_WAIT: count must be a uint32_t integer");
+        }
+        const auto allowed = static_cast<uint32_t>(count);
 
         if (warp.copies_in_flight > allowed) {
             // Cache hits can finish after issue in a different order. Wait for

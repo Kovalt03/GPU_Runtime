@@ -317,6 +317,7 @@ Instruction make_v_cp_async_shared_global_f32(uint8_t shared_addr_reg,
 // Spelled at every call site for the reason make_s_syncwarp's participants is:
 // the useful values are 0 and 1, and which one a kernel means is the whole
 // difference between waiting for everything and keeping one load ahead.
+// Throws if outstanding cannot be represented exactly in the float immediate.
 Instruction make_s_cp_async_wait(uint32_t outstanding);
 
 // CONTROL FLOW

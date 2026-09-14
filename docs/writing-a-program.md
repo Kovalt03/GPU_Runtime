@@ -81,6 +81,14 @@ the colour is blended away, and the tracer shades once per candidate triangle.
 Writing `out` is safe; a store or an atomic in a shader fires for candidates the
 frame never shows.
 
+## Asynchronous wait counts
+
+`make_s_cp_async_wait` rejects counts that cannot be represented exactly by the
+ISA's float immediate. The scheduler also checks directly constructed WAIT
+instructions for a finite, non-negative integer below 2^32 before conversion.
+Counts at or above the copy queue depth require no waiting; they remain valid
+when exactly encodable.
+
 ---
 
 [← back to the README](../README.md)

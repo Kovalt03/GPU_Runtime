@@ -295,7 +295,11 @@ Instruction make_s_syncwarp(uint32_t participants)
 // there is no set of participants to name.
 Instruction make_s_cp_async_wait(uint32_t outstanding)
 {
-    return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, static_cast<float>(outstanding)};
+    const float encoded = static_cast<float>(outstanding);
+    if (static_cast<double>(encoded) != static_cast<double>(outstanding)) {
+        throw std::runtime_error("S_CP_ASYNC_WAIT: count is not exactly encodable");
+    }
+    return {Opcode::S_CP_ASYNC_WAIT, 0, 0, 0, encoded};
 }
 
 Instruction make_v_ld_const_f32(uint8_t dst, uint8_t addr_reg, float offset)
