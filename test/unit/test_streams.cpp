@@ -691,3 +691,60 @@ TEST(Streams, ABlockBarrierDoesNotReleaseAClusterBarrier)
     EXPECT_FLOAT_EQ(back[1], 7.0f);
     rt.myrt_free(out);
 }
+
+TEST(Streams, ConsecutiveClusterBarriersDoNotDropTheNextCluster)
+{
+    auto rt = make_runtime();
+    rt.myrt_set_sm_config(two_sms());
+    void* out = rt.myrt_malloc(4 * sizeof(float));
+    const std::vector<float> zeros(4, 0.0f);
+    rt.myrt_memcpy(out, zeros.data(), 4 * sizeof(float), Direction::HostToDevice);
+    Program p = increment_kernel(rt.myrt_device_offset(out));
+    p.insert(p.end() - 1, {make_barrier_cluster(), make_barrier_cluster()});
+    LaunchConfig config{dim3{4, 1, 1}, dim3{1, 1, 1}};
+    config.cluster_size = 2;
+    ASSERT_NO_THROW(rt.myrt_launch(constant_kernel(p), config, nullptr));
+    // Both clusters must retire before the synchronous launch returns.
+    EXPECT_EQ(read_back(rt, out, 4), (std::vector<float>{1, 1, 1, 1}));
+}
+
+TEST(Streams, ClusterRetirementPreservesLaterWorkInTheStream)
+{
+    for (uint32_t width : {1u, 33u}) {
+        for (uint32_t blocks : {4u, 6u}) {
+            for (uint32_t barriers : {1u, 2u, 3u, 4u}) {
+                for (auto policy : {WarpPolicy::LowestPc, WarpPolicy::Independent}) {
+                    for (auto latency : {LatencyModel::Ignored, LatencyModel::Modelled}) {
+                        SCOPED_TRACE(width);
+                        SCOPED_TRACE(blocks);
+                        SCOPED_TRACE(barriers);
+                        SCOPED_TRACE(static_cast<int>(policy));
+                        SCOPED_TRACE(static_cast<int>(latency));
+                        auto rt = make_runtime();
+                        rt.myrt_set_sm_config(two_sms());
+                        rt.myrt_set_warp_policy(policy);
+                        rt.myrt_set_latency_model(latency);
+                        const size_t count = width * blocks;
+                        void* out = rt.myrt_malloc(count * sizeof(float));
+                        const std::vector<float> zeros(count, 0.0f);
+                        rt.myrt_memcpy(out, zeros.data(), count * sizeof(float),
+                                       Direction::HostToDevice);
+                        const Program increment =
+                            increment_kernel(rt.myrt_device_offset(out));
+                        Program clustered = increment;
+                        clustered.insert(clustered.end() - 1, barriers,
+                                         make_barrier_cluster());
+                        LaunchConfig config{dim3{blocks, 1, 1}, dim3{width, 1, 1}};
+                        config.cluster_size = 2;
+                        rt.myrt_launch_async(constant_kernel(clustered), config, nullptr);
+                        config.cluster_size = 1;
+                        rt.myrt_launch_async(constant_kernel(increment), config, nullptr);
+                        ASSERT_NO_THROW(rt.myrt_wait());
+                        EXPECT_EQ(read_back(rt, out, count),
+                                  std::vector<float>(count, 2.0f));
+                    }
+                }
+            }
+        }
+    }
+}

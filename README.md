@@ -242,7 +242,7 @@ on their own line, `int* ptr`.
 | Shared-memory staging's occupancy | **pinned at one block an SM** — it declares the whole scratchpad |
 | A wide load for the ray tracer's vertices | **-25%** transactions, **-49%** cycles |
 | Opcodes | 45 |
-| Tests | 445 |
+| Tests | 447 |
 
 ### What divergence costs
 

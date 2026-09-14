@@ -2178,6 +2178,7 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         uint64_t soonest = UINT64_MAX;
         bool anything_resident = false;
         bool released_any = false;
+        bool retired_any = false;
         loaded_any = false;
         if (charging) {
             std::fill(cycle_resident.begin(), cycle_resident.end(), uint8_t{0});
@@ -2197,6 +2198,11 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                     continue;
                 }
                 anything_resident = true;
+                // Finished cluster members retain storage until their peers
+                // retire, but their cleared live mask must not be indexed.
+                if (slot.finished()) {
+                    continue;
+                }
 
                 const size_t warps = slot.block->warps.size();
                 for (size_t w = 0; w < warps; ++w) {
@@ -2337,6 +2343,7 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                 unit.warps_resident -= static_cast<uint32_t>(slot.block->warps.size());
                 unit.shared_resident -= launches[slot.launch].shared_bytes;
                 --pending[slot.launch].resident;
+                retired_any = true;
                 slot.block->cluster = nullptr;
                 last_block_ = std::move(slot.block);
                 slot.live.clear();
@@ -2396,10 +2403,10 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
             continue;
         }
 
-        // Nobody issued and nobody is waiting on a result. A barrier opening or a
-        // slot taking the next block are the only things that can have changed,
-        // and if neither did, no later cycle will differ from this one.
-        if (!released_any && !loaded_any) {
+        // Retiring the last cluster member can make a finished peer on an
+        // already visited SM reclaimable. Another sweep must release that slot
+        // before deciding whether the next cluster can be admitted.
+        if (!released_any && !loaded_any && !retired_any) {
             break;
         }
 
