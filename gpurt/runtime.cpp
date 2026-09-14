@@ -1,8 +1,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 
 // thread.hpp for ThreadBlock/Thread/WARP_SIZE/make_block, which runtime.hpp
 // itself does not need.
@@ -124,7 +126,8 @@ void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
 
 dim3 MyGPURuntime::read_grid(size_t offset) const
 {
-    if (offset % sizeof(float) != 0 || offset + 3 * sizeof(float) > mem_->device_size()) {
+    if (offset % sizeof(float) != 0 || offset > mem_->device_size() ||
+        mem_->device_size() - offset < 3 * sizeof(float)) {
         throw std::runtime_error(
             "myrt_launch_indirect: the grid must be three aligned floats inside "
             "device memory");
@@ -134,10 +137,18 @@ dim3 MyGPURuntime::read_grid(size_t offset) const
     // The same decoder the ISA's addresses go through, so that a grid written by
     // a kernel is read under the rule the kernel wrote it under. A dimension is
     // one number and cannot be half of one.
+    const auto dimension = [](float value, const char* name) {
+        const size_t decoded = decode_address(value, name);
+        if (decoded > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error(std::string(name) +
+                                     ": dimension exceeds uint32_t range");
+        }
+        return static_cast<uint32_t>(decoded);
+    };
     dim3 grid;
-    grid.x = static_cast<uint32_t>(decode_address(p[0], "indirect grid x"));
-    grid.y = static_cast<uint32_t>(decode_address(p[1], "indirect grid y"));
-    grid.z = static_cast<uint32_t>(decode_address(p[2], "indirect grid z"));
+    grid.x = dimension(p[0], "indirect grid x");
+    grid.y = dimension(p[1], "indirect grid y");
+    grid.z = dimension(p[2], "indirect grid z");
     return grid;
 }
 
@@ -254,7 +265,8 @@ void MyGPURuntime::drain()
                     launch.grid = read_grid(launch.grid_offset);
                 }
                 cursor.blocks = launch.grid.volume();
-                cursor.warps = (launch.block.volume() + WARP_SIZE - 1) / WARP_SIZE;
+                const uint32_t threads = launch.block.volume();
+                cursor.warps = threads / WARP_SIZE + (threads % WARP_SIZE != 0);
                 cursor.resolved = true;
             }
             if (cursor.next >= cursor.blocks) {

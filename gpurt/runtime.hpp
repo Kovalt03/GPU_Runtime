@@ -3,7 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #include "isa.hpp"        // Program, for KernelFunc
@@ -18,6 +20,13 @@ struct dim3 {
 
     uint32_t volume() const
     {
+        if (x == 0 || y == 0 || z == 0) {
+            return 0;
+        }
+        constexpr uint32_t max = std::numeric_limits<uint32_t>::max();
+        if (x > max / y || x * y > max / z) {
+            throw std::runtime_error("dim3: volume exceeds uint32_t range");
+        }
         return x * y * z;
     }
 };
@@ -155,8 +164,8 @@ public:
     // --- execution ----------------------------------------------------------
     // Runs kernel(args) over grid x block threads. Execution is synchronous:
     // the call returns once every thread has retired. Throws
-    // std::runtime_error if the launch geometry is empty or if a block holds
-    // more threads than the simulator will place in one ThreadBlock.
+    // std::runtime_error if the launch geometry is empty or its grid/block volume
+    // exceeds the uint32_t indexing range.
     void myrt_launch(KernelFunc kernel, dim3 grid, dim3 block, void** args);
 
     // The same, with what else a launch declares about itself. Kept apart from

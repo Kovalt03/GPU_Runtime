@@ -1,5 +1,6 @@
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -14,7 +15,11 @@ size_t align_up(size_t size, size_t alignment)
     if (size % alignment == 0) {
         return size;
     }
-    return size - size % alignment + alignment;
+    const size_t padding = alignment - size % alignment;
+    if (size > std::numeric_limits<size_t>::max() - padding) {
+        throw std::runtime_error("alloc: aligned size exceeds size_t range");
+    }
+    return size + padding;
 }
 
 }  // namespace

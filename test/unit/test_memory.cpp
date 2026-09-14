@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -299,4 +300,26 @@ TEST(Memory, DeviceOffsetRejectsAHostPointer)
 
     EXPECT_THROW(mm.device_offset(host.data()), std::runtime_error);
     EXPECT_THROW(mm.device_offset(mm.host_alloc(16)), std::runtime_error);
+}
+
+TEST(Memory, OversizedAllocationsPreserveArena)
+{
+    for (bool host : {false, true}) {
+        for (size_t bytes : {SIZE_MAX, SIZE_MAX - 1, SIZE_MAX - 15, DEVICE_SIZE + 1}) {
+            SCOPED_TRACE(bytes);
+            MemoryManager mem = make_manager();
+            auto alloc = [&](size_t n) {
+                return host ? mem.host_alloc(n) : mem.device_alloc(n);
+            };
+            EXPECT_THROW(alloc(bytes), std::runtime_error);
+            EXPECT_EQ(host ? mem.host_free_bytes() : mem.device_free_bytes(),
+                      DEVICE_SIZE);
+            void* a = alloc(16);
+            void* b = alloc(16);
+            EXPECT_NE(a, b);
+        }
+        MemoryManager mem = make_manager();
+        EXPECT_NO_THROW(host ? mem.host_alloc(HOST_SIZE) : mem.device_alloc(DEVICE_SIZE));
+        EXPECT_EQ(host ? mem.host_free_bytes() : mem.device_free_bytes(), 0u);
+    }
 }

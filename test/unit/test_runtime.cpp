@@ -1,5 +1,7 @@
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -395,4 +397,100 @@ TEST(Runtime, LaunchSeedsBlockCoordinates)
     rt.myrt_memcpy(got.data(), out, 4 * sizeof(float), Direction::DeviceToHost);
     EXPECT_FLOAT_EQ(got[0], 0.0f) << "block (0, 0)";
     EXPECT_FLOAT_EQ(got[1], 1.0f) << "block (1, 0)";
+}
+
+TEST(Runtime, GeometryVolumeChecksOverflowAndZero)
+{
+    const uint32_t max = UINT32_MAX;
+    for (dim3 shape : {dim3{max, max, 1}, dim3{65536, 65536, 1}, dim3{65536, 1, 65536},
+                       dim3{2048, 2048, 2048}}) {
+        EXPECT_THROW(shape.volume(), std::runtime_error);
+    }
+    EXPECT_EQ((dim3{max, 1, 1}.volume()), max);
+    EXPECT_EQ((dim3{max, max, 0}.volume()), 0u);
+    EXPECT_EQ((dim3{8, 4, 2}.volume()), 64u);
+}
+
+TEST(Runtime, OverflowingLaunchIsRejectedBeforeBuildingKernel)
+{
+    for (bool grid : {false, true}) {
+        auto rt = make_runtime();
+        LaunchConfig cfg;
+        (grid ? cfg.grid : cfg.block) = dim3{UINT32_MAX, UINT32_MAX, 1};
+        bool built = false;
+        EXPECT_THROW(rt.myrt_launch_async(
+                         [&](void**) {
+                             built = true;
+                             return Program{make_ret()};
+                         },
+                         cfg, nullptr),
+                     std::runtime_error);
+        EXPECT_FALSE(built);
+    }
+    auto rt = make_runtime();
+    IndirectLaunchConfig cfg;
+    cfg.block = dim3{UINT32_MAX, UINT32_MAX, 1};
+    EXPECT_THROW(rt.myrt_launch_indirect(constant_kernel({make_ret()}), cfg, nullptr),
+                 std::runtime_error);
+}
+
+TEST(Runtime, IndirectGridOffsetCannotWrapBoundsCheck)
+{
+    for (size_t offset : {SIZE_MAX - 3, SIZE_MAX - 7, TEST_DEVICE_BYTES,
+                          TEST_DEVICE_BYTES - 8, size_t{1}}) {
+        auto rt = make_runtime();
+        IndirectLaunchConfig cfg;
+        cfg.grid_offset = offset;
+        try {
+            rt.myrt_launch_indirect(constant_kernel({make_ret()}), cfg, nullptr);
+            rt.myrt_wait();
+            FAIL() << "accepted invalid grid offset " << offset;
+        } catch (const std::runtime_error& e) {
+            EXPECT_NE(std::string(e.what()).find("three aligned floats"),
+                      std::string::npos);
+        }
+    }
+}
+
+TEST(Runtime, IndirectGridChecksDimensionRangeAndProduct)
+{
+    for (float large : {4294967296.0f, std::numeric_limits<float>::max()}) {
+        for (int axis = 0; axis < 3; ++axis) {
+            auto rt = make_runtime();
+            float dims[] = {1, 1, 1};
+            dims[axis] = large;
+            void* p = rt.myrt_malloc(sizeof(dims));
+            rt.myrt_memcpy(p, dims, sizeof(dims), Direction::HostToDevice);
+            IndirectLaunchConfig cfg;
+            cfg.grid_offset = rt.myrt_device_offset(p);
+            rt.myrt_launch_indirect(constant_kernel({make_ret()}), cfg, nullptr);
+            EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+        }
+    }
+    auto rt = make_runtime();
+    float dims[] = {65536, 65536, 1};
+    void* p = rt.myrt_malloc(sizeof(dims));
+    rt.myrt_memcpy(p, dims, sizeof(dims), Direction::HostToDevice);
+    rt.myrt_launch_indirect(constant_kernel({make_ret()}), IndirectLaunchConfig{},
+                            nullptr);
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+}
+
+TEST(Runtime, IndirectGridAtArenaEndAndEmptyGridRemainValid)
+{
+    for (bool empty : {false, true}) {
+        auto rt = make_runtime();
+        std::vector<float> data(TEST_DEVICE_BYTES / sizeof(float), 0.0f);
+        const size_t end = data.size();
+        data[end - 3] = empty ? 0.0f : 1.0f;
+        data[end - 2] = empty ? std::nextafter(4294967296.0f, 0.0f) : 1.0f;
+        data[end - 1] = 1.0f;
+        void* p = rt.myrt_malloc(TEST_DEVICE_BYTES);
+        rt.myrt_memcpy(p, data.data(), TEST_DEVICE_BYTES, Direction::HostToDevice);
+        IndirectLaunchConfig cfg;
+        cfg.grid_offset = TEST_DEVICE_BYTES - 3 * sizeof(float);
+        rt.myrt_launch_indirect(constant_kernel({make_ret()}), cfg, nullptr);
+        EXPECT_NO_THROW(rt.myrt_wait());
+        EXPECT_EQ(rt.stats().active_lane_ops, empty ? 0u : 1u);
+    }
 }

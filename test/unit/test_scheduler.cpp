@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -2901,4 +2902,22 @@ TEST(Scheduler, PartialWarpExecutesOnlyRequestedLanes)
         EXPECT_FLOAT_EQ(f.peek(0), static_cast<float>(count));
         EXPECT_EQ(f.sched.stats().active_lane_ops, 2u * count);
     }
+}
+
+TEST(Scheduler, AddressDecoderRejectsUnrepresentableIntegers)
+{
+    const float upper = std::ldexp(1.0f, std::numeric_limits<size_t>::digits);
+    EXPECT_THROW(decode_address(upper, "test"), std::runtime_error);
+    EXPECT_THROW(decode_address(std::numeric_limits<float>::max(), "test"),
+                 std::runtime_error);
+    const float below = std::nextafter(upper, 0.0f);
+    EXPECT_EQ(decode_address(below, "test"), static_cast<size_t>(below));
+}
+
+TEST(Scheduler, GlobalLoadRejectsUnrepresentableAddress)
+{
+    Fixture f;
+    EXPECT_THROW(f.run(Program{make_v_mov_f32(0, std::numeric_limits<float>::max()),
+                               make_v_ld_global_f32(1, 0), make_ret()}),
+                 std::runtime_error);
 }

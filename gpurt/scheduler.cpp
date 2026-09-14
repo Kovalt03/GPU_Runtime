@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <sys/types.h>
@@ -122,6 +123,11 @@ size_t decode_address(float value, const char* what)
     if (value != std::floor(value)) {
         throw std::runtime_error(std::string(what) + ": address " +
                                  std::to_string(value) + " is not a whole number");
+    }
+    // SIZE_MAX rounded to float can become 2^N, which is already out of range.
+    const float upper = std::ldexp(1.0f, std::numeric_limits<size_t>::digits);
+    if (value >= upper) {
+        throw std::runtime_error(std::string(what) + ": address exceeds size_t range");
     }
     return static_cast<size_t>(value);
 }
