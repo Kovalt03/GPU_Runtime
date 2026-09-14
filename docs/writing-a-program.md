@@ -81,7 +81,26 @@ the colour is blended away, and the tracer shades once per candidate triangle.
 Writing `out` is safe; a store or an atomic in a shader fires for candidates the
 frame never shows.
 
-## Asynchronous wait counts
+## Handling execution errors
+
+Errors detected while submitting a launch reject that request and preserve
+previously queued work. This includes invalid geometry, an unknown stream,
+an invalid indirect-grid address, and exceptions from the kernel builder.
+The indirect-grid address is checked at submission; its contents are read only
+when the launch reaches the scheduler, since an earlier kernel may produce them.
+
+An exception from scheduler dispatch permanently disables execution on that
+runtime. The whole pending batch is discarded, and subsequent launch, wait and
+sync calls rethrow the original exception before running work or building a new
+kernel. This includes deferred indirect-grid errors and scheduler admission
+failures: the simulator conservatively treats dispatch as the failure boundary.
+It does not implement CUDA's full error classification or recovery semantics.
+
+Memory operations remain available for diagnosis. Writes made before the failure
+remain visible; there is no rollback or automatic replay. Construct a fresh
+runtime and prepare its data to execute again. Statistics retain only successful
+prior drains and exclude the entire failed batch, even if an earlier launch in
+that batch had completed.
 
 `make_s_cp_async_wait` rejects counts that cannot be represented exactly by the
 ISA's float immediate. The scheduler also checks directly constructed WAIT

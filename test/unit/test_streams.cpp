@@ -416,8 +416,10 @@ TEST(Streams, AnIndirectGridMustLieInDeviceMemory)
     IndirectLaunchConfig config;
     config.grid_offset = TEST_DEVICE_BYTES - sizeof(float);
     config.block = dim3{32, 1, 1};
-    rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr);
-    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+    EXPECT_THROW(
+        rt.myrt_launch_indirect(constant_kernel(store_kernel(0, 1.0f)), config, nullptr),
+        std::runtime_error);
+    EXPECT_NO_THROW(rt.myrt_wait());
 }
 
 // ---------------------------------------------------------------------------

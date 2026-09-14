@@ -494,3 +494,146 @@ TEST(Runtime, IndirectGridAtArenaEndAndEmptyGridRemainValid)
         EXPECT_EQ(rt.stats().active_lane_ops, empty ? 0u : 1u);
     }
 }
+
+TEST(Runtime, ExecutionFailureDoesNotReplayMemoryWrites)
+{
+    // Recovery may reject further work or discard failed work. Neither policy
+    // permits a later call to replay writes that have already happened.
+    for (bool separate_launches : {false, true}) {
+        for (int followup = 0; followup < 3; ++followup) {
+            SCOPED_TRACE(separate_launches);
+            SCOPED_TRACE(followup);
+            auto rt = make_runtime();
+            void* counter = rt.myrt_malloc(sizeof(float));
+            float value = 0.0f;
+            rt.myrt_memcpy(counter, &value, sizeof(value), Direction::HostToDevice);
+            Program increment{make_v_mov_f32(0, float(rt.myrt_device_offset(counter))),
+                              make_v_mov_f32(1, 1.0f),
+                              make_v_atom_add_global_f32(2, 0, 1)};
+            Program invalid{make_v_mov_f32(0, float(TEST_DEVICE_BYTES)),
+                            make_v_ld_global_f32(1, 0), make_ret()};
+            if (separate_launches) {
+                increment.push_back(make_ret());
+                rt.myrt_launch_async(constant_kernel(increment), LaunchConfig{}, nullptr);
+            } else {
+                invalid.insert(invalid.begin(), increment.begin(), increment.end());
+            }
+            rt.myrt_launch_async(constant_kernel(invalid), LaunchConfig{}, nullptr);
+            EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+            rt.myrt_memcpy(&value, counter, sizeof(value), Direction::DeviceToHost);
+            ASSERT_FLOAT_EQ(value, 1.0f);
+
+            try {
+                if (followup == 0) {
+                    rt.myrt_wait();
+                } else if (followup == 1) {
+                    rt.myrt_sync(false);
+                } else {
+                    rt.myrt_launch(constant_kernel({make_ret()}), dim3{}, dim3{},
+                                   nullptr);
+                }
+            } catch (const std::runtime_error&) {
+                // A persistent error state is allowed; duplicated writes are not.
+            }
+            rt.myrt_memcpy(&value, counter, sizeof(value), Direction::DeviceToHost);
+            EXPECT_FLOAT_EQ(value, 1.0f) << "previous memory effect was replayed";
+        }
+    }
+}
+
+TEST(Runtime, SubmissionErrorsPreserveQueuedWorkAndAllowLaterLaunches)
+{
+    auto rt = make_runtime();
+    const auto ret = constant_kernel({make_ret()});
+    rt.myrt_launch_async(ret, LaunchConfig{}, nullptr);
+    LaunchConfig empty;
+    empty.grid.x = 0;
+    EXPECT_THROW(rt.myrt_launch_async(ret, empty, nullptr), std::runtime_error);
+    EXPECT_THROW(rt.myrt_launch_async(ret, LaunchConfig{}, nullptr, UINT32_MAX),
+                 std::runtime_error);
+    EXPECT_THROW(rt.myrt_launch_async(
+                     [](void**) -> Program {
+                         throw std::runtime_error("kernel construction failed");
+                     },
+                     LaunchConfig{}, nullptr),
+                 std::runtime_error);
+    IndirectLaunchConfig indirect;
+    indirect.grid_offset = SIZE_MAX - 3;
+    EXPECT_THROW(rt.myrt_launch_indirect(ret, indirect, nullptr), std::runtime_error);
+    EXPECT_THROW(rt.myrt_malloc(SIZE_MAX), std::runtime_error);
+    EXPECT_NO_THROW(rt.myrt_wait());
+    EXPECT_EQ(rt.stats().active_lane_ops, 1u);
+    EXPECT_NO_THROW(rt.myrt_launch(ret, dim3{}, dim3{}, nullptr));
+    EXPECT_EQ(rt.stats().active_lane_ops, 2u);
+}
+
+TEST(Runtime, ExecutionFailurePersistsBeforeBuildingAnyNewKernel)
+{
+    auto rt = make_runtime();
+    rt.myrt_launch(constant_kernel({make_ret()}), dim3{}, dim3{}, nullptr);
+    const uint64_t completed = rt.stats().active_lane_ops;
+    std::string original;
+    try {
+        rt.myrt_launch(constant_kernel({make_v_mov_f32(0, float(TEST_DEVICE_BYTES)),
+                                        make_v_ld_global_f32(1, 0), make_ret()}),
+                       dim3{}, dim3{}, nullptr);
+        FAIL() << "invalid access should fail";
+    } catch (const std::runtime_error& e) {
+        original = e.what();
+    }
+    auto same_error = [&](auto action) {
+        try {
+            action();
+            FAIL() << "failed runtime accepted execution";
+        } catch (const std::runtime_error& e) {
+            EXPECT_EQ(e.what(), original);
+        }
+    };
+    bool built = false;
+    KernelFunc kernel = [&](void**) {
+        built = true;
+        return Program{make_ret()};
+    };
+    same_error([&] { rt.myrt_wait(); });
+    same_error([&] { rt.myrt_sync(false); });
+    same_error([&] { rt.myrt_launch(kernel, dim3{}, dim3{}, nullptr); });
+    same_error([&] { rt.myrt_launch_async(kernel, LaunchConfig{}, nullptr); });
+    same_error([&] { rt.myrt_launch_indirect(kernel, IndirectLaunchConfig{}, nullptr); });
+    EXPECT_FALSE(built);
+    EXPECT_EQ(rt.stats().active_lane_ops, completed);
+    EXPECT_EQ(rt.myrt_stream_stats(DEFAULT_STREAM).active_lane_ops, completed);
+    auto fresh = make_runtime();
+    EXPECT_NO_THROW(
+        fresh.myrt_launch(constant_kernel({make_ret()}), dim3{}, dim3{}, nullptr));
+}
+
+TEST(Runtime, DeferredGridFailureBlocksEveryStream)
+{
+    auto rt = make_runtime();
+    const StreamId other = rt.myrt_stream_create();
+    void* p = rt.myrt_malloc(3 * sizeof(float));
+    float dims[] = {1, 1, 1};
+    rt.myrt_memcpy(p, dims, sizeof(dims), Direction::HostToDevice);
+    // The grid is valid at submission. Its producer makes it invalid at execution.
+    const float offset = float(rt.myrt_device_offset(p));
+    rt.myrt_launch_async(
+        constant_kernel({make_v_mov_f32(0, offset), make_v_mov_f32(1, -1.0f),
+                         make_v_st_global_f32(0, 1), make_ret()}),
+        LaunchConfig{}, nullptr);
+    IndirectLaunchConfig cfg;
+    cfg.grid_offset = rt.myrt_device_offset(p);
+    EXPECT_NO_THROW(rt.myrt_launch_indirect(constant_kernel({make_ret()}), cfg, nullptr));
+    EXPECT_THROW(rt.myrt_wait(), std::runtime_error);
+    rt.myrt_memcpy(dims, p, sizeof(dims), Direction::DeviceToHost);
+    EXPECT_FLOAT_EQ(dims[0], -1.0f);
+    EXPECT_EQ(rt.stats().active_lane_ops, 0u) << "failed batch is excluded from totals";
+    bool built = false;
+    EXPECT_THROW(rt.myrt_launch_async(
+                     [&](void**) {
+                         built = true;
+                         return Program{make_ret()};
+                     },
+                     LaunchConfig{}, nullptr, other),
+                 std::runtime_error);
+    EXPECT_FALSE(built);
+}

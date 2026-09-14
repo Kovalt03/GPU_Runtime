@@ -124,7 +124,7 @@ void MyGPURuntime::seed_block(ThreadBlock& tb, const QueuedLaunch& launch,
     }
 }
 
-dim3 MyGPURuntime::read_grid(size_t offset) const
+void MyGPURuntime::require_grid_offset(size_t offset) const
 {
     if (offset % sizeof(float) != 0 || offset > mem_->device_size() ||
         mem_->device_size() - offset < 3 * sizeof(float)) {
@@ -132,6 +132,11 @@ dim3 MyGPURuntime::read_grid(size_t offset) const
             "myrt_launch_indirect: the grid must be three aligned floats inside "
             "device memory");
     }
+}
+
+dim3 MyGPURuntime::read_grid(size_t offset) const
+{
+    require_grid_offset(offset);
     const float* p = reinterpret_cast<const float*>(mem_->device_base() + offset);
 
     // The same decoder the ISA's addresses go through, so that a grid written by
@@ -165,6 +170,8 @@ void MyGPURuntime::myrt_launch(KernelFunc kernel, const LaunchConfig& config, vo
 void MyGPURuntime::myrt_launch_async(KernelFunc kernel, const LaunchConfig& config,
                                      void** args, StreamId stream)
 {
+    rethrow_if_failed();
+    require_stream(stream);
     if (config.grid.volume() == 0 || config.block.volume() == 0) {
         throw std::runtime_error("myrt_launch: grid and block must both be non-empty");
     }
@@ -187,6 +194,9 @@ void MyGPURuntime::myrt_launch_indirect(KernelFunc kernel,
                                         const IndirectLaunchConfig& config, void** args,
                                         StreamId stream)
 {
+    rethrow_if_failed();
+    require_stream(stream);
+    require_grid_offset(config.grid_offset);
     if (config.block.volume() == 0) {
         throw std::runtime_error("myrt_launch_indirect: block must be non-empty");
     }
@@ -201,11 +211,23 @@ void MyGPURuntime::myrt_launch_indirect(KernelFunc kernel,
     enqueue(std::move(launch));
 }
 
-void MyGPURuntime::enqueue(QueuedLaunch launch)
+void MyGPURuntime::rethrow_if_failed() const
 {
-    if (launch.stream >= stream_stats_.size()) {
+    if (failure_) {
+        std::rethrow_exception(failure_);
+    }
+}
+
+void MyGPURuntime::require_stream(StreamId stream) const
+{
+    if (stream >= stream_stats_.size()) {
         throw std::runtime_error("myrt_launch: no such stream");
     }
+}
+
+void MyGPURuntime::enqueue(QueuedLaunch launch)
+{
+    rethrow_if_failed();
     queue_.push_back(std::move(launch));
 }
 
@@ -230,6 +252,7 @@ const SchedulerStats& MyGPURuntime::myrt_stream_stats(StreamId stream) const
 
 void MyGPURuntime::drain()
 {
+    rethrow_if_failed();
     if (queue_.empty()) {
         return;
     }
@@ -290,9 +313,17 @@ void MyGPURuntime::drain()
     // steady_clock, not high_resolution_clock, which is permitted to be
     // non-monotonic and could yield a negative interval.
     const auto t0 = std::chrono::steady_clock::now();
-    scheduler_->run_streams(launches,
-                            DeviceSpan{mem_->device_base(), mem_->device_size()},
-                            split ? &per_launch : nullptr);
+    try {
+        scheduler_->run_streams(launches,
+                                DeviceSpan{mem_->device_base(), mem_->device_size()},
+                                split ? &per_launch : nullptr);
+    } catch (...) {
+        // Local cursors cannot resume partial execution. Keep the original
+        // failure instead of replaying a batch whose writes already happened.
+        failure_ = std::current_exception();
+        queue_.clear();
+        throw;
+    }
     const auto t1 = std::chrono::steady_clock::now();
 
     elapsed_seconds_ += std::chrono::duration<double>(t1 - t0).count();

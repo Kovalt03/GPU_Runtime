@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -162,6 +163,12 @@ public:
     size_t myrt_device_free_bytes() const;
 
     // --- execution ----------------------------------------------------------
+    // Submission errors reject only the new request. Once dispatch starts, any
+    // execution error discards the batch and permanently disables execution on
+    // this runtime; launch, wait and sync rethrow the original exception.
+    // Deferred indirect-grid validation belongs to dispatch. Memory remains
+    // accessible for diagnosis, with partial writes intact and no rollback.
+    // Construct a fresh runtime to execute again.
     // Runs kernel(args) over grid x block threads. Execution is synchronous:
     // the call returns once every thread has retired. Throws
     // std::runtime_error if the launch geometry is empty or its grid/block volume
@@ -247,7 +254,7 @@ public:
     // --- statistics ---------------------------------------------------------
     // Accumulated across every launch since construction or the last
     // myrt_sync(). The Scheduler only ever knows about the launch it is
-    // running, so the totals live here.
+    // running, so the totals live here. A failed drain contributes no statistics.
     double divergence_rate() const;
 
     // Simulated instructions per second, cost-weighted, in billions.
@@ -296,7 +303,10 @@ private:
     std::unique_ptr<MemoryManager> mem_;
     std::unique_ptr<WarpScheduler> scheduler_;
 
+    // Statistics include only successfully completed drains, excluding every
+    // launch in a failed batch even if some of them completed before the error.
     SchedulerStats stats_;
+    std::exception_ptr failure_;
     double elapsed_seconds_ = 0.0;
 
     // A launch that has been built but not yet run. The Program is held by value
@@ -322,6 +332,9 @@ private:
     std::vector<SchedulerStats> stream_stats_{1};
 
     void enqueue(QueuedLaunch launch);
+    void rethrow_if_failed() const;
+    void require_stream(StreamId stream) const;
+    void require_grid_offset(size_t offset) const;
 
     // Everything queued, on the machine at once. One timing around the whole of
     // it: overlapping launches share cycles, and timing them separately would
