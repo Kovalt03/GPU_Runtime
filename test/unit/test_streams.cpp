@@ -544,3 +544,148 @@ TEST(Streams, ClusterReadsRequireProducerCopyWaits)
         }
     }
 }
+
+TEST(Streams, ClustersWaitForEarlierClustersToReleaseCapacity)
+{
+    // Two blocks fit simultaneously. A second cluster must wait, not be
+    // mistaken for a cluster whose own size exceeds the machine's capacity.
+    for (uint32_t blocks : {2u, 4u, 6u}) {
+        SCOPED_TRACE(blocks);
+        MyGPURuntime rt = make_runtime();
+        rt.myrt_set_sm_config(two_sms());
+        const size_t count = blocks * WARP_SIZE;
+        std::vector<float> zeros(count, 0.0f);
+        void* out = rt.myrt_malloc(count * sizeof(float));
+        rt.myrt_memcpy(out, zeros.data(), count * sizeof(float), Direction::HostToDevice);
+
+        Program p = increment_kernel(rt.myrt_device_offset(out));
+        p.insert(p.begin(), make_barrier_cluster());
+        LaunchConfig config{dim3{blocks, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+        config.cluster_size = 2;
+        ASSERT_NO_THROW(rt.myrt_launch(constant_kernel(p), config, nullptr));
+
+        // Every block must execute exactly once, including those admitted later.
+        const std::vector<float> back = read_back(rt, out, count);
+        for (size_t i = 0; i < count; ++i) {
+            EXPECT_FLOAT_EQ(back[i], 1.0f) << "thread " << i;
+        }
+        rt.myrt_free(out);
+    }
+}
+
+TEST(Streams, ClusterRetriesPreserveBlocksWhenOnlySomeSlotsAreFree)
+{
+    MyGPURuntime rt = make_runtime();
+    SMConfig cfg = two_sms();
+    cfg.sm_count = 3;
+    rt.myrt_set_sm_config(cfg);
+    std::vector<float> zeros(4 * WARP_SIZE, 0.0f);
+    void* out = rt.myrt_malloc(zeros.size() * sizeof(float));
+    rt.myrt_memcpy(out, zeros.data(), zeros.size() * sizeof(float),
+                   Direction::HostToDevice);
+    const size_t base = rt.myrt_device_offset(out);
+    LaunchConfig config{dim3{2, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+    config.cluster_size = 2;
+    // The first cluster leaves one free slot: the second cannot partially
+    // consume its block source while waiting for a second slot.
+    for (uint32_t i = 0; i < 2; ++i) {
+        Program p = increment_kernel(base + i * 2 * WARP_SIZE * sizeof(float));
+        p.insert(p.begin(), make_barrier_cluster());
+        rt.myrt_launch_async(constant_kernel(p), config, nullptr,
+                             rt.myrt_stream_create());
+    }
+    ASSERT_NO_THROW(rt.myrt_wait());
+    const std::vector<float> back = read_back(rt, out, zeros.size());
+    for (size_t i = 0; i < back.size(); ++i) {
+        EXPECT_FLOAT_EQ(back[i], 1.0f) << "output " << i;
+    }
+    rt.myrt_free(out);
+}
+
+TEST(Streams, ClusterPlacementAccountsForWarpAndSharedMemoryLimits)
+{
+    for (bool shared_limit : {false, true}) {
+        SCOPED_TRACE(shared_limit);
+        MyGPURuntime rt = make_runtime();
+        SMConfig cfg = two_sms();
+        cfg.blocks_per_sm = 4;
+        cfg.warp_slots_per_sm = shared_limit ? 64 : 1;
+        rt.myrt_set_sm_config(cfg);
+        LaunchConfig config{dim3{4, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+        config.cluster_size = 2;
+        config.shared_bytes = shared_limit ? cfg.shared_bytes_per_sm : 0;
+        ASSERT_NO_THROW(
+            rt.myrt_launch(constant_kernel(Program{make_barrier_cluster(), make_ret()}),
+                           config, nullptr));
+        EXPECT_EQ(rt.stats().warp_steps, 8u);
+
+        // Nominal block slots suffice, but the resource limit makes this
+        // individual cluster impossible even on an empty machine.
+        config.grid = dim3{3, 1, 1};
+        config.cluster_size = 3;
+        EXPECT_THROW(
+            rt.myrt_launch(constant_kernel(Program{make_ret()}), config, nullptr),
+            std::runtime_error);
+    }
+}
+
+TEST(Streams, AGridEndingInsideAClusterIsRefused)
+{
+    MyGPURuntime rt = make_runtime();
+    rt.myrt_set_sm_config(two_sms());
+    LaunchConfig config{dim3{3, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+    config.cluster_size = 2;
+    EXPECT_THROW(rt.myrt_launch(constant_kernel(Program{make_ret()}), config, nullptr),
+                 std::runtime_error);
+}
+
+TEST(Streams, ClusterBarrierRejectsBlocksAtDifferentInstructions)
+{
+    MyGPURuntime rt = make_runtime();
+    rt.myrt_set_sm_config(two_sms());
+    rt.myrt_cycle_budget(1000);
+    const Program p{
+        make_bra_div(REG_CLUSTER_RANK, 3),
+        make_barrier_cluster(),
+        make_bra(2),
+        make_barrier_cluster(),
+        make_ret(),
+    };
+    LaunchConfig config{dim3{2, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+    config.cluster_size = 2;
+    EXPECT_THROW(rt.myrt_launch(constant_kernel(p), config, nullptr), std::runtime_error);
+}
+
+TEST(Streams, ABlockBarrierDoesNotReleaseAClusterBarrier)
+{
+    MyGPURuntime rt = make_runtime();
+    rt.myrt_set_sm_config(two_sms());
+    rt.myrt_cycle_budget(1000);
+    void* out = rt.myrt_malloc(2 * sizeof(float));
+    const size_t base = rt.myrt_device_offset(out);
+    // Rank 1 has a local rendezvous before publishing its value. Rank 0
+    // reaching the common cluster barrier cannot release that local barrier.
+    const Program p{
+        make_bra_div(REG_CLUSTER_RANK, 2),  // 0: rank 1 -> 2
+        make_bra(4),                        // 1: rank 0 -> 5
+        make_barrier(),                     // 2
+        make_v_mov_f32(4, 7.0f),            // 3
+        make_v_st_shared_f32(0, 4),         // 4
+        make_barrier_cluster(),             // 5
+        make_v_mov_f32(1, 1.0f),
+        make_v_ld_cluster_f32(4, 0, 1),
+        make_v_mov_f32(2, 4.0f),
+        make_v_mul_f32(2, REG_CLUSTER_RANK, 2),
+        make_v_mov_f32(3, static_cast<float>(base)),
+        make_v_add_f32(2, 2, 3),
+        make_v_st_global_f32(2, 4),
+        make_ret(),
+    };
+    LaunchConfig config{dim3{2, 1, 1}, dim3{WARP_SIZE, 1, 1}};
+    config.cluster_size = 2;
+    ASSERT_NO_THROW(rt.myrt_launch(constant_kernel(p), config, nullptr));
+    const std::vector<float> back = read_back(rt, out, 2);
+    EXPECT_FLOAT_EQ(back[0], 7.0f);
+    EXPECT_FLOAT_EQ(back[1], 7.0f);
+    rt.myrt_free(out);
+}

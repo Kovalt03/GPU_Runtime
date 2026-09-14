@@ -1058,6 +1058,28 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
                 " live lanes: a barrier inside divergent control flow");
         }
 
+        // A parked warp retains the PC of its rendezvous. Lane agreement
+        // alone cannot tell disjoint barriers in different warps apart.
+        const auto require_same_barrier = [&](const ThreadBlock& peer) {
+            for (const Warp& waiting : peer.warps) {
+                if (waiting.at_barrier && waiting.pc != warp.pc) {
+                    throw std::runtime_error(
+                        "BARRIER mismatch: pc " + std::to_string(warp.pc) +
+                        " meets a warp waiting at pc " + std::to_string(waiting.pc));
+                }
+            }
+        };
+        require_same_barrier(block);
+        if (program[warp.pc].op == Opcode::BARRIER_CLUSTER && block.cluster != nullptr) {
+            for (const ThreadBlock* peer : *block.cluster) {
+                // Another block may still be at a preceding local barrier.
+                // Only cluster rendezvous must match across block boundaries.
+                if (peer->at_cluster_barrier) {
+                    require_same_barrier(*peer);
+                }
+            }
+        }
+
         // Past the barrier before waiting, or a released warp arrives at the
         // same instruction again and never gets anywhere.
         for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
@@ -1727,6 +1749,9 @@ bool WarpScheduler::cluster_has_arrived(const ThreadBlock& block) const
                 }
             }
         }
+        if (any_live && !peer->at_cluster_barrier) {
+            return false;
+        }
     }
     return true;
 }
@@ -1844,6 +1869,9 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         // has to exist before its warp count can be weighed against what an SM
         // has left, and the one that does not fit now will fit later.
         std::unique_ptr<ThreadBlock> peeked;
+        // Keep the whole next cluster while it waits. A single lookahead slot
+        // cannot preserve several blocks after a failed placement attempt.
+        std::vector<std::unique_ptr<ThreadBlock>> cluster_blocks;
 
         uint32_t warps = 0;
         size_t resident = 0;
@@ -1851,7 +1879,8 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
 
         bool finished() const
         {
-            return exhausted && resident == 0 && peeked == nullptr;
+            return exhausted && resident == 0 && peeked == nullptr &&
+                   cluster_blocks.empty();
         }
     };
 
@@ -1960,97 +1989,99 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
         return false;
     };
 
-    // A whole cluster at once, across the SMs, or not at all.
-    //
-    // The blocks have to be co-resident for one to address another's shared
-    // memory, so this looks for room for all of them before taking any. Spread
-    // over the units rather than piled on one: a cluster is a group that can talk,
-    // not a group that has to share an SM, and hardware places one across a GPC.
+    // Reserve capacity for every block before changing residency. A temporarily
+    // full machine must not consume and then lose blocks while retrying.
     const auto give_cluster = [&](size_t i) {
         Pending& p = pending[i];
         const uint32_t size = launches[i].cluster_size;
+        while (p.cluster_blocks.size() < size) {
+            auto block = std::make_unique<ThreadBlock>();
+            if (!launches[i].next_block(*block)) {
+                p.exhausted = true;
+                if (p.cluster_blocks.empty()) {
+                    return false;
+                }
+                throw std::runtime_error("run_streams: the grid ends " +
+                                         std::to_string(p.cluster_blocks.size()) +
+                                         " blocks into a cluster of " +
+                                         std::to_string(size));
+            }
+            p.cluster_blocks.push_back(std::move(block));
+        }
 
-        std::vector<ThreadBlock*> placed;
-        std::vector<std::pair<size_t, size_t>> where;  // unit, slot
+        const auto placement = [&](bool empty_machine) {
+            struct Usage {
+                size_t blocks = 0;
+                size_t warps = 0;
+                size_t shared = 0;
+            };
+            std::vector<Usage> usage(units.size());
+            if (!empty_machine) {
+                for (size_t u = 0; u < units.size(); ++u) {
+                    usage[u] = Usage{units[u].slots.size(), units[u].warps_resident,
+                                     units[u].shared_resident};
+                }
+            }
+            std::vector<size_t> plan;
+            for (const auto& block : p.cluster_blocks) {
+                bool found = false;
+                for (size_t u = 0; u < usage.size(); ++u) {
+                    Usage& used = usage[u];
+                    // Preserve fits()'s existing allowance for an oversized
+                    // block to occupy an otherwise empty SM by itself.
+                    if (used.blocks == 0 || (used.blocks < spec_.sms.blocks_per_sm &&
+                                             used.warps + block->warps.size() <=
+                                                 spec_.sms.warp_slots_per_sm &&
+                                             used.shared + launches[i].shared_bytes <=
+                                                 spec_.sms.shared_bytes_per_sm)) {
+                        ++used.blocks;
+                        used.warps += block->warps.size();
+                        used.shared += launches[i].shared_bytes;
+                        plan.push_back(u);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    return std::vector<size_t>{};
+                }
+            }
+            return plan;
+        };
+
+        const std::vector<size_t> plan = placement(false);
+        if (plan.empty()) {
+            if (placement(true).empty()) {
+                throw std::runtime_error(
+                    "run_streams: a cluster of " + std::to_string(size) +
+                    " blocks does not fit an empty machine under its residency limits");
+            }
+            return false;  // resident work will release the required capacity
+        }
+
         clusters.push_back(ClusterState{});
         ClusterState& state = clusters.back();
-
-        for (uint32_t n = 0; n < size; ++n) {
-            if (!p.peeked) {
-                auto block = std::make_unique<ThreadBlock>();
-                if (!launches[i].next_block(*block)) {
-                    p.exhausted = true;
-                    break;
-                }
-                p.warps = static_cast<uint32_t>(block->warps.size());
-                p.peeked = std::move(block);
-            }
-
-            Unit* room = nullptr;
-            for (Unit& unit : units) {
-                if (fits(unit, i)) {
-                    room = &unit;
-                    break;
-                }
-            }
-            if (room == nullptr) {
-                break;  // the machine cannot hold the rest of it
-            }
-
+        state.running = size;
+        for (size_t n = 0; n < plan.size(); ++n) {
+            Unit& unit = units[plan[n]];
             Slot slot;
             slot.launch = i;
             slot.cluster = &state;
-            slot.live.assign(p.peeked->warps.size(), true);
-            slot.remaining = p.peeked->warps.size();
-            for (Warp& warp : p.peeked->warps) {
+            slot.block = std::move(p.cluster_blocks[n]);
+            slot.live.assign(slot.block->warps.size(), true);
+            slot.remaining = slot.block->warps.size();
+            for (Warp& warp : slot.block->warps) {
                 warp.at_barrier = false;
                 warp.ready_at = 0;
             }
-            placed.push_back(p.peeked.get());
-            slot.block = std::move(p.peeked);
-            room->slots.push_back(std::move(slot));
-            room->warps_resident += p.warps;
-            room->shared_resident += launches[i].shared_bytes;
+            state.blocks.push_back(slot.block.get());
+            unit.warps_resident += slot.block->warps.size();
+            unit.shared_resident += launches[i].shared_bytes;
+            unit.slots.push_back(std::move(slot));
             ++p.resident;
-            where.emplace_back(static_cast<size_t>(room - units.data()),
-                               room->slots.size() - 1);
         }
-
-        if (placed.size() != size) {
-            // Nothing takes a slot unless all of it does. Undoing is cheaper than
-            // discovering halfway through a launch that a cluster is short one
-            // block and nobody can pass its barrier.
-            for (auto it = where.rbegin(); it != where.rend(); ++it) {
-                Unit& unit = units[it->first];
-                Slot& slot = unit.slots[it->second];
-                unit.warps_resident -= static_cast<uint32_t>(slot.block->warps.size());
-                unit.shared_resident -= launches[i].shared_bytes;
-                --p.resident;
-                p.peeked = std::move(slot.block);
-                unit.slots.pop_back();
-            }
-            clusters.pop_back();
-            if (placed.empty() && p.exhausted) {
-                return false;  // the grid ended on a cluster boundary
-            }
-            if (p.exhausted) {
-                throw std::runtime_error(
-                    "run_streams: the grid ends " + std::to_string(placed.size()) +
-                    " blocks into a cluster of " + std::to_string(size) +
-                    " — a clustered launch has to be a whole number of them");
-            }
-            // Room for some of it and no more. Waiting will not make the machine
-            // bigger: the blocks have to be co-resident, so this is a launch that
-            // cannot start rather than one that runs a piece at a time.
-            throw std::runtime_error(
-                "run_streams: a cluster of " + std::to_string(size) +
-                " blocks does not fit a machine holding " +
-                std::to_string(units.size() * spec_.sms.blocks_per_sm) + " at once");
-        }
-
-        state.blocks = placed;
-        state.running = size;
-        for (ThreadBlock* block : placed) {
+        p.cluster_blocks.clear();
+        for (ThreadBlock* block : state.blocks) {
             block->cluster = &state.blocks;
         }
         loaded_any = true;

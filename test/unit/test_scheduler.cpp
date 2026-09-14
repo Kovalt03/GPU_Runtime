@@ -2847,3 +2847,41 @@ TEST(Scheduler, CopyWaitCoversOutOfOrderCompletion)
         f.run(Program{make_s_cp_async_wait(0), make_v_ld_shared_f32(4, 0), make_ret()}));
     EXPECT_GE(f.sched.stats().cycles, 400u);
 }
+
+TEST(Scheduler, BarrierRejectsWarpsAtDifferentInstructions)
+{
+    ThreadBlock block = make_block(2);
+    broadcast(block.warps[0], 0, 0.0f);
+    broadcast(block.warps[1], 0, 1.0f);
+    // All lanes within each warp agree, but the block takes disjoint barriers.
+    // A warp-local active-mask check cannot detect this mismatch.
+    const Program p{
+        make_bra_div(0, 3),  // warp 1 -> pc 3
+        make_barrier(),      // warp 0 waits at pc 1
+        make_bra(2),         // warp 0 skips the other barrier
+        make_barrier(),      // warp 1 waits at pc 3
+        make_ret(),
+    };
+    WarpScheduler scheduler;
+    scheduler.set_cycle_budget(1000);
+    EXPECT_THROW(scheduler.run(p, block, DeviceSpan{}), std::runtime_error);
+}
+
+TEST(Scheduler, ConsecutiveBarriersAllowWarpsAtTheSameInstruction)
+{
+    ThreadBlock block = make_block(2);
+    const Program p{
+        make_barrier(), make_v_mov_f32(0, 7.0f), make_barrier(), make_v_mov_f32(1, 9.0f),
+        make_ret(),
+    };
+    WarpScheduler scheduler;
+    scheduler.set_cycle_budget(1000);
+    ASSERT_NO_THROW(scheduler.run(p, block, DeviceSpan{}));
+    for (const Warp& warp : block.warps) {
+        for (const Thread& thread : warp.threads) {
+            EXPECT_FALSE(thread.active);
+            EXPECT_FLOAT_EQ(thread.regs[0], 7.0f);
+            EXPECT_FLOAT_EQ(thread.regs[1], 9.0f);
+        }
+    }
+}
