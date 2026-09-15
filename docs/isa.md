@@ -70,6 +70,30 @@ Grouped by what each group made possible, since that is why they exist.
 `opcode_name()` has no `default` arm, so adding an opcode without naming it is a
 compile error rather than a run-time surprise.
 
+
+## Rendezvous contracts
+
+`REORDER` moves live threads, including survivors of retired warps, and preserves
+registers and PCs. Live keys must not be NaN; infinities sort normally. All
+`cp.async` batches in the block, including those issued by retired warps, must
+have completed through `S_CP_ASYNC_WAIT` before regrouping. Pending copies are
+rejected at the rendezvous because their queues belong to warps and cannot
+follow threads that split across new warps. `REORDER` does not implicitly wait
+for them.
+
+With `LatencyModel::Modelled`, regrouping delays the block by the instruction's
+30-cycle latency after all live warps arrive. With `Ignored`, it introduces no
+latency beyond the issued rendezvous instructions. Previously recorded cycle
+measurements that omitted this delay must be rerun before comparison; warp-step
+counts are unaffected by this timing correction.
+
+`S_SYNCWARP` waits for its explicitly named lanes and introduces no data-result
+latency. A lane at a higher PC may still arrive through a backward branch under
+`WarpPolicy::Independent`. Retired lanes, lanes at `RET`, and lanes outside the
+program cannot arrive and are rejected. Other non-arrivals are bounded by the
+cycle budget. `LowestPc` can still starve a higher-PC lane while waiting at a
+lower PC; use `Independent` for that control-flow pattern.
+
 ---
 
 [← back to the README](../README.md)

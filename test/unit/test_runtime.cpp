@@ -637,3 +637,66 @@ TEST(Runtime, DeferredGridFailureBlocksEveryStream)
                  std::runtime_error);
     EXPECT_FALSE(built);
 }
+
+TEST(Runtime, MachineSpecRejectsNegativeCountsWithoutWrapping)
+{
+    for (const char* field :
+         {"sm_count", "blocks_per_sm", "warp_slots_per_sm", "memory_lines_a_cycle",
+          "shared_bytes_per_sm", "l1_lines", "l2_lines"})
+        for (const char* value : {"-1", "-4294967295", "-0", "\v-1", "\f-1"}) {
+            SCOPED_TRACE(std::string(field) + '=' + value);
+            EXPECT_THROW(parse_spec(std::string(field) + '=' + value),
+                         std::runtime_error);
+        }
+}
+
+TEST(Runtime, MachineSpecChecksTheDestinationIntegerRange)
+{
+    for (const char* field :
+         {"sm_count", "blocks_per_sm", "warp_slots_per_sm", "memory_lines_a_cycle"}) {
+        EXPECT_THROW(parse_spec(std::string(field) + "=4294967296"), std::runtime_error);
+        EXPECT_THROW(parse_spec(std::string(field) + "=4294967297"), std::runtime_error);
+        EXPECT_NO_THROW(parse_spec(std::string(field) + "=4294967295"));
+    }
+    GPUSpec s;
+    s.sms.sm_count = UINT32_MAX;
+    s.sms.blocks_per_sm = UINT32_MAX;
+    s.sms.warp_slots_per_sm = UINT32_MAX;
+    s.memory_lines_a_cycle = UINT32_MAX;
+    s.sms.shared_bytes_per_sm = std::numeric_limits<size_t>::max();
+    s.l1_lines = std::numeric_limits<size_t>::max();
+    s.l2_lines = std::numeric_limits<size_t>::max();
+    EXPECT_EQ(parse_spec(s.to_text()).to_text(), s.to_text());
+    EXPECT_THROW(parse_spec("l1_lines=18446744073709551616"), std::runtime_error);
+}
+
+TEST(Runtime, FinishedClusterMembersSurviveIdleBarrierScans)
+{
+    auto rt = make_runtime();
+    SMConfig machine;
+    machine.sm_count = 2;
+    machine.blocks_per_sm = 1;
+    rt.myrt_set_sm_config(machine);
+    rt.myrt_set_latency_model(LatencyModel::Modelled);
+    std::vector<float> values(4, 0);
+    void* out = rt.myrt_malloc(values.size() * sizeof(float));
+    rt.myrt_memcpy(out, values.data(), values.size() * sizeof(float),
+                   Direction::HostToDevice);
+    Program p{make_v_mov_f32(0, float(rt.myrt_device_offset(out))),
+              make_v_mov_f32(1, 0),
+              make_v_cmp_f32(2, REG_CLUSTER_RANK, 1, CmpOp::EQ),
+              make_bra_div(2, 7),  // rank 0 retires while rank 1 still runs
+              make_v_ld_global_f32(3, 0),
+              make_v_mov_f32(1, 4),
+              make_v_mul_f32(2, REG_GLOBAL_ID_X, 1),
+              make_v_add_f32(2, 2, 0),
+              make_v_mov_f32(3, 42),
+              make_v_st_global_f32(2, 3),
+              make_ret()};
+    LaunchConfig config{dim3{4, 1, 1}, dim3{1, 1, 1}};
+    config.cluster_size = 2;
+    ASSERT_NO_THROW(rt.myrt_launch([p](void**) { return p; }, config, nullptr));
+    rt.myrt_memcpy(values.data(), out, values.size() * sizeof(float),
+                   Direction::DeviceToHost);
+    EXPECT_EQ(values, (std::vector<float>{0, 42, 0, 42}));
+}

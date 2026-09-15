@@ -214,6 +214,12 @@ enum class Opcode : uint8_t {
     // warp it is in — its registers and its pc travel with it — so the answer is
     // the same either way and only the divergence differs.
     //
+    // Live keys must not be NaN (infinities are ordered normally). Every warp,
+    // including retired producers, must complete its cp.async copies through
+    // S_CP_ASYNC_WAIT before regrouping; REORDER does not transfer copy queues.
+    // Under Modelled latency, regrouping delays the block by the REORDER
+    // instruction latency after all live warps reach the rendezvous.
+    //
     // No prefix and no type, like BARRIER: it writes no register. It is also a
     // rendezvous for the same reason a barrier is, since threads cannot be
     // regrouped while some of them are elsewhere.

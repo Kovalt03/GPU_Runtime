@@ -982,6 +982,9 @@ GlobalAccess WarpScheduler::global_access(const Warp& warp, const Instruction& i
 bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& block,
                               DeviceSpan global, uint64_t now)
 {
+    // Special control paths may return without producing a delayed result.
+    // Never inherit a latency from the previous instruction or another warp.
+    issued_latency_ = 0;
     // A copy leaves the queue when it is waited for, not when enough time has
     // passed. Time decides when the warp may go on; the wait decides when the
     // bytes may be read, and PTX draws the line the same way — cp.async.wait_group
@@ -1253,14 +1256,14 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
         // the pc unconditionally and waiting is exactly not doing so.
         const uint32_t participants = decode_lane_mask(program[warp.pc].imm);
 
-        // A participant that is live but already past this instruction is never
-        // coming back, and waiting for it would spin until the step budget ran
-        // out with nothing to say. The other primitives can refuse outright;
-        // this one has to look ahead, since a lane still on its way is exactly
-        // the case it exists to wait for.
+        // PC ordering does not imply reachability: a higher PC can branch
+        // back here. Only reject a participant that cannot issue another useful
+        // instruction; other non-arrivals are bounded by the cycle budget.
         for (uint32_t lane = 0; lane < WARP_SIZE; ++lane) {
             const Thread& t = warp.threads[lane];
-            if ((participants & (1u << lane)) != 0 && t.active && t.pc > warp.pc) {
+            if ((participants & (1u << lane)) != 0 &&
+                (!t.active || t.pc >= program.size() ||
+                 program[t.pc].op == Opcode::RET)) {
                 throw std::runtime_error("S_SYNCWARP at pc " + std::to_string(warp.pc) +
                                          ": lane " + std::to_string(lane) +
                                          " is named in the participation mask but "
@@ -1668,7 +1671,7 @@ bool WarpScheduler::step_warp(const Program& program, Warp& warp, ThreadBlock& b
 namespace {
 
 // The regroup itself: the block's threads sorted by their key and laid back down
-// across its warps, sixteen at a time and then the next.
+// across its warps, WARP_SIZE threads at a time.
 //
 // A thread carries its registers and its pc with it, so nothing about what it
 // computes changes — only which lanes it shares an instruction with. That is the
@@ -1677,12 +1680,25 @@ namespace {
 //
 // Retired threads sort last. They will not issue again, and leaving them among
 // the live ones would put holes in the warps this exists to fill.
-void regroup(ThreadBlock& block, uint32_t key_reg)
+void regroup(ThreadBlock& block, uint32_t key_reg, uint64_t now)
 {
     std::vector<Thread> threads;
     threads.reserve(block.warps.size() * WARP_SIZE);
     for (Warp& warp : block.warps) {
+        // Queue ownership cannot follow threads that may split across warps.
+        // Check retired producers too: their copies still belong to this block.
+        if (warp.copies_in_flight != 0 ||
+            std::any_of(
+                warp.waited_copies.begin(), warp.waited_copies.end(),
+                [now](const Warp::InFlightCopy& copy) { return copy.ready_at > now; })) {
+            throw std::runtime_error(
+                "REORDER requires every cp.async to complete through S_CP_ASYNC_WAIT "
+                "first");
+        }
         for (Thread& thread : warp.threads) {
+            if (thread.active && std::isnan(thread.regs[key_reg])) {
+                throw std::runtime_error("REORDER key must not be NaN");
+            }
             threads.push_back(thread);
         }
     }
@@ -1692,7 +1708,7 @@ void regroup(ThreadBlock& block, uint32_t key_reg)
                          if (a.active != b.active) {
                              return a.active;
                          }
-                         return a.regs[key_reg] < b.regs[key_reg];
+                         return a.active && a.regs[key_reg] < b.regs[key_reg];
                      });
 
     size_t at = 0;
@@ -1710,7 +1726,7 @@ void regroup(ThreadBlock& block, uint32_t key_reg)
 
 }  // namespace
 
-void WarpScheduler::release_barrier(ThreadBlock& block)
+void WarpScheduler::release_barrier(ThreadBlock& block, uint64_t now)
 {
     // Called only once no warp of this block can issue, and that is the whole
     // arrival test: if nobody can take a turn and somebody is waiting, then every
@@ -1720,8 +1736,16 @@ void WarpScheduler::release_barrier(ThreadBlock& block)
     // Per block, not per SM. Two blocks sharing an SM have separate barriers, and
     // one of them stalling is not the other's business.
     if (block.reorder_key != ThreadBlock::NO_REORDER) {
-        regroup(block, block.reorder_key);
+        regroup(block, block.reorder_key, now);
         block.reorder_key = ThreadBlock::NO_REORDER;
+        // Sorting starts once the last warp arrives, and completes once for
+        // the block rather than once per warp.
+        const uint64_t ready = now + (latency_ == LatencyModel::Modelled
+                                          ? instruction_latency(Opcode::REORDER)
+                                          : 0);
+        for (Warp& warp : block.warps) {
+            warp.ready_at = ready;
+        }
     }
     block.at_cluster_barrier = false;
     for (Warp& warp : block.warps) {
@@ -2264,13 +2288,13 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                 // or one of them has every live warp at a barrier and nobody
                 // left to arrive.
                 for (Slot& slot : unit.slots) {
-                    if (!slot.occupied()) {
+                    if (!slot.occupied() || slot.finished()) {
                         continue;
                     }
                     bool waiting = false;
                     bool at_barrier = false;
                     for (size_t i = 0; i < slot.block->warps.size(); ++i) {
-                        if (!slot.live[i]) {
+                        if (!slot.live.at(i)) {
                             continue;
                         }
                         const Warp& warp = slot.block->warps[i];
@@ -2287,7 +2311,21 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                         continue;
                     }
                     if (!slot.block->at_cluster_barrier) {
-                        release_barrier(*slot.block);
+                        const bool reordered =
+                            slot.block->reorder_key != ThreadBlock::NO_REORDER;
+                        release_barrier(*slot.block, now);
+                        if (reordered) {
+                            // A surviving thread can move into a previously
+                            // retired warp; cached slot state must follow it.
+                            slot.remaining = 0;
+                            for (size_t i = 0; i < slot.block->warps.size(); ++i) {
+                                const auto& threads = slot.block->warps[i].threads;
+                                slot.live[i] =
+                                    std::any_of(threads.begin(), threads.end(),
+                                                [](const Thread& t) { return t.active; });
+                                slot.remaining += slot.live[i] ? 1 : 0;
+                            }
+                        }
                         released_any = true;
                         continue;
                     }
@@ -2297,10 +2335,10 @@ void WarpScheduler::run_streams(const std::vector<GridLaunch>& launches,
                     // against, and none of them would ever pass.
                     if (cluster_has_arrived(*slot.block)) {
                         if (slot.block->cluster == nullptr) {
-                            release_barrier(*slot.block);
+                            release_barrier(*slot.block, now);
                         } else {
                             for (ThreadBlock* peer : *slot.block->cluster) {
-                                release_barrier(*peer);
+                                release_barrier(*peer, now);
                             }
                         }
                         released_any = true;

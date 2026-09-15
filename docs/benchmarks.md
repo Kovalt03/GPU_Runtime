@@ -116,3 +116,9 @@ It includes partially filled warps and retired lanes, not just branch divergence
 A reduction in warp steps is not the same percentage reduction in cycles or
 host running time. Cost and latency constants are modelling assumptions, not
 calibrated measurements of a named GPU.
+
+Machine-file counts must be nonnegative and fit their destination field:
+`sm_count`, `blocks_per_sm`, `warp_slots_per_sm`, and `memory_lines_a_cycle`
+are uint32 values; cache sizes and shared-memory bytes use `size_t`.
+Out-of-range values are rejected rather than truncated. Parsing does not allocate
+those resources or guarantee that the host can provide them.

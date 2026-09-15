@@ -1179,19 +1179,18 @@ TEST(Scheduler, SyncwarpGathersLanesThatIndependentSchedulingLetDrift)
     }
 }
 
-TEST(Scheduler, SyncwarpRefusesToWaitForALaneAlreadyPastIt)
+TEST(Scheduler, SyncwarpRefusesToWaitForALaneOutsideTheProgram)
 {
-    // A participant that branched beyond the sync is never coming back. Waiting
-    // would spin until the step budget ran out and report only that the block
-    // did not finish, which says nothing about why.
+    // This participant branches outside the program, so it cannot return.
+    // A higher PC inside the program would not prove that: it can branch back.
     ThreadBlock block = make_block(1);
 
     Program p;
     p.push_back(make_v_mov_f32(2, 16.0f));                          // 0
     p.push_back(make_v_cmp_f32(1, REG_GLOBAL_ID_X, 2, CmpOp::GE));  // 1
-    p.push_back(make_bra_div(1, 3));                                // 2: 16.. -> 4
-    p.push_back(make_s_syncwarp(ALL_LANES));                        // 3: waits for them
-    p.push_back(make_ret());                                        // 4
+    p.push_back(make_bra_div(1, 3));          // 2: lanes 16..31 -> pc 5
+    p.push_back(make_s_syncwarp(ALL_LANES));  // 3: waits for them
+    p.push_back(make_ret());                  // 4
 
     seed_lane_ids(block);
 
@@ -2985,4 +2984,181 @@ TEST(Scheduler, AsyncWaitRejectsRawCountAboveUint32Range)
     Instruction wait = make_s_cp_async_wait(0);
     wait.imm = 4294967296.0f;
     EXPECT_THROW(f.run(Program{wait, make_ret()}), std::runtime_error);
+}
+
+TEST(Scheduler, ReorderPreservesSurvivorsAfterWholeWarpsRetire)
+{
+    for (uint32_t width : {33u, 64u, 65u, 96u})
+        for (bool retire_low : {false, true})
+            for (auto policy : {WarpPolicy::LowestPc, WarpPolicy::Independent})
+                for (bool latency : {false, true}) {
+                    SCOPED_TRACE(::testing::Message() << width << ':' << retire_low << ':'
+                                                      << int(policy) << ':' << latency);
+                    MyGPURuntime rt(65536, 1024);
+                    rt.myrt_set_warp_policy(policy);
+                    rt.myrt_set_latency_model(latency ? LatencyModel::Modelled
+                                                      : LatencyModel::Ignored);
+                    void* out = rt.myrt_malloc(width * sizeof(float));
+                    std::vector<float> values(width, 0);
+                    rt.myrt_memcpy(out, values.data(), width * sizeof(float),
+                                   Direction::HostToDevice);
+                    Program p{make_v_mov_f32(0, 32),
+                              make_v_cmp_f32(1, REG_GLOBAL_ID_X, 0,
+                                             retire_low ? CmpOp::LT : CmpOp::GE),
+                              make_bra_div(1, 7),
+                              make_reorder(0),
+                              make_v_mov_f32(2, 4),
+                              make_v_mul_f32(3, REG_GLOBAL_ID_X, 2),
+                              make_v_mov_f32(4, float(rt.myrt_device_offset(out))),
+                              make_v_add_f32(3, 3, 4),
+                              make_v_st_global_f32(3, 2),
+                              make_ret()};
+                    rt.myrt_launch([p](void**) { return p; }, dim3{}, dim3{width, 1, 1},
+                                   nullptr);
+                    rt.myrt_memcpy(values.data(), out, width * sizeof(float),
+                                   Direction::DeviceToHost);
+                    for (uint32_t i = 0; i < width; ++i)
+                        EXPECT_FLOAT_EQ(values[i],
+                                        (retire_low ? i < 32 : i >= 32) ? 0 : 4)
+                            << i;
+                }
+}
+
+TEST(Scheduler, ReorderRequiresEveryProducerToWaitBeforeThreadsMove)
+{
+    for (bool wait : {false, true})
+        for (auto policy : {WarpPolicy::LowestPc, WarpPolicy::Independent})
+            for (bool latency : {false, true}) {
+                ThreadBlock b = make_block(2);
+                std::vector<uint8_t> memory(1024, 0);
+                float value = 42;
+                std::memcpy(memory.data(), &value, sizeof(value));
+                for (uint32_t i = 0; i < 64; ++i) {
+                    auto& r = b.warps[i / 32].threads[i % 32].regs;
+                    r[0] = i < 32;
+                    r[1] = -float(i);
+                    r[2] = float(4 * i);
+                    r[3] = 0;
+                    r[4] = float(256 + 4 * i);
+                }
+                Program p{make_bra_div(0, 2),
+                          make_bra(3),
+                          make_v_cp_async_shared_global_f32(2, 3),
+                          wait ? make_s_cp_async_wait(0) : make_v_mov_f32(5, 0),
+                          make_reorder(1),
+                          make_v_ld_shared_f32(5, 2),
+                          make_v_st_global_f32(4, 5),
+                          make_ret()};
+                WarpScheduler s;
+                s.set_policy(policy);
+                s.set_latency_model(latency ? LatencyModel::Modelled
+                                            : LatencyModel::Ignored);
+                if (wait) {
+                    ASSERT_NO_THROW(s.run(p, b, {memory.data(), memory.size()}));
+                    for (uint32_t i = 0; i < 64; ++i) {
+                        float actual = 0;
+                        std::memcpy(&actual, memory.data() + 256 + 4 * i, sizeof(actual));
+                        EXPECT_FLOAT_EQ(actual, i < 32 ? 42 : 0);
+                    }
+                } else {
+                    try {
+                        s.run(p, b, {memory.data(), memory.size()});
+                        FAIL() << "REORDER accepted a pending copy";
+                    } catch (const std::runtime_error& e) {
+                        EXPECT_NE(std::string(e.what()).find("REORDER"),
+                                  std::string::npos);
+                    }
+                }
+            }
+}
+
+TEST(Scheduler, ReorderRejectsPendingCopiesFromRetiredWarps)
+{
+    ThreadBlock b = make_block(2);
+    for (auto& t : b.warps[0].threads)
+        t.regs[0] = 1;
+    std::vector<uint8_t> memory(16, 0);
+    Program p{make_bra_div(0, 3), make_reorder(1), make_ret(),
+              make_v_cp_async_shared_global_f32(1, 1), make_ret()};
+    WarpScheduler s;
+    EXPECT_THROW(s.run(p, b, {memory.data(), memory.size()}), std::runtime_error);
+}
+
+TEST(Scheduler, ReorderRejectsLiveNaNKeysButIgnoresRetiredKeys)
+{
+    for (bool live : {false, true}) {
+        ThreadBlock b = make_block(1);
+        b.warps[0].threads[0].active = live;
+        b.warps[0].threads[0].regs[0] = std::numeric_limits<float>::quiet_NaN();
+        WarpScheduler s;
+        Program p{make_reorder(0), make_ret()};
+        if (live)
+            EXPECT_THROW(s.run(p, b, {}), std::runtime_error);
+        else
+            EXPECT_NO_THROW(s.run(p, b, {}));
+    }
+}
+
+TEST(Scheduler, ReorderLatencyStartsWhenTheBlockRendezvousCompletes)
+{
+    for (uint32_t warps : {1u, 2u, 3u})
+        for (bool latency : {false, true}) {
+            uint64_t cycles[2]{};
+            for (bool reorder : {false, true}) {
+                ThreadBlock b = make_block(warps);
+                WarpScheduler s;
+                s.set_latency_model(latency ? LatencyModel::Modelled
+                                            : LatencyModel::Ignored);
+                s.run({reorder ? make_reorder(0) : make_barrier(), make_ret()}, b, {});
+                cycles[reorder] = s.stats().cycles;
+            }
+            EXPECT_EQ(cycles[1] - cycles[0],
+                      latency ? instruction_latency(Opcode::REORDER) : 0u);
+        }
+}
+
+TEST(Scheduler, SyncwarpDoesNotReuseThePreviousInstructionsLatency)
+{
+    for (auto model : {MemoryModel::Flat, MemoryModel::Coalesced, MemoryModel::Cached})
+        for (bool latency : {false, true})
+            for (uint32_t syncs : {0u, 1u, 2u}) {
+                Fixture f;
+                f.sched.set_memory_model(model);
+                f.sched.set_latency_model(latency ? LatencyModel::Modelled
+                                                  : LatencyModel::Ignored);
+                Program p{make_v_ld_global_f32(1, 0)};
+                for (uint32_t i = 0; i < syncs; ++i)
+                    p.push_back(make_s_syncwarp(ALL_LANES));
+                p.push_back(make_ret());
+                f.run(p);
+                EXPECT_EQ(f.sched.stats().cycles, (latency ? 401u : 2u) + syncs);
+            }
+}
+
+TEST(Scheduler, IndependentSyncwarpAllowsArrivalThroughABackwardBranch)
+{
+    ThreadBlock b = make_block(1);
+    b.warps[0] = make_warp(2);
+    b.warps[0].threads[1].regs[0] = 1;
+    WarpScheduler s;
+    s.set_policy(WarpPolicy::Independent);
+    s.set_cycle_budget(100);
+    ASSERT_NO_THROW(
+        s.run({make_bra_div(0, 3), make_s_syncwarp(3), make_ret(), make_bra(-2)}, b, {}));
+    EXPECT_FALSE(b.warps[0].threads[0].active);
+    EXPECT_FALSE(b.warps[0].threads[1].active);
+}
+
+TEST(Scheduler, ReorderOrdersInfiniteKeysNormally)
+{
+    ThreadBlock b = make_block(1);
+    b.warps[0] = make_warp(3);
+    b.warps[0].threads[0].regs[0] = std::numeric_limits<float>::infinity();
+    b.warps[0].threads[1].regs[0] = 0;
+    b.warps[0].threads[2].regs[0] = -std::numeric_limits<float>::infinity();
+    WarpScheduler s;
+    ASSERT_NO_THROW(s.run({make_reorder(0), make_ret()}, b, {}));
+    EXPECT_EQ(b.warps[0].threads[0].regs[0], -std::numeric_limits<float>::infinity());
+    EXPECT_EQ(b.warps[0].threads[1].regs[0], 0);
+    EXPECT_EQ(b.warps[0].threads[2].regs[0], std::numeric_limits<float>::infinity());
 }

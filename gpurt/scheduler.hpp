@@ -475,7 +475,7 @@ private:
                    DeviceSpan global, uint64_t now);
 
     // Every warp of the block has arrived, so let them all go.
-    void release_barrier(ThreadBlock& block);
+    void release_barrier(ThreadBlock& block, uint64_t now);
 
     // The same question one level wider, for BARRIER_CLUSTER.
     bool cluster_has_arrived(const ThreadBlock& block) const;

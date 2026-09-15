@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -100,6 +101,9 @@ std::string trimmed(const std::string& text)
 uint64_t to_number(const std::string& name, const std::string& value)
 {
     try {
+        if (value.find('-') != std::string::npos) {
+            throw std::invalid_argument("negative value");
+        }
         size_t consumed = 0;
         const unsigned long long parsed = std::stoull(value, &consumed);
         if (consumed != value.size()) {
@@ -110,6 +114,15 @@ uint64_t to_number(const std::string& name, const std::string& value)
         throw std::runtime_error("machine spec: " + name + " = '" + value +
                                  "' is not a whole number");
     }
+}
+
+template <typename T>
+T checked_number(uint64_t number, const std::string& name)
+{
+    if (number > std::numeric_limits<T>::max()) {
+        throw std::runtime_error("machine spec: " + name + " exceeds its integer range");
+    }
+    return static_cast<T>(number);
 }
 
 }  // namespace
@@ -139,19 +152,19 @@ GPUSpec parse_spec(const std::string& text)
 
         const uint64_t number = to_number(name, value);
         if (name == "sm_count") {
-            spec.sms.sm_count = static_cast<uint32_t>(number);
+            spec.sms.sm_count = checked_number<uint32_t>(number, name);
         } else if (name == "blocks_per_sm") {
-            spec.sms.blocks_per_sm = static_cast<uint32_t>(number);
+            spec.sms.blocks_per_sm = checked_number<uint32_t>(number, name);
         } else if (name == "warp_slots_per_sm") {
-            spec.sms.warp_slots_per_sm = static_cast<uint32_t>(number);
+            spec.sms.warp_slots_per_sm = checked_number<uint32_t>(number, name);
         } else if (name == "shared_bytes_per_sm") {
-            spec.sms.shared_bytes_per_sm = static_cast<size_t>(number);
+            spec.sms.shared_bytes_per_sm = checked_number<size_t>(number, name);
         } else if (name == "l1_lines") {
-            spec.l1_lines = static_cast<size_t>(number);
+            spec.l1_lines = checked_number<size_t>(number, name);
         } else if (name == "l2_lines") {
-            spec.l2_lines = static_cast<size_t>(number);
+            spec.l2_lines = checked_number<size_t>(number, name);
         } else if (name == "memory_lines_a_cycle") {
-            spec.memory_lines_a_cycle = static_cast<uint32_t>(number);
+            spec.memory_lines_a_cycle = checked_number<uint32_t>(number, name);
         } else {
             throw std::runtime_error("machine spec: no field named " + name);
         }
